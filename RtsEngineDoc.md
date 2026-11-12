@@ -548,13 +548,9 @@ Every request should support protocol/API version, request ID and command ID, ex
 
 Commands that affect a running simulation are queued for a defined tick boundary. Editor-only map mutations are not silently mixed with active match state.
 
-### 12.3 Agent workflow
+### 12.3 Agent integration
 
-Agents must inspect existing code and relevant documentation before editing. Work in small, verifiable steps. Never silently weaken/delete tests, suppress errors, or introduce placeholder implementations that appear complete.
-
-Every substantial task must report implemented behavior, changed files and public API changes, tests/checks executed, performance impact or measurement, architectural decisions/ADRs added or changed, and known limitations/remaining work.
-
-Do not search unrelated personal files or other projects on the developer's machine. Access to official documentation, toolchain documentation, and source/documentation for project dependencies is permitted.
+Coding agents must follow the repository-wide instructions in `AGENTS.md`. The command/query protocol, trust boundaries, and simulation tick-boundary requirements defined in this document remain the authoritative technical contract.
 
 ---
 
@@ -674,14 +670,11 @@ Agent commands, imported projects, maps, saves, and scripts are untrusted input�
 
 ## 17. Development workflow and architecture governance
 
-### 17.1 Repository workflow
+### 17.1 Repository workflow and agent instructions
 
-- Work on vibe/<slug> or another task-specific branch.
-- Open PRs to main; do not push directly to main.
-- Run relevant tests before requesting review.
-- Review architecture-sensitive changes against this document and applicable ADRs.
-- Keep PRs focused and independently reviewable.
-- Update docs when contracts, public APIs, data schemas, or architectural behavior change.
+Repository workflow, implementation discipline, testing expectations, dependency policy, and coding-agent completion reports are defined in `AGENTS.md`.
+
+All contributors must review architecture-sensitive changes against this document and applicable ADRs. Keep architecture decisions and subsystem contracts here; do not duplicate their full definitions in agent instructions.
 
 ### 17.2 Architecture Decision Records
 
@@ -700,25 +693,13 @@ Initial ADRs to create:
 
 An agent must not silently override an accepted ADR. If new evidence invalidates a decision, propose a replacement ADR and explain migration impact.
 
-### 17.3 Function design rules
+### 17.3 Implementation guidance
 
-Every function follows these principles:
+Coding agents must follow the function-design and implementation rules in `AGENTS.md`. Architecture-specific invariants—including single ownership of authoritative state, deterministic simulation, CPU-only headless operation, and atomic map activation—are defined in their respective sections of this document and remain authoritative.
 
-1. **Fulfill its contract completely.** Validate untrusted inputs at boundaries, enforce invariants at mutation boundaries, and report failures explicitly. Never conceal programming errors behind silent fallbacks.
-2. **Make signatures communicate semantics.** Use Result<T, E> for meaningful failure, Option<T> for ordinary absence, and simple types where they express the contract clearly. Avoid sentinel values and unnecessary out-parameters.
-3. **Keep a consistent abstraction level.** Decompose for clarity, not to maximize helper count. High-level orchestration should not be mixed with low-level implementation details.
+### 17.4 Documentation and dependency governance
 
-These rules must not undermine data-oriented performance. Hot systems should process batches/columns where appropriate; do not force one function call per entity merely to satisfy a simplistic interpretation of decomposition.
-
-A map asset is data, not a runtime container. Loading should parse and validate into a new candidate state, construct runtime data, and only then activate it. A failed load must leave the active world unchanged.
-
-### 17.4 Documentation and dependency policy
-
-- Prefer official documentation and maintained dependencies.
-- Pin or constrain dependencies deliberately; review major upgrades.
-- Do not add a dependency for trivial functionality without justification.
-- Record security, licensing, platform, and maintenance considerations for major dependencies.
-- Keep AGENTS.md concise and point to this document and subsystem-specific docs.
+Use `AGENTS.md` for contributor-facing documentation and dependency-handling procedures. This document remains the source of truth for engine architecture, subsystem boundaries, technical constraints, and unresolved design decisions.
 
 ---
 
