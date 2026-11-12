@@ -81,3 +81,38 @@ jobs:
           # gitleaks-action v2 requires the token explicitly for PR scans;
           # the default token with the workflow's contents: read is enough.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # The benchmark crate is a detached workspace (excluded from the root
+  # workspace on purpose), so it gets its own build/lint gates here. It only
+  # builds and lints; benchmark timings are not run on shared runners.
+  bench-checks:
+    name: Benchmark crate checks (benchmarks/ecs)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: benchmarks/ecs
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks/ecs
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release

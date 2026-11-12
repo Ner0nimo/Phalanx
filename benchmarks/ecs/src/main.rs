@@ -2,10 +2,13 @@
 //! ADR-0003).
 //!
 //! This binary is deliberately NOT part of the production workspace (see the
-//! `[workspace]` table in Cargo.toml): CI gates do not build it. Wall-clock
-//! timing and a counting global allocator are fine here because this measures
-//! the ECS libraries, not the authoritative simulation. Both candidates run
-//! the same seed, entity counts, workload, and release profile.
+//! `[workspace]` table in Cargo.toml): the root CI gates do not build it, but a
+//! dedicated `bench-checks` CI job does. Wall-clock timing and a counting global
+//! allocator are fine here because this measures the ECS libraries, not the
+//! authoritative simulation. Both candidates run the same seed, entity counts,
+//! workload, and release profile, and — per review feedback — construct their
+//! query handles inside every measured round so query-lifecycle costs are paid
+//! symmetrically by both.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +48,10 @@ struct Building;
 #[derive(Component, Clone, Copy)]
 struct Armor;
 
-// --- counting global allocator (allocation count + live/peak bytes) ---
+// --- counting global allocator ---
+//
+// Counts allocator *calls* and *requested* bytes (live and peak). These are
+// allocator-accounted metrics, not process RSS; see ADR-0003 methodology.
 
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 static CUR_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -98,7 +104,10 @@ type UnitBundle = (Position, Velocity, Health, Attack);
 type ArmoredBundle = (Position, Velocity, Health, Attack, Armor);
 type BuildingBundle = (Position, Health, Building);
 
-fn make_bundles(n: usize, rng: &mut Rng) -> (Vec<UnitBundle>, Vec<ArmoredBundle>, Vec<BuildingBundle>) {
+fn make_bundles(
+    n: usize,
+    rng: &mut Rng,
+) -> (Vec<UnitBundle>, Vec<ArmoredBundle>, Vec<BuildingBundle>) {
     let mut units = Vec::new();
     let mut armored = Vec::new();
     let mut buildings = Vec::new();
@@ -175,25 +184,48 @@ fn step(pos: &mut Position, vel: &Velocity) {
     pos.z += vel.z * DT;
 }
 
-fn report(bench: &str, candidate: &str, entities: usize, rounds: usize, elapsed: Duration, checksum: f64) {
+/// Reports one benchmark. `visits` is the number of items actually iterated
+/// (not the total entity count — filtered/partial queries visit fewer), and
+/// `matched` is the number of items that passed the bench's filter.
+#[allow(clippy::too_many_arguments)]
+fn report(
+    bench: &str,
+    candidate: &str,
+    entities: usize,
+    rounds: usize,
+    elapsed: Duration,
+    visits: u64,
+    matched: u64,
+    checksum: f64,
+) {
     let secs = elapsed.as_secs_f64();
-    let per_round = if rounds > 0 { secs / rounds as f64 } else { 0.0 };
-    let throughput = if secs > 0.0 {
-        entities as f64 * rounds as f64 / secs
+    let per_round = if rounds > 0 {
+        secs / rounds as f64
+    } else {
+        0.0
+    };
+    let visits_per_sec = if secs > 0.0 {
+        visits as f64 / secs
+    } else {
+        0.0
+    };
+    let matched_per_sec = if secs > 0.0 {
+        matched as f64 / secs
     } else {
         0.0
     };
     println!(
-        "RESULT candidate={candidate} entities={entities} bench={bench} rounds={rounds} time_ms={:.3} per_round_ms={:.4} throughput_eps={:.0} checksum={checksum:.4}",
+        "RESULT candidate={candidate} entities={entities} bench={bench} rounds={rounds} time_ms={:.3} per_round_ms={:.4} visits={visits} visits_per_sec={:.0} matched={matched} matched_per_sec={:.0} checksum={checksum:.4}",
         secs * 1000.0,
         per_round * 1000.0,
-        throughput,
+        visits_per_sec,
+        matched_per_sec,
     );
 }
 
 fn mem(phase: &str, candidate: &str) {
     println!(
-        "MEM candidate={candidate} phase={phase} alloc_calls={} current_bytes={} peak_bytes={}",
+        "MEM candidate={candidate} phase={phase} alloc_calls={} allocator_live_bytes={} allocator_peak_bytes={}",
         ALLOC_CALLS.load(Ordering::Relaxed),
         CUR_BYTES.load(Ordering::Relaxed),
         PEAK_BYTES.load(Ordering::Relaxed),
@@ -201,6 +233,9 @@ fn mem(phase: &str, candidate: &str) {
 }
 
 // --- bevy_ecs path ---
+//
+// Query handles are constructed inside every round (warmup and measured), the
+// same as the hecs path, so query-lifecycle costs are paid symmetrically.
 
 fn run_bevy(n: usize, rounds: usize, seed: u64) {
     let candidate = "bevy_ecs-0.20.1";
@@ -212,7 +247,16 @@ fn run_bevy(n: usize, rounds: usize, seed: u64) {
     world.spawn_batch(units);
     world.spawn_batch(armored);
     world.spawn_batch(buildings);
-    report("spawn", candidate, n, 1, t.elapsed(), n as f64);
+    report(
+        "spawn",
+        candidate,
+        n,
+        1,
+        t.elapsed(),
+        n as u64,
+        n as u64,
+        n as f64,
+    );
     mem("after_spawn", candidate);
 
     // Deterministic batch update: integrate positions from velocities.
@@ -223,53 +267,101 @@ fn run_bevy(n: usize, rounds: usize, seed: u64) {
         }
     }
     let t = Instant::now();
+    let mut visits = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
         let mut q = world.query::<(&mut Position, &Velocity)>();
         for (mut pos, vel) in q.iter_mut(&mut world) {
             step(&mut pos, vel);
+            visits += 1;
             checksum += f64::from(pos.x + pos.z);
         }
     }
-    report("iterate_update", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "iterate_update",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        checksum,
+    );
 
     // Read-only movement query.
-    let mut q = world.query::<(&Position, &Velocity)>();
     let t = Instant::now();
+    let mut visits = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
+        let mut q = world.query::<(&Position, &Velocity)>();
         for (pos, vel) in q.iter(&world) {
+            visits += 1;
             checksum += f64::from(pos.x + vel.x);
         }
     }
-    report("query_movement_read", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "query_movement_read",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        checksum,
+    );
 
     // Combat query: wounded attackers.
-    let mut q = world.query::<(&Position, &Health, &Attack)>();
     let t = Instant::now();
+    let mut visits = 0u64;
+    let mut matched = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
+        let mut q = world.query::<(&Position, &Health, &Attack)>();
         for (_pos, health, attack) in q.iter(&world) {
+            visits += 1;
             if health.current < health.max * 0.5 {
+                matched += 1;
                 checksum += f64::from(attack.damage + attack.range);
             }
         }
     }
-    report("query_combat_wounded", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "query_combat_wounded",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        matched,
+        checksum,
+    );
 
     // Mixed filtered query: mobile non-buildings.
-    let mut q = world.query_filtered::<(&Position, &Velocity), Without<Building>>();
     let t = Instant::now();
+    let mut visits = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
+        let mut q = world.query_filtered::<(&Position, &Velocity), Without<Building>>();
         for (pos, vel) in q.iter(&world) {
+            visits += 1;
             checksum += f64::from(pos.z - vel.z);
         }
     }
-    report("query_movement_no_building", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "query_movement_no_building",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        checksum,
+    );
 
-    // Churn: despawn + respawn ~1% per round.
+    // Churn: despawn + respawn ~1% per round. The id query is per-round in both
+    // implementations because the world mutates between rounds.
     let t = Instant::now();
+    let mut visits = 0u64;
     for _ in 0..rounds {
         let mut ids: Vec<BevyEntity> = Vec::new();
         {
@@ -285,12 +377,22 @@ fn run_bevy(n: usize, rounds: usize, seed: u64) {
         }
         let fresh: Vec<UnitBundle> = (0..ids.len()).map(|_| unit_bundle(&mut rng)).collect();
         world.spawn_batch(fresh);
+        visits += ids.len() as u64;
     }
-    report("churn_spawn_despawn", candidate, n, rounds, t.elapsed(), 0.0);
+    report(
+        "churn_spawn_despawn",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        0.0,
+    );
     mem("after_churn", candidate);
 }
 
-// --- hecs path ---
+// --- hecs path (same per-round query construction as the bevy path) ---
 
 fn run_hecs(n: usize, rounds: usize, seed: u64) {
     let candidate = "hecs-0.11.2";
@@ -302,7 +404,16 @@ fn run_hecs(n: usize, rounds: usize, seed: u64) {
     world.spawn_batch(units);
     world.spawn_batch(armored);
     world.spawn_batch(buildings);
-    report("spawn", candidate, n, 1, t.elapsed(), n as f64);
+    report(
+        "spawn",
+        candidate,
+        n,
+        1,
+        t.elapsed(),
+        n as u64,
+        n as u64,
+        n as f64,
+    );
     mem("after_spawn", candidate);
 
     // Deterministic batch update.
@@ -312,52 +423,101 @@ fn run_hecs(n: usize, rounds: usize, seed: u64) {
         }
     }
     let t = Instant::now();
+    let mut visits = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
         for (pos, vel) in world.query_mut::<(&mut Position, &Velocity)>() {
             step(pos, vel);
+            visits += 1;
             checksum += f64::from(pos.x + pos.z);
         }
     }
-    report("iterate_update", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "iterate_update",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        checksum,
+    );
 
     // Read-only movement query.
     let t = Instant::now();
+    let mut visits = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
         let mut q = world.query::<(&Position, &Velocity)>();
         for (pos, vel) in q.iter() {
+            visits += 1;
             checksum += f64::from(pos.x + vel.x);
         }
     }
-    report("query_movement_read", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "query_movement_read",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        checksum,
+    );
 
     // Combat query: wounded attackers.
     let t = Instant::now();
+    let mut visits = 0u64;
+    let mut matched = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
         let mut q = world.query::<(&Position, &Health, &Attack)>();
         for (_pos, health, attack) in q.iter() {
+            visits += 1;
             if health.current < health.max * 0.5 {
+                matched += 1;
                 checksum += f64::from(attack.damage + attack.range);
             }
         }
     }
-    report("query_combat_wounded", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "query_combat_wounded",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        matched,
+        checksum,
+    );
 
     // Mixed filtered query: mobile non-buildings.
     let t = Instant::now();
+    let mut visits = 0u64;
     let mut checksum = 0.0f64;
     for _ in 0..rounds {
-        let mut q = world.query::<(&Position, &Velocity)>().without::<&Building>();
+        let mut q = world
+            .query::<(&Position, &Velocity)>()
+            .without::<&Building>();
         for (pos, vel) in q.iter() {
+            visits += 1;
             checksum += f64::from(pos.z - vel.z);
         }
     }
-    report("query_movement_no_building", candidate, n, rounds, t.elapsed(), checksum);
+    report(
+        "query_movement_no_building",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        checksum,
+    );
 
-    // Churn: despawn + respawn ~1% per round.
+    // Churn: despawn + respawn ~1% per round (id query per-round in both).
     let t = Instant::now();
+    let mut visits = 0u64;
     for _ in 0..rounds {
         let ids: Vec<hecs::Entity> = {
             let mut q = world.query::<(hecs::Entity, &Position)>();
@@ -366,14 +526,23 @@ fn run_hecs(n: usize, rounds: usize, seed: u64) {
                 .map(|(entity, _pos)| entity)
                 .collect()
         };
-
         for entity in &ids {
             let _ = world.despawn(*entity);
         }
         let fresh: Vec<UnitBundle> = (0..ids.len()).map(|_| unit_bundle(&mut rng)).collect();
         world.spawn_batch(fresh);
+        visits += ids.len() as u64;
     }
-    report("churn_spawn_despawn", candidate, n, rounds, t.elapsed(), 0.0);
+    report(
+        "churn_spawn_despawn",
+        candidate,
+        n,
+        rounds,
+        t.elapsed(),
+        visits,
+        visits,
+        0.0,
+    );
     mem("after_churn", candidate);
 }
 
@@ -423,7 +592,10 @@ fn main() {
     );
 
     for part in entities.split(',') {
-        let n: usize = part.trim().parse().expect("entity count must be an integer");
+        let n: usize = part
+            .trim()
+            .parse()
+            .expect("entity count must be an integer");
         match candidate.as_str() {
             "bevy" => run_bevy(n, rounds, seed),
             "hecs" => run_hecs(n, rounds, seed),
