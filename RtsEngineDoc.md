@@ -629,6 +629,8 @@ Testing is a primary engineering requirement.
 - Map/schema validation tests.
 - Headless smoke tests.
 
+The M0 subset of these gates is implemented in `.github/workflows/ci.yml`: formatting, Clippy with `-D warnings`, tests, a workspace build, and the CPU-only headless smoke scenario run on `ubuntu-latest` and `windows-latest` for pushes to `main` and pull requests targeting `main`, plus a `cargo audit` dependency job against the committed `Cargo.lock` and a gitleaks secret-scanning job. The workflow uses least-privilege permissions (`contents: read`) and cargo artifact caching; performance timing thresholds are intentionally excluded from shared hosted runners.
+
 ### 15.2 Required test categories
 
 - Unit tests for local rules and data structures.

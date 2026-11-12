@@ -67,4 +67,8 @@ toolchain or graphics development packages are not required by this workspace.
 
 GitHub Actions runs formatting, Clippy, tests, a workspace build, and the
 headless smoke scenario on both Windows and Linux for pushes to `main` and
-pull requests targeting `main`.
+pull requests targeting `main` (`.github/workflows/ci.yml`). A `cargo audit`
+dependency job and a gitleaks secret-scanning job run alongside the Rust
+matrix; the workflow uses least-privilege permissions (`contents: read`) and
+caches cargo artifacts. Performance timing thresholds are deliberately kept
+out of shared hosted runners.
