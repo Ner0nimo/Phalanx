@@ -1,0 +1,12 @@
+[package]
+name = "phalanx_runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+phalanx_core = { path = "../phalanx_core" }
+
+[lints]
+workspace = true
