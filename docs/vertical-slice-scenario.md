@@ -1,6 +1,6 @@
 # M1 Vertical Slice — Scenario and Acceptance Test Specification
 
-- **Status:** Accepted specification for issue #11 (M1 first playable vertical slice)
+- **Status:** Accepted specification for issue #11 (M1 first playable vertical slice); revised for issue #13 (see the corrected §8 worked example and §9 item 3)
 - **Date:** 2026-11-12
 - **Related:** [RtsEngineDoc.md](../RtsEngineDoc.md) §2 (gameplay model), §6 (simulation model), §9.4 (combat), §13 (replays/hashing), §15 (testing), §18 (M1); [ADR-0001](adr/0001-authoritative-simulation.md) (authoritative simulation and determinism contract); `phalanx_core` contracts from issues #5–#7 (`SimulationRunner`/`Phase`, `CommandEnvelope`, `EntityId`, `RngStreams`, `canonical_hash`, `replay_recording`).
 
@@ -94,10 +94,10 @@ Scripted commands (all submitted before tick 1; command IDs assigned in submissi
 
 Both armies converge on the chokepoint at (100, 100); both striker groups travel the same 80 m at the same speed and arrive on the same tick. The only asymmetry is the `EntityId` tie-break in simultaneous fire (§6 item 4), which Team A wins because its units are allocated first and have lower IDs.
 
-**Worked timing expectations** (derivable from §5–§6; the test asserts these exact values):
+**Worked timing expectations** (derivable from §5–§6; the test computes them from the rules rather than hardcoding):
 
 - Distance from each spawn pad center to (100, 100) is 80 m; strikers at 0.2 m/tick take 400 ticks to arrive if unobstructed; the chokepoint and congestion only delay, never change, the deterministic outcome.
-- First `DamageDealt` occurs at the tick when the first striker pair is within 10 m. The spawn pads are 160 m apart (x = 20 vs x = 180) and both striker groups close at 0.2 m/tick each (0.4 m/tick combined), so first contact is ≈ tick 375: (160 − 10) m ÷ 0.4 m/tick = 375 ticks, adjusted only by the deterministic separation rules. The test computes the expected tick from the rules and asserts it matches the recorded event.
+- First `DamageDealt` occurs at the tick when the first striker pair is within 10 m. The spawn pads are 160 m apart (x = 20 vs x = 180) and both striker groups close at 0.2 m/tick each (0.4 m/tick combined), so first contact is ≈ tick 375: (160 − 10) m ÷ 0.4 m/tick = 375 ticks. The fixed spawn layout offsets individual units by up to 2 m per axis and the chokepoint rocks/congestion only delay, so the test computes the 375-tick estimate from the rules and asserts the recorded first `DamageDealt` tick lies in a window around it (the issue #13 implementation records tick 384); the exact per-tick state is pinned by the replay digests.
 - Each striker kill takes 10 hits × 20 ticks cooldown = 200 ticks after first contact with that target. Skirmishers (60 HP, 6 damage) die in 10 hits as well.
 - Match ends with `MatchOver { winner: Team A }` no later than tick 2000 (100 s of simulation); the exact end tick is whatever the deterministic rules produce and is asserted via the recorded events and hashes, not hardcoded.
 
@@ -107,7 +107,7 @@ The scenario runs fully headless (no window/GPU; `phalanx_runtime --headless` pa
 
 1. **Determinism/replay (M1 exit):** record the scenario with `ReplayRecorder` (commands as above, seed fixed), then `replay_recording` into a fresh runner reproduces **identical per-tick canonical state hashes** on the same build/platform. Replay checkpoints: record the canonical hash every 100 ticks (plus the final tick) in the `ReplayRecording`.
 2. **Divergence detection:** replaying the recording with one command's payload altered must report `first_divergent_tick = Some(<the altered command's target tick or the tick its effect first lands>)`.
-3. **Event assertions:** the recorded event stream contains `DamageDealt` from the expected first-contact tick and `UnitDestroyed` for exactly 6 Team B units followed by `MatchOver { winner: Team A, .. }`; no Team A unit dies (lower-ID tie advantage plus identical stats).
+3. **Event assertions:** the recorded event stream contains `DamageDealt` from the expected first-contact tick and `UnitDestroyed` for exactly the 6 Team B units followed by `MatchOver { winner: Team A, .. }`. Under the §6 nearest-target rule, Team B's strikers focus the nearest Team A striker and destroy it before being wiped, so one Team A unit dying is the rule-derived outcome (the issue #13 implementation records one Team A striker destroyed at tick 470; the lower-`EntityId` tie-break only decides simultaneous same-tick volleys, it does not prevent focus fire). The exact event stream and end tick are pinned by the recorded events and replay hashes, not hardcoded.
 4. **Chokepoint/movement test:** a variant scenario with a single striker issued `Move { destination: (180, 100) }` must produce a path through the wall lane (all path grid cells within z∈(62,138) while x∈[55,145]), the unit never overlaps another unit or obstacle (separation invariant checked every tick), and arrival at the destination within the rule-derived tick bound (path length / 0.2 m per tick ± deterministic congestion bound). The full path is part of replay state.
 5. **CI budget:** the full scenario (≤ 2000 ticks) executes in under 5 s wall-clock on hosted runners; the test is part of `cargo test --workspace` on both OS targets.
 

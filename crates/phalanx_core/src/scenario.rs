@@ -27,6 +27,7 @@ pub fn scenario_commands() -> Vec<CommandRequest<CommandPayload>> {
             request_id: RequestId(index + 1),
             actor: ActorId(0),
             tick: 2 * (index + 1),
+            subject: None,
             payload: CommandPayload::Diagnostics { value: 100 + index },
         })
         .collect()
@@ -67,9 +68,9 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
         let values: Vec<u64> = simulation
             .commands_for_current_tick()
             .iter()
-            .map(|command| {
-                let CommandPayload::Diagnostics { value } = command.payload();
-                *value
+            .map(|command| match command.payload() {
+                CommandPayload::Diagnostics { value } => *value,
+                _ => 0,
             })
             .collect();
         for value in values {

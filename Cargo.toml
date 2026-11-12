@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/phalanx_core", "crates/phalanx_navigation", "crates/phalanx_runtime"]
+members = [
+    "crates/phalanx_core",
+    "crates/phalanx_game",
+    "crates/phalanx_navigation",
+    "crates/phalanx_runtime",
+]
 # The spike benchmarks are detached workspaces of their own (see ADR-0003 and
 # ADR-0004); CI gates intentionally do not build them (dedicated jobs do).
 exclude = ["benchmarks/ecs", "benchmarks/graphics", "benchmarks/navigation"]

@@ -164,6 +164,7 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
             command_id,
             request.actor,
             request.tick,
+            request.subject,
             request.payload,
         )
         .expect("ENVELOPE_VERSION is always supported");
@@ -349,6 +350,7 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
             request_id: envelope.request_id(),
             actor: envelope.actor(),
             tick: envelope.tick(),
+            subject: envelope.subject(),
             payload: envelope.payload().clone(),
         };
         runner
@@ -448,6 +450,7 @@ mod tests {
             envelope.command_id(),
             envelope.actor(),
             envelope.tick(),
+            envelope.subject(),
             CommandPayload::Diagnostics { value: 999_999 },
         )
         .expect("current version");
