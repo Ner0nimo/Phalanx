@@ -16,7 +16,7 @@ const COMPUTE_WGSL: &str = r#"
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = id.x;
     if (index < arrayLength(&data)) {
-        data[index] = data[index] ^ 0x5EED_0001u;
+        data[index] = data[index] ^ 0x5EED0001u;
     }
 }
 "#;
@@ -38,6 +38,14 @@ fn print_planned_workload() {
 
 fn main() {
     println!("INIT candidate=wgpu version=30.0.1 backends=all validation=on unsafe_blocks=0");
+
+    // Validate the WGSL up front (no device needed) so a shader bug fails this
+    // gate on every runner, GPU or not.
+    if let Err(error) = wgpu::naga::front::wgsl::parse_str(COMPUTE_WGSL) {
+        println!("SHADER candidate=wgpu language=wgsl parsed_ok=false error=\"{error}\"");
+        std::process::exit(1);
+    }
+    println!("SHADER candidate=wgpu language=wgsl parsed_ok=true (pre-device naga validation)");
 
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::all();
