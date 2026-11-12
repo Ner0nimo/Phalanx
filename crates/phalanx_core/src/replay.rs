@@ -2,19 +2,21 @@
 //! `RtsEngineDoc.md` §13.2–13.3).
 //!
 //! A [`ReplayRecording`] captures the replay metadata (format and simulation
-//! schema versions, tick rate, master RNG seed), the tick-indexed command
-//! stream, and the per-tick canonical state hashes. [`replay_recording`]
-//! replays a recording into a fresh simulation instance and reports the first
-//! tick whose state hash diverges, with subsystem-agnostic tick granularity.
+//! schema versions, digest algorithm, tick rate, master RNG seed), the
+//! tick-indexed command stream, and the per-tick canonical state digests.
+//! [`replay_recording`] replays a recording into a fresh simulation instance
+//! and reports the first tick whose state digest diverges, with
+//! subsystem-agnostic tick granularity. Recordings made with a different
+//! digest algorithm or an unsupported format version are rejected explicitly.
 //!
 //! A same-build replay on the same supported platform reproduces identical
-//! per-tick hashes. Cross-platform bit-identical lockstep is a separate
+//! per-tick digests. Cross-platform bit-identical lockstep is a separate
 //! acceptance target and is not claimed here (ADR-0001 Decision §5).
 
 use crate::command::{
     CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
 };
-use crate::hash::CanonicalSerialize;
+use crate::hash::{CanonicalSerialize, Digest, DigestAlgorithm};
 use crate::simulation::{SIMULATION_SCHEMA_VERSION, SimulationRunner, TickRate};
 
 /// The replay container format version. Recorded in every replay; bump on
@@ -26,20 +28,22 @@ pub const REPLAY_FORMAT_VERSION: u32 = 1;
 pub struct ReplayRecording<P> {
     format_version: u32,
     simulation_version: u32,
+    digest_algorithm: DigestAlgorithm,
     tick_rate: TickRate,
     rng_seed: u64,
     commands: Vec<CommandEnvelope<P>>,
-    tick_hashes: Vec<u64>,
+    tick_hashes: Vec<Digest>,
 }
 
 impl<P> ReplayRecording<P> {
     /// Creates an empty recording with the current format and simulation
-    /// schema versions.
+    /// schema versions and the current digest algorithm.
     #[must_use]
     pub fn new(tick_rate: TickRate, rng_seed: u64) -> Self {
         Self {
             format_version: REPLAY_FORMAT_VERSION,
             simulation_version: SIMULATION_SCHEMA_VERSION,
+            digest_algorithm: DigestAlgorithm::current(),
             tick_rate,
             rng_seed,
             commands: Vec::new(),
@@ -57,6 +61,13 @@ impl<P> ReplayRecording<P> {
     #[must_use]
     pub const fn simulation_version(&self) -> u32 {
         self.simulation_version
+    }
+
+    /// Returns the digest algorithm the per-tick digests were recorded with.
+    /// Replays reject recordings made with a different algorithm.
+    #[must_use]
+    pub const fn digest_algorithm(&self) -> DigestAlgorithm {
+        self.digest_algorithm
     }
 
     /// Returns the tick rate the recording was made with.
@@ -83,9 +94,9 @@ impl<P> ReplayRecording<P> {
         &mut self.commands
     }
 
-    /// Returns the recorded per-tick canonical state hashes, in tick order.
+    /// Returns the recorded per-tick canonical state digests, in tick order.
     #[must_use]
-    pub fn tick_hashes(&self) -> &[u64] {
+    pub fn tick_hashes(&self) -> &[Digest] {
         &self.tick_hashes
     }
 
@@ -94,9 +105,9 @@ impl<P> ReplayRecording<P> {
         self.commands.push(envelope);
     }
 
-    /// Appends a per-tick state hash to the recording.
-    pub fn push_tick_hash(&mut self, hash: u64) {
-        self.tick_hashes.push(hash);
+    /// Appends a per-tick state digest to the recording.
+    pub fn push_tick_hash(&mut self, digest: Digest) {
+        self.tick_hashes.push(digest);
     }
 }
 
@@ -150,23 +161,23 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
     }
 
     /// Advances the recorded run by exactly one tick and records its state
-    /// hash.
+    /// digest.
     ///
-    /// Fails with [`ReplayError::HashRecordingDisabled`] if per-tick hash
-    /// recording was disabled on the runner; a stale previous hash is never
+    /// Fails with [`ReplayError::HashRecordingDisabled`] if per-tick digest
+    /// recording was disabled on the runner; a stale previous digest is never
     /// recorded silently.
     pub fn step_tick(&mut self) -> Result<(), ReplayError> {
         let recorded_before = self.runner.tick_hashes().len();
         self.runner
             .step_tick()
             .map_err(|_| ReplayError::TickOverflow)?;
-        let hash = self
+        let digest = self
             .runner
             .tick_hashes()
             .get(recorded_before)
-            .copied()
+            .cloned()
             .ok_or(ReplayError::HashRecordingDisabled)?;
-        self.recording.push_tick_hash(hash);
+        self.recording.push_tick_hash(digest);
         Ok(())
     }
 
@@ -189,7 +200,7 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplayReport {
     ticks_executed: u64,
-    tick_hashes: Vec<u64>,
+    tick_hashes: Vec<Digest>,
     first_divergent_tick: Option<u64>,
 }
 
@@ -200,9 +211,9 @@ impl ReplayReport {
         self.ticks_executed
     }
 
-    /// Returns the per-tick canonical state hashes produced by the replay.
+    /// Returns the per-tick canonical state digests produced by the replay.
     #[must_use]
-    pub fn tick_hashes(&self) -> &[u64] {
+    pub fn tick_hashes(&self) -> &[Digest] {
         &self.tick_hashes
     }
 
@@ -227,12 +238,18 @@ impl ReplayReport {
 pub enum ReplayError {
     /// The recording's format version is not supported by this harness.
     UnsupportedFormatVersion { found: u32, expected: u32 },
+    /// The recording's digest algorithm is not the one this build produces;
+    /// digests of a different algorithm or width cannot be compared.
+    IncompatibleDigestAlgorithm {
+        expected: DigestAlgorithm,
+        found: DigestAlgorithm,
+    },
     /// A recorded command was rejected during replay.
     InvalidRecordedCommand(CommandSubmitError),
     /// The replay ran out of representable ticks.
     TickOverflow,
-    /// Per-tick hash recording is disabled, so no fresh state hash exists for
-    /// the tick that was just executed.
+    /// Per-tick digest recording is disabled, so no fresh state digest exists
+    /// for the tick that was just executed.
     HashRecordingDisabled,
 }
 
@@ -242,6 +259,10 @@ impl std::fmt::Display for ReplayError {
             Self::UnsupportedFormatVersion { found, expected } => write!(
                 formatter,
                 "unsupported replay format version {found} (expected {expected})"
+            ),
+            Self::IncompatibleDigestAlgorithm { expected, found } => write!(
+                formatter,
+                "incompatible digest algorithm: this build produces {expected:?}, recording uses {found:?}"
             ),
             Self::InvalidRecordedCommand(error) => {
                 write!(formatter, "recorded command rejected: {error}")
@@ -258,7 +279,7 @@ impl std::error::Error for ReplayError {}
 
 /// Replays a recording into a fresh simulation instance for exactly `ticks`
 /// ticks, registering systems through `setup`, and compares the per-tick
-/// canonical state hashes against the recorded ones.
+/// canonical state digests against the recorded ones.
 ///
 /// All recorded commands are submitted up front in recorded order, mirroring
 /// how the recording was made, so command IDs and bookkeeping match exactly.
@@ -273,6 +294,21 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
             found: recording.format_version(),
             expected: REPLAY_FORMAT_VERSION,
         });
+    }
+    let current_algorithm = DigestAlgorithm::current();
+    if recording.digest_algorithm() != current_algorithm {
+        return Err(ReplayError::IncompatibleDigestAlgorithm {
+            expected: current_algorithm,
+            found: recording.digest_algorithm(),
+        });
+    }
+    for digest in recording.tick_hashes() {
+        digest
+            .expect_algorithm(current_algorithm)
+            .map_err(|mismatch| ReplayError::IncompatibleDigestAlgorithm {
+                expected: mismatch.expected,
+                found: mismatch.found,
+            })?;
     }
 
     let mut runner = SimulationRunner::new(recording.tick_rate(), recording.rng_seed());
@@ -293,12 +329,12 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
     for _ in 0..ticks {
         let recorded_before = runner.tick_hashes().len();
         runner.step_tick().map_err(|_| ReplayError::TickOverflow)?;
-        let hash = runner
+        let digest = runner
             .tick_hashes()
             .get(recorded_before)
-            .copied()
+            .cloned()
             .ok_or(ReplayError::HashRecordingDisabled)?;
-        tick_hashes.push(hash);
+        tick_hashes.push(digest);
     }
 
     let recorded = recording.tick_hashes();
@@ -373,9 +409,8 @@ mod tests {
         let mut recording = record_scenario(SCENARIO_TICKS);
         // Alter the payload of the command targeting tick 10 (index 4: ticks
         // 2, 4, 6, 8, 10, ...).
-        let altered_tick = recording.commands()[4].tick();
-        assert_eq!(altered_tick, 10);
         let envelope = &recording.commands()[4];
+        assert_eq!(envelope.tick(), 10);
         recording.commands_mut()[4] = CommandEnvelope::new(
             ENVELOPE_VERSION,
             envelope.request_id(),
@@ -386,10 +421,32 @@ mod tests {
         )
         .expect("current version");
 
+        // The pending command queue is authoritative input state and is part
+        // of the canonical digest from submission, so the altered command
+        // diverges the state already at tick 1.
         let report = replay_recording(&recording, SCENARIO_TICKS, setup_scenario)
             .expect("replay should succeed");
         assert!(report.diverged());
-        assert_eq!(report.first_divergent_tick(), Some(altered_tick));
+        assert_eq!(report.first_divergent_tick(), Some(1));
+    }
+
+    #[test]
+    fn incompatible_digest_algorithm_is_rejected() {
+        let mut recording = record_scenario(4);
+        assert_eq!(
+            recording.digest_algorithm(),
+            crate::hash::DigestAlgorithm::current()
+        );
+        // A recording made with a different digest algorithm/width cannot be
+        // compared against this build's digests and is rejected explicitly.
+        recording.digest_algorithm = crate::hash::DigestAlgorithm::Fnv1a32;
+        assert_eq!(
+            replay_recording(&recording, 4, setup_scenario),
+            Err(ReplayError::IncompatibleDigestAlgorithm {
+                expected: crate::hash::DigestAlgorithm::Fnv1a64,
+                found: crate::hash::DigestAlgorithm::Fnv1a32,
+            })
+        );
     }
 
     #[test]

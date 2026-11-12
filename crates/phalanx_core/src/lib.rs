@@ -5,7 +5,8 @@
 //! `RtsEngineDoc.md` §6.1. The [`entity`], [`rng`], and [`command`] modules
 //! provide the stable entity IDs, deterministic RNG streams, and versioned
 //! tick-indexed command envelope that authoritative state is built on. The
-//! [`hash`] and [`replay`] modules provide canonical state hashing and the
+//! [`hash`] module provides the versioned canonical encoding contract and the
+//! replaceable state-digest interface, and [`replay`] provides the
 //! deterministic replay harness, with a small CI scenario in [`scenario`].
 //! The smoke scenario below is infrastructure validation only; it is
 //! deliberately not a gameplay simulation.

@@ -20,7 +20,7 @@ use crate::command::{
     CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
 };
 use crate::entity::EntityAllocator;
-use crate::hash::{CanonicalHasher, CanonicalSerialize};
+use crate::hash::{CANONICAL_ENCODING_VERSION, CanonicalSerialize, Digest, canonical_digest};
 use crate::rng::RngStreams;
 
 pub use crate::TickOverflow;
@@ -257,30 +257,36 @@ impl<P> Simulation<P> {
     }
 }
 
+/// Canonical encoding of the authoritative simulation state (ADR-0001
+/// Decision §8, `RtsEngineDoc.md` §13.3, encoding contract in
+/// [`crate::hash`]). Covers the encoding and schema versions, tick, entity
+/// allocator, RNG stream states, the full command bookkeeping (pending queue,
+/// applied commands, accepted requests, command-ID sequence) — the pending
+/// queue is authoritative input state and is hashed from submission. Ordering
+/// is stable and logical (slot index, stream name, tick, command ID) and never
+/// depends on storage layout. Renderer/GPU state and wall-clock data cannot
+/// enter because the authoritative types do not contain them.
+impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
+    fn write_canonical(&self, sink: &mut dyn crate::hash::CanonicalSink) {
+        sink.write_u32(CANONICAL_ENCODING_VERSION);
+        sink.write_u32(SIMULATION_SCHEMA_VERSION);
+        sink.write_u64(self.tick);
+        self.entities.write_canonical(sink);
+        self.rng.write_canonical(sink);
+        self.pending_commands.write_canonical(sink);
+        self.current_tick_commands.write_canonical(sink);
+        self.seen_requests.write_canonical(sink);
+        sink.write_u64(self.next_command_id);
+    }
+}
+
 impl<P: CanonicalSerialize> Simulation<P> {
-    /// Produces the canonical state hash of the authoritative simulation
-    /// state (ADR-0001 Decision §8, `RtsEngineDoc.md` §13.3).
-    ///
-    /// The hash covers the schema version, tick, entity allocator, RNG stream
-    /// states, the accepted-request bookkeeping, and the commands applied at
-    /// the current tick. It uses stable logical ordering (slot index, stream
-    /// name, command ID) and never depends on storage layout. The pending
-    /// input queue is deliberately not hashed: it is the recorded command
-    /// stream (see [`crate::replay`]) and is compared through execution, so an
-    /// altered input is reported at the tick where it is applied rather than
-    /// at tick 1. Renderer/GPU state and wall-clock data cannot enter the hash
-    /// because the authoritative types do not contain them.
+    /// Produces the canonical state digest of the authoritative simulation
+    /// state (ADR-0001 Decision §8). The concrete algorithm is hidden behind
+    /// [`Digest`]; see [`crate::hash`] for the versioned encoding contract.
     #[must_use]
-    pub fn canonical_hash(&self) -> u64 {
-        let mut hasher = CanonicalHasher::new();
-        hasher.write_u32(SIMULATION_SCHEMA_VERSION);
-        hasher.write_u64(self.tick);
-        self.entities.write_canonical(&mut hasher);
-        self.rng.write_canonical(&mut hasher);
-        self.current_tick_commands.write_canonical(&mut hasher);
-        self.seen_requests.write_canonical(&mut hasher);
-        hasher.write_u64(self.next_command_id);
-        hasher.finish()
+    pub fn canonical_digest(&self) -> Digest {
+        canonical_digest(self)
     }
 }
 
@@ -323,7 +329,7 @@ pub struct SimulationRunner<P> {
     simulation: Simulation<P>,
     tick_rate: TickRate,
     systems: Vec<RegisteredSystem<P>>,
-    hashes: Vec<u64>,
+    hashes: Vec<Digest>,
     record_hashes: bool,
 }
 
@@ -342,10 +348,10 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         }
     }
 
-    /// Returns the canonical state hash recorded for each executed tick, in
-    /// tick order. Empty when hash recording is disabled.
+    /// Returns the canonical state digest recorded for each executed tick, in
+    /// tick order. Empty when digest recording is disabled.
     #[must_use]
-    pub fn tick_hashes(&self) -> &[u64] {
+    pub fn tick_hashes(&self) -> &[Digest] {
         &self.hashes
     }
 
@@ -355,10 +361,10 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         self.record_hashes
     }
 
-    /// Enables or disables per-tick state hash recording. Hashing is always
-    /// available via [`Simulation::canonical_hash`]; recording may be disabled
-    /// in release builds (`RtsEngineDoc.md` §13.3) but must stay enabled in
-    /// tests and diagnostic builds.
+    /// Enables or disables per-tick state digest recording. Digesting is
+    /// always available via [`Simulation::canonical_digest`]; recording may be
+    /// disabled in release builds (`RtsEngineDoc.md` §13.3) but must stay
+    /// enabled in tests and diagnostic builds.
     pub fn set_record_hashes(&mut self, enabled: bool) {
         self.record_hashes = enabled;
     }
@@ -478,7 +484,7 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         // Phase 15 (produce state hash): hash after all phases ran, while the
         // tick's applied commands are still visible.
         if *record_hashes {
-            hashes.push(simulation.canonical_hash());
+            hashes.push(simulation.canonical_digest());
         }
         simulation.current_tick_commands.clear();
         Ok(())
