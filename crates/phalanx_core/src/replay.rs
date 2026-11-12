@@ -11,7 +11,6 @@
 //! per-tick hashes. Cross-platform bit-identical lockstep is a separate
 //! acceptance target and is not claimed here (ADR-0001 Decision §5).
 
-use crate::TickOverflow;
 use crate::command::{
     CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
 };
@@ -152,16 +151,27 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
 
     /// Advances the recorded run by exactly one tick and records its state
     /// hash.
-    pub fn step_tick(&mut self) -> Result<(), TickOverflow> {
-        self.runner.step_tick()?;
-        if let Some(&hash) = self.runner.tick_hashes().last() {
-            self.recording.push_tick_hash(hash);
-        }
+    ///
+    /// Fails with [`ReplayError::HashRecordingDisabled`] if per-tick hash
+    /// recording was disabled on the runner; a stale previous hash is never
+    /// recorded silently.
+    pub fn step_tick(&mut self) -> Result<(), ReplayError> {
+        let recorded_before = self.runner.tick_hashes().len();
+        self.runner
+            .step_tick()
+            .map_err(|_| ReplayError::TickOverflow)?;
+        let hash = self
+            .runner
+            .tick_hashes()
+            .get(recorded_before)
+            .copied()
+            .ok_or(ReplayError::HashRecordingDisabled)?;
+        self.recording.push_tick_hash(hash);
         Ok(())
     }
 
     /// Advances the recorded run by exactly `count` ticks.
-    pub fn advance_ticks(&mut self, count: u64) -> Result<(), TickOverflow> {
+    pub fn advance_ticks(&mut self, count: u64) -> Result<(), ReplayError> {
         for _ in 0..count {
             self.step_tick()?;
         }
@@ -197,7 +207,9 @@ impl ReplayReport {
     }
 
     /// Returns the first tick whose state hash differs from the recording, or
-    /// `None` if the replay reproduced the recording exactly.
+    /// `None` if the replay reproduced the recording exactly. If the replay
+    /// and the recording cover different numbers of ticks, the first tick
+    /// not covered by both is reported as divergent.
     #[must_use]
     pub const fn first_divergent_tick(&self) -> Option<u64> {
         self.first_divergent_tick
@@ -219,6 +231,9 @@ pub enum ReplayError {
     InvalidRecordedCommand(CommandSubmitError),
     /// The replay ran out of representable ticks.
     TickOverflow,
+    /// Per-tick hash recording is disabled, so no fresh state hash exists for
+    /// the tick that was just executed.
+    HashRecordingDisabled,
 }
 
 impl std::fmt::Display for ReplayError {
@@ -232,6 +247,9 @@ impl std::fmt::Display for ReplayError {
                 write!(formatter, "recorded command rejected: {error}")
             }
             Self::TickOverflow => formatter.write_str("replay tick counter overflowed"),
+            Self::HashRecordingDisabled => {
+                formatter.write_str("per-tick state hash recording is disabled")
+            }
         }
     }
 }
@@ -273,17 +291,28 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
 
     let mut tick_hashes = Vec::new();
     for _ in 0..ticks {
+        let recorded_before = runner.tick_hashes().len();
         runner.step_tick().map_err(|_| ReplayError::TickOverflow)?;
-        if let Some(&hash) = runner.tick_hashes().last() {
-            tick_hashes.push(hash);
-        }
+        let hash = runner
+            .tick_hashes()
+            .get(recorded_before)
+            .copied()
+            .ok_or(ReplayError::HashRecordingDisabled)?;
+        tick_hashes.push(hash);
     }
 
-    let first_divergent_tick = tick_hashes
+    let recorded = recording.tick_hashes();
+    let mut first_divergent_tick = tick_hashes
         .iter()
-        .zip(recording.tick_hashes())
+        .zip(recorded)
         .enumerate()
         .find_map(|(index, (actual, expected))| (actual != expected).then_some(index as u64 + 1));
+    // A length mismatch means the replay did not verify every recorded tick;
+    // report the first tick not covered by both as divergent.
+    if first_divergent_tick.is_none() && !recorded.is_empty() && tick_hashes.len() != recorded.len()
+    {
+        first_divergent_tick = Some(tick_hashes.len().min(recorded.len()) as u64 + 1);
+    }
 
     Ok(ReplayReport {
         ticks_executed: ticks,
@@ -384,5 +413,36 @@ mod tests {
                 CommandPayload::Diagnostics { .. }
             ));
         }
+    }
+
+    #[test]
+    fn disabled_hash_recording_is_an_explicit_error_not_a_stale_hash() {
+        // Recorder side: disabling recording must fail loudly.
+        let mut recorder = ReplayRecorder::<CommandPayload>::new(TickRate::DEFAULT, 1);
+        recorder.runner_mut().set_record_hashes(false);
+        assert_eq!(
+            recorder.advance_ticks(1),
+            Err(ReplayError::HashRecordingDisabled)
+        );
+        assert!(recorder.finish().tick_hashes().is_empty());
+
+        // Replay side: same guard.
+        let recording = record_scenario(4);
+        let result = replay_recording(&recording, 4, |runner| {
+            setup_scenario(runner);
+            runner.set_record_hashes(false);
+        });
+        assert_eq!(result, Err(ReplayError::HashRecordingDisabled));
+    }
+
+    #[test]
+    fn replay_length_mismatch_reports_the_first_unverified_tick() {
+        let recording = record_scenario(SCENARIO_TICKS);
+        // Replay only half the recorded ticks: the common prefix matches, but
+        // ticks 9..=16 were never verified.
+        let report = replay_recording(&recording, SCENARIO_TICKS / 2, setup_scenario)
+            .expect("replay should succeed");
+        assert_eq!(report.ticks_executed(), SCENARIO_TICKS / 2);
+        assert_eq!(report.first_divergent_tick(), Some(SCENARIO_TICKS / 2 + 1));
     }
 }
