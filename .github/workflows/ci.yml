@@ -117,6 +117,40 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+  # The navigation baseline benchmark is a detached workspace (issue #12).
+  # It only builds and lints here; timings are not run on shared runners.
+  nav-bench-checks:
+    name: Benchmark crate checks (benchmarks/navigation)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: benchmarks/navigation
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmarks/navigation
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
   # The graphics spike is a detached workspace (see ADR-0004). Build and run
   # both candidate binaries headless on both OSes; on GPU-less runners they
   # report structured "no adapter" results and exit 0, which records native

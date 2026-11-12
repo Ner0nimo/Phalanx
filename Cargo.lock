@@ -7,6 +7,13 @@ name = "phalanx_core"
 version = "0.1.0"
 
 [[package]]
+name = "phalanx_navigation"
+version = "0.1.0"
+dependencies = [
+ "phalanx_core",
+]
+
+[[package]]
 name = "phalanx_runtime"
 version = "0.1.0"
 dependencies = [

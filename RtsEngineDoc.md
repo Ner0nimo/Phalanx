@@ -333,6 +333,8 @@ Do not use an untyped global event bus as a substitute for clear ownership or di
 
 Navigation is a core differentiator and must be designed as three cooperating layers.
 
+**Prototype status (issue #12):** `phalanx_navigation` implements the first CPU-only prototype: a 1 m `NavGrid` over static maps (obstacles inflated by the unit radius), deterministic A* route queries with explicit unreachable/blocked outcomes, a budgeted per-tick path-request queue, move orders with observable completed/failed status, route following with separation that never lets a unit cross an obstacle or another unit (movement is clamped against occupied cells; recomputed routes dynamically avoid congested cells), and machine-readable diagnostics (`NavDiagnostics`, canonical-encoded). The `MovementSystem` runs in `Phase::ResolveMovement` with its state in the canonical checkpoint digest, so movement is covered by replays and snapshots. Baseline benchmark: `benchmarks/navigation` (1k/10k units). Not yet implemented: flow fields, hierarchical navigation, GPU avoidance, formations (§7.3), multiple profiles beyond the data-driven `MovementProfile`.
+
 ### 7.1 Global navigation
 
 Responsible for route selection across the map:

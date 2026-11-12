@@ -54,6 +54,14 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
         "scenario"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn run(&mut self, simulation: &mut Simulation<CommandPayload>, _phase: Phase) {
         let _ambient = simulation.rng_mut().stream("ambient").next_u64();
         let values: Vec<u64> = simulation

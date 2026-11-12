@@ -457,6 +457,12 @@ pub trait SimulationSystem<P> {
     /// Stable diagnostic name used by tests and replay diagnostics.
     fn name(&self) -> &'static str;
 
+    /// Downcast access for inspection/diagnostics.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Mutable downcast access for setup/diagnostics.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
     /// Writes this system's authoritative state (including behavior-relevant
     /// configuration) into the canonical stream. Stateless systems use the
     /// default, which writes nothing. This is the ONLY system state included
@@ -628,6 +634,24 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     #[must_use]
     pub const fn simulation(&self) -> &Simulation<P> {
         &self.simulation
+    }
+
+    /// Returns mutable access to the authoritative simulation state, for
+    /// setup (world construction, spawning) outside system hooks.
+    #[must_use]
+    pub fn simulation_mut(&mut self) -> &mut Simulation<P> {
+        &mut self.simulation
+    }
+
+    /// Returns the registered system with the given ID, for inspection and
+    /// downcast access (via [`SimulationSystem::as_any`]).
+    pub fn system_mut(&mut self, id: SystemId) -> Option<&mut dyn SimulationSystem<P>> {
+        for registered in &mut self.systems {
+            if registered.id == id {
+                return Some(&mut *registered.system);
+            }
+        }
+        None
     }
 
     /// Registers a system. The phase schedule comes from [`Phase::SCHEDULE`]
@@ -923,6 +947,14 @@ mod tests {
             self.name
         }
 
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
         fn run(&mut self, simulation: &mut Simulation<P>, phase: Phase) {
             self.trace
                 .borrow_mut()
@@ -1133,6 +1165,14 @@ mod tests {
                 "command-probe"
             }
 
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+
             fn run(&mut self, simulation: &mut Simulation<u32>, _phase: Phase) {
                 self.log.borrow_mut().push((
                     simulation.tick(),
@@ -1311,6 +1351,14 @@ mod tests {
                 "world-probe"
             }
 
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+
             fn run(&mut self, simulation: &mut Simulation<()>, _phase: Phase) {
                 let entity = simulation
                     .entities_mut()
@@ -1392,6 +1440,14 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "counter"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
         }
 
         fn write_canonical_state(&self, sink: &mut dyn CanonicalSink) {
@@ -1496,6 +1552,14 @@ mod tests {
             fn name(&self) -> &'static str {
                 "extra"
             }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
             fn run(&mut self, _simulation: &mut Simulation<u32>, _phase: Phase) {}
         }
 
@@ -1599,6 +1663,14 @@ mod tests {
 
         fn name(&self) -> &'static str {
             self.id
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
         }
 
         fn run(&mut self, _simulation: &mut Simulation<P>, _phase: Phase) {}
