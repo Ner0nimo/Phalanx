@@ -13,23 +13,32 @@ fn main() -> ExitCode {
 }
 
 fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let arguments: Vec<String> = args.collect();
     let mut headless = false;
     let mut ticks = 8_u64;
-    let mut args = args;
+    let mut index = 0;
 
-    while let Some(argument) = args.next() {
-        match argument.as_str() {
+    while index < arguments.len() {
+        match arguments[index].as_str() {
             "--headless" => headless = true,
             "--ticks" => {
-                let value = args.next().ok_or("--ticks requires a non-negative integer")?;
-                ticks = value.parse().map_err(|_| format!("invalid tick count: {value}"))?;
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or("--ticks requires a non-negative integer")?;
+                ticks = value
+                    .parse()
+                    .map_err(|_| format!("invalid tick count: {value}"))?;
             }
             "--help" | "-h" => {
-                println!("Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT]\n\nRuns the deterministic CPU-only infrastructure smoke scenario.");
+                println!(
+                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT]\n\nRuns the deterministic CPU-only infrastructure smoke scenario."
+                );
                 return Ok(());
             }
             unknown => return Err(format!("unknown argument: {unknown}")),
         }
+        index += 1;
     }
 
     if !headless {
@@ -41,8 +50,11 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         scenario.advance_tick().map_err(|error| error.to_string())?;
     }
 
-    println!("Phalanx headless smoke run: ticks={}, digest=0x{:016x}",
-        scenario.tick(), scenario.digest());
+    println!(
+        "Phalanx headless smoke run: ticks={}, digest=0x{:016x}",
+        scenario.tick(),
+        scenario.digest()
+    );
     Ok(())
 }
 
