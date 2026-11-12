@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hash::{CanonicalHasher, CanonicalSerialize};
+use crate::hash::{CanonicalSerialize, CanonicalSink};
 
 const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const MIX1: u64 = 0xBF58_476D_1CE4_E5B9;
@@ -76,8 +76,8 @@ impl RngStream {
 }
 
 impl CanonicalSerialize for RngStream {
-    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
-        hasher.write_u64(self.state);
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u64(self.state);
     }
 }
 
@@ -214,12 +214,12 @@ impl RngStreams {
 /// Canonical form: master seed, then streams in name order (the registry is a
 /// `BTreeMap`), each with its recorded state.
 impl CanonicalSerialize for RngStreams {
-    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
-        hasher.write_u64(self.master_seed);
-        hasher.write_u64(self.streams.len() as u64);
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u64(self.master_seed);
+        sink.write_u64(self.streams.len() as u64);
         for (name, stream) in &self.streams {
-            hasher.write_bytes(name.as_bytes());
-            stream.write_canonical(hasher);
+            sink.write_bytes(name.as_bytes());
+            stream.write_canonical(sink);
         }
     }
 }

@@ -6,7 +6,7 @@
 //! bumped generation, and rejects stale IDs with structured errors instead of
 //! letting them resolve to a newly created entity.
 
-use crate::hash::{CanonicalHasher, CanonicalSerialize};
+use crate::hash::{CanonicalSerialize, CanonicalSink};
 
 /// A stable logical entity identifier.
 ///
@@ -185,16 +185,16 @@ impl Default for EntityAllocator {
 /// free list in stack order. The hash depends on logical slot state, never on
 /// storage layout or allocation history beyond what the slots record.
 impl CanonicalSerialize for EntityAllocator {
-    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
-        hasher.write_u64(self.slots.len() as u64);
-        hasher.write_u64(self.alive);
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u64(self.slots.len() as u64);
+        sink.write_u64(self.alive);
         for slot in &self.slots {
-            hasher.write_bool(slot.alive);
-            hasher.write_u64(slot.generation);
+            sink.write_bool(slot.alive);
+            sink.write_u64(slot.generation);
         }
-        hasher.write_u64(self.free.len() as u64);
+        sink.write_u64(self.free.len() as u64);
         for index in &self.free {
-            hasher.write_u32(*index);
+            sink.write_u32(*index);
         }
     }
 }
