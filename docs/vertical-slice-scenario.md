@@ -23,7 +23,7 @@ A small 3D battlefield, 200 m × 200 m, flat heightfield (height 0) with static 
 | Rock W | obstacle | (60, 100) | 8 × 8 | yes |
 | Rock E | obstacle | (140, 100) | 8 × 8 | yes |
 
-The two walls leave a single **chokepoint lane**: Wall N occupies x∈[55,145], z∈[58,62] and Wall S occupies x∈[55,145], z∈[138,142], so the only passage between them is the lane z∈(62,138) (76 m wide) at x∈[55,145], with the two rocks (x∈[56,64] and x∈[136,144], z∈[96,104]) narrowing the middle around (100, 100). Pathfinding runs on a 1 m grid over the 200×200 map with obstacles inflated by the unit radius (0.5 m).
+The two walls leave a single **chokepoint lane**: Wall N occupies x∈[55,145], z∈[58,62] and Wall S occupies x∈[55,145], z∈[138,142], so the only passage between them is the lane z∈(62,138) (76 m wide) at x∈[55,145], with the two rocks (x∈[56,64] and x∈[136,144], z∈[96,104]) narrowing the lane entrances (the lane midpoint between the rocks is 72 m wide). Pathfinding runs on a 1 m grid over the 200×200 map with obstacles inflated by the unit radius (0.5 m).
 
 Map data is static scenario data (part of the replay's initial scenario hash), not runtime state.
 
@@ -48,7 +48,7 @@ Unit definitions (placeholder balance values; definitions are data, not code con
 
 ## 4. Commands
 
-Simulation-affecting commands use the existing envelope contract (`CommandRequest` → `CommandEnvelope` with request ID, command ID, target tick, actor, payload), applied at the target tick's boundary in ascending command-ID order. The slice adds these payload variants to `CommandPayload`:
+Simulation-affecting commands use the existing envelope contract (`CommandRequest` → `CommandEnvelope` with request ID, command ID, target tick, actor, payload), applied at the target tick's boundary in ascending command-ID order. When the new payload variants land, their fields (including the `f32` coordinates) must implement `CanonicalSerialize` (deterministic `to_le_bytes` for `f32`), keeping the §13.3 hashing rules and ADR-0001 numeric policy applicable. The slice adds these payload variants to `CommandPayload`:
 
 - `Move { destination: (f32, f32) }` — path to destination and stop.
 - `AttackMove { destination: (f32, f32) }` — path to destination; acquire and engage any enemy that enters weapon range along the way; stop at destination.
@@ -92,12 +92,12 @@ Scripted commands (all submitted before tick 1; command IDs assigned in submissi
 | 7–9 | 1 | Team B (`ActorId(2)`) | `AttackMove { destination: (100, 100) }` for each of the 3 strikers |
 | 10–12 | 1 | Team B | `Move { destination: (110, 100) }` for each of the 3 skirmishers (hold just east of the chokepoint) |
 
-Both armies converge on the chokepoint at (100, 100); Team A's strikers arrive first (spawned west, same distance, but issued first — same-tick ties resolve by `EntityId`, and Team A has lower IDs).
+Both armies converge on the chokepoint at (100, 100); both striker groups travel the same 80 m at the same speed and arrive on the same tick. The only asymmetry is the `EntityId` tie-break in simultaneous fire (§6 item 4), which Team A wins because its units are allocated first and have lower IDs.
 
 **Worked timing expectations** (derivable from §5–§6; the test asserts these exact values):
 
 - Distance from each spawn pad center to (100, 100) is 80 m; strikers at 0.2 m/tick take 400 ticks to arrive if unobstructed; the chokepoint and congestion only delay, never change, the deterministic outcome.
-- First `DamageDealt` occurs at the tick when the first striker pair is within 10 m — with both sides closing at 0.4 m/tick combined, first contact ≈ tick 175 (80 m gap closed to 10 m = 70 m at 0.4 m/tick = 175 ticks), adjusted only by the deterministic separation rules; the test computes the expected tick from the rules and asserts it matches the recorded event.
+- First `DamageDealt` occurs at the tick when the first striker pair is within 10 m. The spawn pads are 160 m apart (x = 20 vs x = 180) and both striker groups close at 0.2 m/tick each (0.4 m/tick combined), so first contact is ≈ tick 375: (160 − 10) m ÷ 0.4 m/tick = 375 ticks, adjusted only by the deterministic separation rules. The test computes the expected tick from the rules and asserts it matches the recorded event.
 - Each striker kill takes 10 hits × 20 ticks cooldown = 200 ticks after first contact with that target. Skirmishers (60 HP, 6 damage) die in 10 hits as well.
 - Match ends with `MatchOver { winner: Team A }` no later than tick 2000 (100 s of simulation); the exact end tick is whatever the deterministic rules produce and is asserted via the recorded events and hashes, not hardcoded.
 
