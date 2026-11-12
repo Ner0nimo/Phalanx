@@ -143,9 +143,14 @@ fn main() {
             resource: compute_buffer.as_entire_binding(),
         }],
     });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("spike-compute-pl"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("spike-compute-pipeline"),
-        layout: None,
+        layout: Some(&pipeline_layout),
         module: &shader,
         entry_point: Some("main"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
