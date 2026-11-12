@@ -648,7 +648,7 @@ The M0 subset of these gates is implemented in `.github/workflows/ci.yml`: forma
 
 ### 15.3 Test scenario
 
-Maintain a deterministic test scenario that exercises multiple players/teams, several unit and building definitions, multiple regions and contested objectives, resource extraction and production, supply sources/routes/bottlenecks/disruption, several armies/formations, different movement profiles where implemented, pathfinding and chokepoints, combat/projectiles/destruction, fog of war and scouting, save/load and replay, and the agent command/query API.
+Maintain a deterministic test scenario that exercises multiple players/teams, several unit and building definitions, multiple regions and contested objectives, resource extraction and production, supply sources/routes/bottlenecks/disruption, several armies/formations, different movement profiles where implemented, pathfinding and chokepoints, combat/projectiles/destruction, fog of war and scouting, save/load and replay, and the agent command/query API. The concrete M1 slice scenario and its acceptance test are specified in [docs/vertical-slice-scenario.md](docs/vertical-slice-scenario.md).
 
 The scenario must be small enough for fast CI tests and have separate scaled variants for stress/performance testing.
 
@@ -730,6 +730,8 @@ Milestones are capability gates, not calendar promises. Do not start broad conte
 - Basic combat and destruction.
 - Headless execution of the same scenario.
 - Command recording, replay, and state hashing.
+
+The concrete scenario ("Crossing assault") and its headless acceptance test are specified in [docs/vertical-slice-scenario.md](docs/vertical-slice-scenario.md).
 
 **Exit:** a complete small battle can be played, recorded, and reproduced in headless mode with matching state hashes on the same supported build/platform.
 
