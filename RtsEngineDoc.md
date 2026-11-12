@@ -208,7 +208,7 @@ The stack is a proposal, not a reason to force a library into a poor fit. Record
 
 - **Language/toolchain:** stable Rust; Cargo workspace.
 - **Window/input:** winit.
-- **Rendering/compute candidate:** evaluate wgpu against ash before selecting. wgpu reduces low-level Vulkan lifetime/synchronization work and offers multiple backends; ash offers direct Vulkan control at substantially higher engineering cost. Do not build both production backends.
+- **Rendering/compute candidate:** wgpu selected over ash after a headless spike on both candidates — see [ADR-0004](docs/adr/0004-rendering-backend.md) and `benchmarks/graphics/`. wgpu reduces low-level Vulkan lifetime/synchronization work and offers multiple backends; ash offers direct Vulkan control at substantially higher engineering cost. Do not build both production backends.
 - **Shaders:** WGSL if using wgpu; GLSL/SPIR-V if using ash. Shader compilation and validation must be part of CI.
 - **ECS candidate:** bevy_ecs vs hecs benchmarked on representative workloads at 10k/50k/100k entities; hecs selected for the initial implementation spike — see [ADR-0003](docs/adr/0003-ecs-selection.md) for measurements and revisit criteria. Do not build a custom ECS before measurements justify it.
 - **Math:** glam, subject to deterministic-simulation validation.
@@ -224,8 +224,8 @@ The stack is a proposal, not a reason to force a library into a poor fit. Record
 
 Before finalizing major choices, create isolated prototypes and record results:
 
-1. Render and update 10,000 instanced units with camera movement and selection highlighting.
-2. Run a representative compute workload with the candidate graphics API.
+1. Render and update 10,000 instanced units with camera movement and selection highlighting (API-level spike done headless in `benchmarks/graphics/` — see ADR-0004; headed GPU run is a recorded follow-up).
+2. Run a representative compute workload with the candidate graphics API (WGSL compute validated in the wgpu spike; execution on real GPUs is a recorded follow-up — see ADR-0004).
 3. Start CPU-only headless simulation on Windows and Linux.
 4. Benchmark ECS iteration and representative systems at 10k, 50k, and 100k entities (done for the library comparison — see [ADR-0003](docs/adr/0003-ecs-selection.md) and `benchmarks/ecs/`; repeat with real gameplay systems at M3).
 5. Run deterministic simulation tests with and without Rayon.
@@ -682,12 +682,12 @@ All contributors must review architecture-sensitive changes against this documen
 
 Store ADRs in docs/adr/. Each ADR includes context, problem, alternatives, decision, consequences, and revisit criteria.
 
-Initial ADRs to create:
+ADR index (remaining entries are created as their decisions land):
 
 - [0001-authoritative-simulation.md](docs/adr/0001-authoritative-simulation.md) (accepted; codifies the §3 simulation invariants and determinism contract)
 - 0002-determinism-and-numeric-model.md
 - [0003-ecs-selection.md](docs/adr/0003-ecs-selection.md) (accepted as an initial spike selection; production commitment deferred to M3 validation)
-- 0004-rendering-backend.md
+- [0004-rendering-backend.md](docs/adr/0004-rendering-backend.md) (accepted for the production prototype; headed GPU validation is a recorded follow-up)
 - 0005-navigation-and-formation-model.md
 - 0006-territory-and-supply-model.md
 - 0007-map-and-save-format.md

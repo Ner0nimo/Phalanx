@@ -1,8 +1,8 @@
 [workspace]
 members = ["crates/phalanx_core", "crates/phalanx_runtime"]
-# The ECS spike benchmark is a detached workspace of its own (see ADR-0003);
-# CI gates intentionally do not build it.
-exclude = ["benchmarks/ecs"]
+# The spike benchmarks are detached workspaces of their own (see ADR-0003 and
+# ADR-0004); CI gates intentionally do not build them (dedicated jobs do).
+exclude = ["benchmarks/ecs", "benchmarks/graphics"]
 resolver = "2"
 
 [workspace.package]
