@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: jobs only need to read the repository contents.
 permissions:
   contents: read
 
@@ -26,6 +27,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -35,8 +39,45 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Build runtime
+      - name: Build workspace
         run: cargo build --workspace
 
+      # Correctness gate only: no performance timing thresholds on shared
+      # hosted runners. Runs without a window, graphics API, or GPU.
       - name: Run CPU-only headless smoke scenario
         run: cargo run -p phalanx_runtime -- --headless --ticks 8
+
+  audit:
+    name: Dependency audit (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit the committed lockfile
+        run: cargo audit
+
+  secrets:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for leaked secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # gitleaks-action v2 requires the token explicitly for PR scans;
+          # the default token with the workflow's contents: read is enough.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
