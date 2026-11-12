@@ -27,6 +27,7 @@ Avoid applying `good first issue` to foundational architecture work.
 | `priority:P1` | `d93f0b` | Important for the current milestone; should be scheduled soon |
 | `priority:P2` | `fbca04` | Normal planned work |
 | `priority:P3` | `0e8a16` | Low urgency, polish, or optional improvement |
+| `priority:P4` | `ededed` | Backlog: not planned for the current roadmap |
 
 ### Area
 
@@ -41,6 +42,7 @@ Avoid applying `good first issue` to foundational architecture work.
 | `area:ai` | `d4c5f9` | Strategic, operational, and tactical AI |
 | `area:editor-api` | `bfd4f2` | Editor, agent commands/queries, map tools |
 | `area:infrastructure` | `e4e669` | CI, build, packaging, dependency/tooling |
+| `area:content` | `f9d0c4` | Maps, unit/building/weapon definitions, art and audio assets, balance data |
 
 ### Workflow
 
@@ -63,13 +65,14 @@ Do not add a separate `status:ready` label: open issues without a blocking statu
 
 ## Create the custom labels
 
-The connected GitHub actions available to this session can create issues and assign existing labels, but do not expose the repository label-creation endpoint. Once the repository labels are managed from GitHub or GitHub CLI, the following commands create the custom labels defined above. Run them from a machine authenticated to this repository with permission to manage labels.
+Create the custom labels with the GitHub CLI from an account authenticated to this repository with permission to manage labels. The `--force` flag makes the commands idempotent (applied to the repository on 2026-11-12).
 
 ```bash
 gh label create "priority:P0" --color "b60205" --description "Blocks the next milestone or risks a costly architectural mistake" --force
 gh label create "priority:P1" --color "d93f0b" --description "Important for the current milestone; schedule soon" --force
 gh label create "priority:P2" --color "fbca04" --description "Normal planned work" --force
 gh label create "priority:P3" --color "0e8a16" --description "Low urgency, polish, or optional improvement" --force
+gh label create "priority:P4" --color "ededed" --description "Backlog: not planned for the current roadmap" --force
 
 gh label create "area:architecture" --color "5319e7" --description "Architecture, ADRs, subsystem boundaries" --force
 gh label create "area:simulation" --color "1d76db" --description "Tick loop, world state, determinism, replay" --force
@@ -80,6 +83,7 @@ gh label create "area:rendering" --color "c2e0c6" --description "Renderer, GPU, 
 gh label create "area:ai" --color "d4c5f9" --description "Strategic, operational, and tactical AI" --force
 gh label create "area:editor-api" --color "bfd4f2" --description "Editor, agent commands/queries, map tools" --force
 gh label create "area:infrastructure" --color "e4e669" --description "CI, build, packaging, dependency/tooling" --force
+gh label create "area:content" --color "f9d0c4" --description "Maps, unit/building/weapon definitions, art and audio assets, balance data" --force
 
 gh label create "status:blocked" --color "b60205" --description "Cannot proceed until a dependency or decision is resolved" --force
 gh label create "status:needs-design" --color "d876e3" --description "Requires a product or technical design decision before implementation" --force
