@@ -5,10 +5,10 @@ We're building a production-grade, large-scale real-time strategy (RTS) engine i
 ## Decisions / status (maintained as we go)
 
 - Engine name: **Phalanx** (Cargo crates `phalanx_*`).
-- Repo: https://github.com/Ner0nimo/Phalanx (private, like Ignis).
+- Repo: https://github.com/Ner0nimo/Phalanx (public).
 - Language: **Rust** (stable toolchain, Cargo workspace).
 - Genre/scale: large-scale 3D RTS, 10,000+ units; free-moving RTS camera, full 3D terrain.
-- Platforms: **Windows & Linux, native builds** via wgpu (DX12 on Windows, Vulkan on Linux). Proton is only a distribution fallback (Steam), never part of the dev loop. *(Proposal — confirm.)*
+- Platforms: **Windows & Linux, native builds** via Vulkan on all platforms. Proton is only a distribution fallback (Steam), never part of the dev loop. *(Proposal — confirm.)*
 - Multiplayer: **singleplayer + skirmish AI first**; networking is a later phase. The sim is designed deterministically (fixed timestep) from day one so lockstep can be added later.
 - MVP scope: **core gameplay** — selection, command queue, resources, building, tech tree, combat, fog of war. The 10k-unit scale is a standing performance target built in from the start (SoA + GPU compute), not bolted on later.
 - Headless: **optional, but recommended once cheap** — a `--headless` mode running the sim without window/GPU enables CI tests of 10k-unit scenarios. *(Proposal.)*
@@ -20,7 +20,7 @@ We're building a production-grade, large-scale real-time strategy (RTS) engine i
 - Work autonomously; ask questions only when absolutely necessary.
 - IMPORTANT: do not look outside the working directory or use other code on my computer as reference.
 - Testing is of the utmost importance — lots of unit tests (`cargo test`), run automated tests before every commit; `cargo clippy -- -D warnings` and `cargo fmt --check` must be clean.
-- CI (GitHub Actions): build + `cargo test` on `ubuntu-latest` and `windows-latest`; security gates: `cargo audit` + secret scan (gitleaks). (Light version of the Ignis gates; can be extended.)
+- CI (GitHub Actions): build + `cargo test` on `ubuntu-latest` and `windows-latest`; security gates: `cargo audit` + secret scan (gitleaks). (Can be extended as needed.)
 - Provide a test map/skirmish that exercises every engine feature — all systems, the full command/scripting API, pathfinding, combat, fog of war, save/load.
 - Do things properly: production-grade, not a hack project.
 - Create `AGENTS.md` and relevant skills (`.vibe/skills/phalanx-dev`) with concrete development guidelines.
@@ -28,7 +28,7 @@ We're building a production-grade, large-scale real-time strategy (RTS) engine i
 
 ## Tech stack (Rust)
 
-- **wgpu** for rendering **and** GPU compute (WGSL) — one abstraction over DX12 (Windows) / Vulkan (Linux); compute also usable without a window.
+- **Vulkan via ash** for rendering **and** GPU compute — raw Vulkan bindings on Windows & Linux; shaders in GLSL compiled to SPIR-V at build time; compute also usable without a window (headless instance, no swapchain).
 - **winit** for windowing and input.
 - ECS: **bevy_ecs** (or **hecs**) — decide at the first milestone; needs SoA-friendly archetypes for 10k+ entities.
 - Math: **glam**; CPU parallelism: **rayon**; serialization: **serde** (+ RON/JSON for maps, scenes, saves); assets: glTF via the **gltf** crate.
@@ -39,9 +39,9 @@ We're building a production-grade, large-scale real-time strategy (RTS) engine i
 
 ## Basic Architecture
 
-- Cargo workspace: `phalanx_core` (ECS, fixed-timestep deterministic sim, orders, economy, combat), `phalanx_map` (terrain, navgrid/flow fields, map format), `phalanx_gpu` (wgpu compute: unit steering/separation, flow-field pathfinding, fog-of-war visibility, projectile sim), `phalanx_render` (wgpu renderer: instancing, LOD, terrain chunks), `phalanx_ai` (skirmish AI), `phalanx_audio`, `phalanx_editor` (window + UI + agent command API), `phalanx_runtime` (game executable), `tools/` (map editor, pak/exporter).
+- Cargo workspace: `phalanx_core` (ECS, fixed-timestep deterministic sim, orders, economy, combat), `phalanx_map` (terrain, navgrid/flow fields, map format), `phalanx_gpu` (Vulkan compute: unit steering/separation, flow-field pathfinding, fog-of-war visibility, projectile sim), `phalanx_render` (Vulkan renderer: instancing, LOD, terrain chunks), `phalanx_ai` (skirmish AI), `phalanx_audio`, `phalanx_editor` (window + UI + agent command API), `phalanx_runtime` (game executable), `tools/` (map editor, pak/exporter).
 - **Fixed-timestep simulation** (e.g. 20 Hz) decoupled from rendering, with deterministic iteration order — prerequisite for future lockstep multiplayer.
-- Data-oriented mass-unit handling: SoA storage, spatial-hash grid, rayon jobs on CPU; hot paths (steering, avoidance, flow fields, FoW) offloaded to GPU compute via wgpu.
+- Data-oriented mass-unit handling: SoA storage, spatial-hash grid, rayon jobs on CPU; hot paths (steering, avoidance, flow fields, FoW) offloaded to GPU compute via Vulkan compute pipelines.
 - Editor embedded in the runtime exe or standalone *(open)*; agent command API as JSON lines (`create_entity`, `spawn_unit`, `issue_order`, `save_map`, `run_commands`, ...).
 - Export/packaging: pack map + assets + scripts into a distributable pak; the runtime runs the game without editor capabilities.
 
@@ -149,7 +149,7 @@ Rule 1 protects correctness, rule 2 API quality, rule 3 maintainability.
 
 ## 3D Renderer
 
-- wgpu, PBR materials, glTF models; **GPU instancing + mesh/material batching** for 10k+ units; LODs + occlusion culling; terrain as chunked heightmap with splat blending.
+- Vulkan (ash), PBR materials, glTF models; **GPU instancing + mesh/material batching** for 10k+ units; LODs + occlusion culling; terrain as chunked heightmap with splat blending.
 - Selection rings, health bars, order markers as instanced quads; projectiles/explosions as billboards/particles.
 - HDR + bloom optional — keep the frame budget for sim and GPU compute.
 
