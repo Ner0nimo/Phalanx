@@ -472,6 +472,21 @@ impl CanonicalDecode for u8 {
     }
 }
 
+impl CanonicalSerialize for f32 {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        // IEEE-754 bit pattern, little-endian. Authoritative math must use
+        // only exactly-defined operations (no reassociation/fast-math);
+        // see ADR-0001 Decision §6 and RtsEngineDoc §3.2.
+        sink.write_u32(self.to_bits());
+    }
+}
+
+impl CanonicalDecode for f32 {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        Ok(Self::from_bits(reader.read_u32()?))
+    }
+}
+
 impl CanonicalSerialize for bool {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_bool(*self);

@@ -46,8 +46,20 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
         Phase::ApplyCommands
     }
 
+    fn order(&self) -> u64 {
+        0
+    }
+
     fn name(&self) -> &'static str {
         "scenario"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn run(&mut self, simulation: &mut Simulation<CommandPayload>, _phase: Phase) {

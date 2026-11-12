@@ -1,0 +1,13 @@
+[package]
+name = "phalanx_navigation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Navigation prototype: nav grid, A* routing with budgets, deterministic local movement (issue #12). CPU-only, depends on phalanx_core only."
+
+[dependencies]
+phalanx_core = { path = "../phalanx_core" }
+
+[lints]
+workspace = true

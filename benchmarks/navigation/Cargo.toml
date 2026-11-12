@@ -1,0 +1,19 @@
+[package]
+name = "phalanx-nav-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Issue #12 baseline: deterministic movement/pathfinding benchmark for 1k and 10k simple units (phalanx_navigation). Not part of the production workspace."
+
+# Detached from the root workspace: CI gates (fmt/clippy/test/audit) intentionally
+# do not build this benchmark; a dedicated job does (build/lint only, no timing
+# thresholds on shared runners).
+[workspace]
+
+[dependencies]
+phalanx_core = { path = "../../crates/phalanx_core" }
+phalanx_navigation = { path = "../../crates/phalanx_navigation" }
+
+[profile.release]
+opt-level = 3
+debug = false
