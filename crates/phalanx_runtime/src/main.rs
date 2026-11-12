@@ -64,7 +64,12 @@ mod tests {
 
     #[test]
     fn headless_runtime_advances_without_graphics_initialization() {
-        assert!(run(["--headless", "--ticks", "5"].into_iter().map(str::to_owned)).is_ok());
+        assert!(
+            run(["--headless", "--ticks", "5"]
+                .into_iter()
+                .map(str::to_owned))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -75,8 +80,10 @@ mod tests {
 
     #[test]
     fn runtime_rejects_invalid_tick_count() {
-        let error = run(["--headless", "--ticks", "many"].into_iter().map(str::to_owned))
-            .expect_err("invalid tick count must be rejected");
+        let error = run(["--headless", "--ticks", "many"]
+            .into_iter()
+            .map(str::to_owned))
+        .expect_err("invalid tick count must be rejected");
         assert!(error.contains("invalid tick count"));
     }
 }
