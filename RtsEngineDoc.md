@@ -137,7 +137,7 @@ Command queues and command replacement behavior must be consistent across single
 
 ## 3. Architecture invariants (binding)
 
-These invariants take precedence over convenience and local implementation preferences.
+These invariants take precedence over convenience and local implementation preferences. Sections 3.1–3.5 are recorded as an accepted decision in [ADR-0001: Authoritative simulation and determinism contract](docs/adr/0001-authoritative-simulation.md).
 
 ### 3.1 Authoritative simulation is CPU-side
 
@@ -682,7 +682,7 @@ Store ADRs in docs/adr/. Each ADR includes context, problem, alternatives, decis
 
 Initial ADRs to create:
 
-- 0001-authoritative-simulation.md
+- [0001-authoritative-simulation.md](docs/adr/0001-authoritative-simulation.md) (accepted; codifies the §3 simulation invariants and determinism contract)
 - 0002-determinism-and-numeric-model.md
 - 0003-ecs-selection.md
 - 0004-rendering-backend.md
