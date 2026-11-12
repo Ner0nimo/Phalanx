@@ -1,10 +1,13 @@
 //! Minimal CPU-only primitives for the Phalanx simulation.
 //!
-//! The smoke scenario in this crate is infrastructure validation only. It is
-//! deliberately not a gameplay simulation or a substitute for the tick
-//! schedule planned in the architecture documentation.
+//! The [`simulation`] module provides the fixed-tick [`simulation::SimulationRunner`]
+//! and the explicit [`simulation::Phase`] schedule required by ADR-0001 and
+//! `RtsEngineDoc.md` §6.1. The smoke scenario below is infrastructure
+//! validation only; it is deliberately not a gameplay simulation.
 
 #![forbid(unsafe_code)]
+
+pub mod simulation;
 
 /// A deterministic workload used to prove that the core can advance without
 /// initializing a renderer, window, graphics API, or GPU.
@@ -58,13 +61,13 @@ impl Default for HeadlessSmokeScenario {
     }
 }
 
-/// The diagnostic tick counter cannot represent another tick.
+/// The authoritative tick counter cannot represent another tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TickOverflow;
 
 impl std::fmt::Display for TickOverflow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("headless smoke scenario tick counter overflowed")
+        formatter.write_str("simulation tick counter overflowed")
     }
 }
 

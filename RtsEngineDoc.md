@@ -280,7 +280,7 @@ The authoritative tick schedule must be explicit, documented, and tested. Initia
 14. Validate critical invariants in debug/test builds.
 15. Produce canonical state hash and replay checkpoint as configured.
 
-This order is a starting contract, not a claim that every subsystem must run every tick. Systems may have explicit update frequencies or budgets, but their schedule and phase must be deterministic. Changes to ordering require an ADR or explicit simulation-version change because they can alter replay results and game balance.
+This order is a starting contract, not a claim that every subsystem must run every tick. Systems may have explicit update frequencies or budgets, but their schedule and phase must be deterministic. Changes to ordering require an ADR or explicit simulation-version change because they can alter replay results and game balance. The schedule is implemented as `Phase::SCHEDULE`, executed by `SimulationRunner` in `phalanx_core::simulation` (`crates/phalanx_core/src/simulation.rs`); the contract is recorded in [ADR-0001](docs/adr/0001-authoritative-simulation.md).
 
 ### 6.2 Entity identity and lifecycle
 
