@@ -8,10 +8,19 @@
 //! [`SimulationRunner::advance_ticks`] from its own frame timing; simulation
 //! progression is independent of the render frame rate.
 //!
-//! The phase hooks are placeholders: they define *when* systems run, not
-//! gameplay behavior. No gameplay systems exist yet.
+//! [`Simulation`] owns the authoritative primitives defined by issue #6:
+//! stable entity IDs ([`crate::entity`]), deterministic RNG streams
+//! ([`crate::rng`]), and the tick-indexed command buffer
+//! ([`crate::command`]). The phase hooks are placeholders: they define *when*
+//! systems run, not gameplay behavior. No gameplay systems exist yet.
 
 use std::collections::BTreeMap;
+
+use crate::command::{
+    CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
+};
+use crate::entity::EntityAllocator;
+use crate::rng::RngStreams;
 
 pub use crate::TickOverflow;
 
@@ -166,23 +175,32 @@ impl Phase {
 /// Authoritative simulation state owned by the CPU simulation (ADR-0001
 /// Decision §1).
 ///
-/// At this milestone the authoritative state is the simulation tick plus the
-/// tick-indexed command buffer. Gameplay world state lands in later
-/// milestones; nothing here pretends gameplay systems exist.
-pub struct Simulation<C> {
+/// The state is the simulation tick, the entity allocator, the deterministic
+/// RNG streams, and the tick-indexed command bookkeeping. Gameplay world state
+/// lands in later milestones; nothing here pretends gameplay systems exist.
+pub struct Simulation<P> {
     tick: u64,
-    pending_commands: BTreeMap<u64, Vec<C>>,
-    current_tick_commands: Vec<C>,
+    rng: RngStreams,
+    entities: EntityAllocator,
+    pending_commands: BTreeMap<u64, Vec<CommandEnvelope<P>>>,
+    current_tick_commands: Vec<CommandEnvelope<P>>,
+    seen_requests: BTreeMap<crate::command::RequestId, CommandId>,
+    next_command_id: u64,
 }
 
-impl<C> Simulation<C> {
-    /// Creates the initial authoritative state at tick 0.
+impl<P> Simulation<P> {
+    /// Creates the initial authoritative state at tick 0 with the given
+    /// explicit master RNG seed.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(rng_seed: u64) -> Self {
         Self {
             tick: 0,
+            rng: RngStreams::new(rng_seed),
+            entities: EntityAllocator::new(),
             pending_commands: BTreeMap::new(),
             current_tick_commands: Vec::new(),
+            seen_requests: BTreeMap::new(),
+            next_command_id: 0,
         }
     }
 
@@ -194,23 +212,43 @@ impl<C> Simulation<C> {
         self.tick
     }
 
-    /// Returns the commands assigned to the tick currently being executed, in
-    /// submission order. They are drained from the pending buffer at the tick
-    /// boundary and are only visible while that tick runs.
+    /// Returns the deterministic RNG stream registry.
     #[must_use]
-    pub fn commands_for_current_tick(&self) -> &[C] {
+    pub const fn rng(&self) -> &RngStreams {
+        &self.rng
+    }
+
+    /// Returns mutable access to the RNG stream registry for systems.
+    #[must_use]
+    pub const fn rng_mut(&mut self) -> &mut RngStreams {
+        &mut self.rng
+    }
+
+    /// Returns the entity ID allocator.
+    #[must_use]
+    pub const fn entities(&self) -> &EntityAllocator {
+        &self.entities
+    }
+
+    /// Returns mutable access to the entity ID allocator for systems.
+    #[must_use]
+    pub const fn entities_mut(&mut self) -> &mut EntityAllocator {
+        &mut self.entities
+    }
+
+    /// Returns the commands assigned to the tick currently being executed, in
+    /// ascending command-ID order. They are drained from the pending buffer at
+    /// the tick boundary and are only visible while that tick runs.
+    #[must_use]
+    pub fn commands_for_current_tick(&self) -> &[CommandEnvelope<P>] {
         &self.current_tick_commands
     }
 
     /// Returns the ticks that still have queued commands, in ascending order.
-    pub fn pending_command_ticks(&self) -> std::collections::btree_map::Keys<'_, u64, Vec<C>> {
+    pub fn pending_command_ticks(
+        &self,
+    ) -> std::collections::btree_map::Keys<'_, u64, Vec<CommandEnvelope<P>>> {
         self.pending_commands.keys()
-    }
-}
-
-impl<C> Default for Simulation<C> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -220,7 +258,7 @@ impl<C> Default for Simulation<C> {
 /// runner executes phases in [`Phase::SCHEDULE`] order; registration order
 /// only breaks exact (phase, order) ties and is therefore never what defines
 /// the schedule.
-pub trait SimulationSystem<C> {
+pub trait SimulationSystem<P> {
     /// The phase this system runs in.
     fn phase(&self) -> Phase;
 
@@ -234,33 +272,13 @@ pub trait SimulationSystem<C> {
 
     /// Executes the system for the current tick. Placeholder hooks must not
     /// pretend gameplay systems exist.
-    fn run(&mut self, simulation: &mut Simulation<C>, phase: Phase);
+    fn run(&mut self, simulation: &mut Simulation<P>, phase: Phase);
 }
 
-/// A command was submitted for a tick that has already started or completed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommandSubmitError {
-    /// The simulation never applies inputs retroactively.
-    PastTick { requested: u64, current: u64 },
-}
-
-impl std::fmt::Display for CommandSubmitError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PastTick { requested, current } => write!(
-                formatter,
-                "command targets tick {requested}, but the simulation is already at tick {current}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CommandSubmitError {}
-
-struct RegisteredSystem<C> {
+struct RegisteredSystem<P> {
     phase: Phase,
     order: u64,
-    system: Box<dyn SimulationSystem<C>>,
+    system: Box<dyn SimulationSystem<P>>,
 }
 
 /// The fixed-tick, CPU-only, deterministic simulation loop.
@@ -269,19 +287,19 @@ struct RegisteredSystem<C> {
 /// callers step exactly one tick with [`SimulationRunner::step_tick`] or an
 /// exact count with [`SimulationRunner::advance_ticks`]. No sleeping, window,
 /// or wall-clock read is involved.
-pub struct SimulationRunner<C> {
-    simulation: Simulation<C>,
+pub struct SimulationRunner<P> {
+    simulation: Simulation<P>,
     tick_rate: TickRate,
-    systems: Vec<RegisteredSystem<C>>,
+    systems: Vec<RegisteredSystem<P>>,
 }
 
-impl<C> SimulationRunner<C> {
-    /// Creates a runner at the given fixed tick rate with no systems
-    /// registered.
+impl<P> SimulationRunner<P> {
+    /// Creates a runner at the given fixed tick rate with the given explicit
+    /// master RNG seed and no systems registered.
     #[must_use]
-    pub fn new(tick_rate: TickRate) -> Self {
+    pub fn new(tick_rate: TickRate, rng_seed: u64) -> Self {
         Self {
-            simulation: Simulation::new(),
+            simulation: Simulation::new(rng_seed),
             tick_rate,
             systems: Vec::new(),
         }
@@ -295,7 +313,7 @@ impl<C> SimulationRunner<C> {
 
     /// Returns the authoritative simulation state.
     #[must_use]
-    pub const fn simulation(&self) -> &Simulation<C> {
+    pub const fn simulation(&self) -> &Simulation<P> {
         &self.simulation
     }
 
@@ -304,7 +322,7 @@ impl<C> SimulationRunner<C> {
     /// order.
     pub fn register_system<S>(&mut self, system: S) -> &mut Self
     where
-        S: SimulationSystem<C> + 'static,
+        S: SimulationSystem<P> + 'static,
     {
         let registered = RegisteredSystem {
             phase: system.phase(),
@@ -319,37 +337,70 @@ impl<C> SimulationRunner<C> {
         self
     }
 
-    /// Queues a command to be applied at the boundary of `tick`.
+    /// Queues a command to be applied at the boundary of its target tick.
     ///
-    /// Commands targeting the current or a past tick are rejected: the
-    /// simulation never applies inputs retroactively.
-    pub fn submit_command(&mut self, command: C, tick: u64) -> Result<(), CommandSubmitError> {
-        if tick <= self.simulation.tick {
-            return Err(CommandSubmitError::PastTick {
-                requested: tick,
+    /// Returns the assigned [`CommandId`]. Commands targeting the current or a
+    /// past tick, duplicate request IDs, and unsupported envelope versions are
+    /// rejected with structured errors; commands are never silently retargeted.
+    pub fn submit_command(
+        &mut self,
+        request: CommandRequest<P>,
+    ) -> Result<CommandId, CommandSubmitError> {
+        if request.tick <= self.simulation.tick {
+            return Err(CommandSubmitError::LateTick {
+                requested: request.tick,
                 current: self.simulation.tick,
             });
         }
+        if self
+            .simulation
+            .seen_requests
+            .contains_key(&request.request_id)
+        {
+            return Err(CommandSubmitError::DuplicateRequest {
+                request_id: request.request_id,
+            });
+        }
+        let raw_id = self.simulation.next_command_id;
+        self.simulation.next_command_id = raw_id
+            .checked_add(1)
+            .ok_or(CommandSubmitError::IdSpaceExhausted)?;
+        let command_id = CommandId(raw_id);
+
+        let envelope = CommandEnvelope::new(
+            ENVELOPE_VERSION,
+            request.request_id,
+            command_id,
+            request.actor,
+            request.tick,
+            request.payload,
+        )?;
+        self.simulation
+            .seen_requests
+            .insert(request.request_id, command_id);
         self.simulation
             .pending_commands
-            .entry(tick)
+            .entry(request.tick)
             .or_default()
-            .push(command);
-        Ok(())
+            .push(envelope);
+        Ok(command_id)
     }
 
     /// Advances the simulation by exactly one tick: increments the
-    /// authoritative tick counter, drains the commands assigned to that tick,
-    /// then executes every phase in [`Phase::SCHEDULE`] order. Never reads
-    /// wall-clock time.
+    /// authoritative tick counter, drains the commands assigned to that tick
+    /// in ascending command-ID order, then executes every phase in
+    /// [`Phase::SCHEDULE`] order. Never reads wall-clock time.
     pub fn step_tick(&mut self) -> Result<(), TickOverflow> {
         let next_tick = self.simulation.tick.checked_add(1).ok_or(TickOverflow)?;
         self.simulation.tick = next_tick;
-        self.simulation.current_tick_commands = self
+        let mut commands = self
             .simulation
             .pending_commands
             .remove(&next_tick)
             .unwrap_or_default();
+        // Deterministic same-tick ordering: ascending command ID.
+        commands.sort_by_key(|envelope| envelope.command_id());
+        self.simulation.current_tick_commands = commands;
 
         let SimulationRunner {
             simulation,
@@ -384,10 +435,14 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::command::{ActorId, RequestId};
 
     type Trace = Rc<RefCell<Vec<(u64, Phase, &'static str)>>>;
     type IngestCounts = Rc<RefCell<Vec<(u64, usize)>>>;
     type CommandLog = Rc<RefCell<Vec<(u64, Vec<u32>)>>>;
+    type WorldLog = Rc<RefCell<Vec<(u64, u32, u64, u64)>>>;
+
+    const SEED: u64 = 0x5EED;
 
     struct Probe {
         phase: Phase,
@@ -397,7 +452,7 @@ mod tests {
         ingest_counts: IngestCounts,
     }
 
-    impl<C> SimulationSystem<C> for Probe {
+    impl<P> SimulationSystem<P> for Probe {
         fn phase(&self) -> Phase {
             self.phase
         }
@@ -410,7 +465,7 @@ mod tests {
             self.name
         }
 
-        fn run(&mut self, simulation: &mut Simulation<C>, phase: Phase) {
+        fn run(&mut self, simulation: &mut Simulation<P>, phase: Phase) {
             self.trace
                 .borrow_mut()
                 .push((simulation.tick(), phase, self.name));
@@ -430,7 +485,7 @@ mod tests {
         trace: &Trace,
         ingest_counts: &IngestCounts,
     ) -> SimulationRunner<u32> {
-        let mut runner = SimulationRunner::new(tick_rate);
+        let mut runner = SimulationRunner::new(tick_rate, SEED);
         runner
             .register_system(Probe {
                 phase: Phase::ProduceStateHash,
@@ -467,9 +522,18 @@ mod tests {
         probe_runner_at(TickRate::DEFAULT, trace, ingest_counts)
     }
 
+    fn request(request_id: u64, tick: u64, payload: u32) -> CommandRequest<u32> {
+        CommandRequest {
+            request_id: RequestId(request_id),
+            actor: ActorId(0),
+            tick,
+            payload,
+        }
+    }
+
     #[test]
     fn advances_an_exact_tick_count_without_sleeping_or_a_window() {
-        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT);
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
 
         runner.advance_ticks(0).expect("zero ticks is valid");
         assert_eq!(runner.simulation().tick(), 0);
@@ -508,10 +572,10 @@ mod tests {
 
         for runner in [&mut first, &mut second] {
             runner
-                .submit_command(7, 2)
+                .submit_command(request(1, 2, 7))
                 .expect("tick 2 is in the future");
             runner
-                .submit_command(8, 3)
+                .submit_command(request(2, 3, 8))
                 .expect("tick 3 is in the future");
         }
         first.advance_ticks(4).expect("advance should succeed");
@@ -550,7 +614,7 @@ mod tests {
     #[test]
     fn commands_are_applied_only_at_their_tick_boundary() {
         let counts = IngestCounts::default();
-        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT);
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
         runner.register_system(Probe {
             phase: Phase::IngestCommands,
             order: 0,
@@ -560,7 +624,7 @@ mod tests {
         });
 
         runner
-            .submit_command(42, 3)
+            .submit_command(request(1, 3, 42))
             .expect("tick 3 is in the future");
         runner.advance_ticks(2).expect("advance to tick 2");
         assert_eq!(*counts.borrow(), vec![(1, 0), (2, 0)]);
@@ -580,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn commands_for_one_tick_keep_submission_order() {
+    fn same_tick_commands_apply_in_ascending_command_id_order() {
         struct CommandProbe {
             log: CommandLog,
         }
@@ -597,57 +661,123 @@ mod tests {
             fn run(&mut self, simulation: &mut Simulation<u32>, _phase: Phase) {
                 self.log.borrow_mut().push((
                     simulation.tick(),
-                    simulation.commands_for_current_tick().to_vec(),
+                    simulation
+                        .commands_for_current_tick()
+                        .iter()
+                        .map(|envelope| envelope.payload())
+                        .copied()
+                        .collect(),
                 ));
             }
         }
 
         let log = CommandLog::default();
-        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT);
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
         runner.register_system(CommandProbe { log: log.clone() });
 
-        runner.submit_command(1, 2).expect("future tick");
-        runner
-            .submit_command(2, 2)
-            .expect("same tick, later submission");
-        runner.submit_command(3, 4).expect("later tick");
+        // Assigned command IDs follow submission order: 0, 1, 2, 3.
+        let id0 = runner
+            .submit_command(request(1, 2, 10))
+            .expect("future tick");
+        let id1 = runner.submit_command(request(2, 2, 20)).expect("same tick");
+        let id2 = runner
+            .submit_command(request(3, 4, 30))
+            .expect("later tick");
+        let id3 = runner.submit_command(request(4, 2, 40)).expect("same tick");
+        assert_eq!(
+            (id0, id1, id2, id3),
+            (CommandId(0), CommandId(1), CommandId(2), CommandId(3))
+        );
+
         runner.advance_ticks(4).expect("advance should succeed");
 
         assert_eq!(
             *log.borrow(),
-            vec![(1, vec![]), (2, vec![1, 2]), (3, vec![]), (4, vec![3])]
+            vec![
+                (1, vec![]),
+                (2, vec![10, 20, 40]),
+                (3, vec![]),
+                (4, vec![30])
+            ]
         );
     }
 
     #[test]
-    fn commands_targeting_the_current_or_past_tick_are_rejected() {
-        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT);
+    fn late_commands_are_rejected_with_structured_errors() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
 
         runner
-            .submit_command(1, 1)
+            .submit_command(request(1, 1, 1))
             .expect("tick 1 is future at tick 0");
         runner.advance_ticks(1).expect("now at tick 1");
 
         assert_eq!(
-            runner.submit_command(2, 1),
-            Err(CommandSubmitError::PastTick {
+            runner.submit_command(request(2, 1, 2)),
+            Err(CommandSubmitError::LateTick {
                 requested: 1,
                 current: 1
             })
         );
         assert_eq!(
-            runner.submit_command(2, 0),
-            Err(CommandSubmitError::PastTick {
+            runner.submit_command(request(3, 0, 3)),
+            Err(CommandSubmitError::LateTick {
                 requested: 0,
                 current: 1
             })
         );
-        runner.submit_command(3, 2).expect("future tick accepted");
+        runner
+            .submit_command(request(4, 2, 4))
+            .expect("future tick accepted");
+    }
+
+    #[test]
+    fn duplicate_requests_are_rejected_not_applied_twice() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+
+        runner
+            .submit_command(request(7, 2, 1))
+            .expect("first submission accepted");
+        assert_eq!(
+            runner.submit_command(request(7, 3, 2)),
+            Err(CommandSubmitError::DuplicateRequest {
+                request_id: RequestId(7)
+            })
+        );
+        // The rejected duplicate did not add another queued command.
+        assert_eq!(
+            runner
+                .simulation()
+                .pending_command_ticks()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        // Even after the original command was applied, the request ID stays
+        // reserved.
+        runner.advance_ticks(2).expect("advance to tick 2");
+        assert_eq!(
+            runner.submit_command(request(7, 3, 2)),
+            Err(CommandSubmitError::DuplicateRequest {
+                request_id: RequestId(7)
+            })
+        );
+        assert_eq!(runner.simulation().pending_command_ticks().count(), 0);
+    }
+
+    #[test]
+    fn command_id_space_exhaustion_is_an_error() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner.simulation.next_command_id = u64::MAX;
+        assert_eq!(
+            runner.submit_command(request(1, 1, 1)),
+            Err(CommandSubmitError::IdSpaceExhausted)
+        );
     }
 
     #[test]
     fn tick_overflow_is_reported_not_wrapped() {
-        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT);
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
         runner.simulation.tick = u64::MAX;
 
         assert_eq!(runner.step_tick(), Err(TickOverflow));
@@ -682,16 +812,69 @@ mod tests {
     }
 
     #[test]
+    fn simulation_exposes_authoritative_entity_and_rng_primitives() {
+        struct WorldProbe {
+            log: WorldLog,
+        }
+
+        impl SimulationSystem<()> for WorldProbe {
+            fn phase(&self) -> Phase {
+                Phase::ApplyCommands
+            }
+
+            fn name(&self) -> &'static str {
+                "world-probe"
+            }
+
+            fn run(&mut self, simulation: &mut Simulation<()>, _phase: Phase) {
+                let entity = simulation
+                    .entities_mut()
+                    .allocate()
+                    .expect("allocate entity");
+                let draw = simulation.rng_mut().stream("combat").next_u64();
+                self.log.borrow_mut().push((
+                    simulation.tick(),
+                    entity.index(),
+                    entity.generation(),
+                    draw,
+                ));
+            }
+        }
+
+        let log_a = Rc::new(RefCell::new(Vec::new()));
+        let log_b = Rc::new(RefCell::new(Vec::new()));
+        let mut a: SimulationRunner<()> = SimulationRunner::new(TickRate::DEFAULT, 42);
+        let mut b: SimulationRunner<()> = SimulationRunner::new(TickRate::DEFAULT, 42);
+        a.register_system(WorldProbe { log: log_a.clone() });
+        b.register_system(WorldProbe { log: log_b.clone() });
+
+        a.advance_ticks(3).expect("advance");
+        b.advance_ticks(3).expect("advance");
+
+        // Same seed and inputs: identical entity IDs and RNG draws.
+        assert_eq!(*log_a.borrow(), *log_b.borrow());
+        assert_eq!(log_a.borrow().len(), 3);
+        let first = log_a.borrow()[0];
+        assert!(
+            a.simulation()
+                .entities()
+                .contains(crate::entity::EntityId::from_raw_parts(first.1, first.2))
+        );
+    }
+
+    #[test]
     fn defaults_match_the_documented_contract() {
         assert_eq!(TickRate::default(), TickRate::DEFAULT);
         assert_eq!(
-            SimulationRunner::<u32>::new(TickRate::DEFAULT).tick_rate(),
+            SimulationRunner::<u32>::new(TickRate::DEFAULT, SEED).tick_rate(),
             TickRate::DEFAULT
         );
 
-        let simulation = Simulation::<u32>::default();
+        let simulation = Simulation::<u32>::new(SEED);
         assert_eq!(simulation.tick(), 0);
         assert!(simulation.commands_for_current_tick().is_empty());
         assert_eq!(simulation.pending_command_ticks().count(), 0);
+        assert_eq!(simulation.rng().master_seed(), SEED);
+        assert_eq!(simulation.entities().alive_count(), 0);
     }
 }
