@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::hash::{CanonicalSerialize, CanonicalSink};
+use crate::hash::{
+    CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink,
+};
 
 const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const MIX1: u64 = 0xBF58_476D_1CE4_E5B9;
@@ -81,14 +83,22 @@ impl CanonicalSerialize for RngStream {
     }
 }
 
+impl CanonicalDecode for RngStream {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        Ok(Self {
+            state: reader.read_u64()?,
+        })
+    }
+}
+
 /// Errors produced when registering or restoring RNG streams.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RngError {
     /// The snapshot names a stream that is not registered.
-    UnknownStream { name: &'static str },
+    UnknownStream { name: String },
     /// A stream with this name is already registered; re-registering must
     /// not silently overwrite it.
-    DuplicateStream { name: &'static str },
+    DuplicateStream { name: String },
 }
 
 impl std::fmt::Display for RngError {
@@ -124,7 +134,7 @@ fn derive_seed(master_seed: u64, name: &str) -> u64 {
 #[derive(Clone, Debug)]
 pub struct RngStreams {
     master_seed: u64,
-    streams: BTreeMap<&'static str, RngStream>,
+    streams: BTreeMap<String, RngStream>,
 }
 
 impl RngStreams {
@@ -145,22 +155,25 @@ impl RngStreams {
 
     /// Registers a stream with an explicit seed. Registering the same name
     /// twice is an error rather than a silent overwrite.
-    pub fn register(&mut self, name: &'static str, seed: u64) -> Result<&mut RngStream, RngError> {
+    pub fn register(&mut self, name: &str, seed: u64) -> Result<&mut RngStream, RngError> {
         if self.streams.contains_key(name) {
-            return Err(RngError::DuplicateStream { name });
+            return Err(RngError::DuplicateStream {
+                name: name.to_owned(),
+            });
         }
         Ok(self
             .streams
-            .entry(name)
+            .entry(name.to_owned())
             .or_insert_with(|| RngStream::from_seed(seed)))
     }
 
     /// Returns the stream registered under `name`, deriving it
     /// deterministically from the master seed if it does not exist yet.
-    pub fn stream(&mut self, name: &'static str) -> &mut RngStream {
+    pub fn stream(&mut self, name: &str) -> &mut RngStream {
+        let master_seed = self.master_seed;
         self.streams
-            .entry(name)
-            .or_insert_with(|| RngStream::from_seed(derive_seed(self.master_seed, name)))
+            .entry(name.to_owned())
+            .or_insert_with(|| RngStream::from_seed(derive_seed(master_seed, name)))
     }
 
     /// Returns a shared reference to the stream registered under `name`.
@@ -190,21 +203,21 @@ impl RngStreams {
     /// Records every stream's state. Iteration order is by name, so the
     /// snapshot is deterministic.
     #[must_use]
-    pub fn snapshot(&self) -> BTreeMap<&'static str, u64> {
+    pub fn snapshot(&self) -> BTreeMap<String, u64> {
         self.streams
             .iter()
-            .map(|(name, stream)| (*name, stream.state()))
+            .map(|(name, stream)| (name.clone(), stream.state()))
             .collect()
     }
 
     /// Restores stream states from a snapshot. Every snapshot entry must name
     /// a registered stream; unknown names are an explicit error.
-    pub fn restore(&mut self, snapshot: &BTreeMap<&'static str, u64>) -> Result<(), RngError> {
+    pub fn restore(&mut self, snapshot: &BTreeMap<String, u64>) -> Result<(), RngError> {
         for (name, state) in snapshot {
             let stream = self
                 .streams
                 .get_mut(name)
-                .ok_or(RngError::UnknownStream { name })?;
+                .ok_or_else(|| RngError::UnknownStream { name: name.clone() })?;
             *stream = RngStream::from_state(*state);
         }
         Ok(())
@@ -221,6 +234,28 @@ impl CanonicalSerialize for RngStreams {
             sink.write_bytes(name.as_bytes());
             stream.write_canonical(sink);
         }
+    }
+}
+
+impl CanonicalDecode for RngStreams {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        let master_seed = reader.read_u64()?;
+        let count = reader.read_u64()?;
+        let count = usize::try_from(count).map_err(|_| CanonicalError::InvalidLength(count))?;
+        let mut streams = BTreeMap::new();
+        for _ in 0..count {
+            let name_bytes = reader.read_bytes()?;
+            let name =
+                String::from_utf8(name_bytes.to_vec()).map_err(|_| CanonicalError::InvalidUtf8)?;
+            let stream = RngStream::read_canonical(reader)?;
+            if streams.insert(name, stream).is_some() {
+                return Err(CanonicalError::InvalidState("duplicate RNG stream name"));
+            }
+        }
+        Ok(Self {
+            master_seed,
+            streams,
+        })
     }
 }
 
@@ -343,10 +378,12 @@ mod tests {
     fn restore_rejects_unknown_streams() {
         let mut streams = RngStreams::new(1);
         let mut snapshot = BTreeMap::new();
-        snapshot.insert("missing", 0_u64);
+        snapshot.insert("missing".to_owned(), 0_u64);
         assert_eq!(
             streams.restore(&snapshot),
-            Err(RngError::UnknownStream { name: "missing" })
+            Err(RngError::UnknownStream {
+                name: "missing".to_owned()
+            })
         );
     }
 

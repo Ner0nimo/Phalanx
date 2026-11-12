@@ -11,7 +11,9 @@
 //! commands are rejected with structured errors; they are never silently
 //! retargeted.
 
-use crate::hash::{CanonicalSerialize, CanonicalSink};
+use crate::hash::{
+    CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink,
+};
 
 /// The current command envelope schema version. Replays and savegames record
 /// it so older envelopes can be rejected or migrated explicitly.
@@ -172,15 +174,33 @@ impl CanonicalSerialize for RequestId {
     }
 }
 
+impl CanonicalDecode for RequestId {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        Ok(Self(reader.read_u64()?))
+    }
+}
+
 impl CanonicalSerialize for CommandId {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u64(self.0);
     }
 }
 
+impl CanonicalDecode for CommandId {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        Ok(Self(reader.read_u64()?))
+    }
+}
+
 impl CanonicalSerialize for ActorId {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u64(self.0);
+    }
+}
+
+impl CanonicalDecode for ActorId {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        Ok(Self(reader.read_u64()?))
     }
 }
 
@@ -195,6 +215,17 @@ impl CanonicalSerialize for CommandPayload {
     }
 }
 
+impl CanonicalDecode for CommandPayload {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        match reader.read_u32()? {
+            0 => Ok(Self::Diagnostics {
+                value: reader.read_u64()?,
+            }),
+            other => Err(CanonicalError::UnknownTag(other)),
+        }
+    }
+}
+
 impl<P: CanonicalSerialize> CanonicalSerialize for CommandEnvelope<P> {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u32(self.version);
@@ -203,6 +234,31 @@ impl<P: CanonicalSerialize> CanonicalSerialize for CommandEnvelope<P> {
         self.actor.write_canonical(sink);
         sink.write_u64(self.tick);
         self.payload.write_canonical(sink);
+    }
+}
+
+impl<P: CanonicalDecode> CanonicalDecode for CommandEnvelope<P> {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        let version = reader.read_u32()?;
+        if version != ENVELOPE_VERSION {
+            return Err(CanonicalError::UnsupportedVersion {
+                found: version,
+                expected: ENVELOPE_VERSION,
+            });
+        }
+        let request_id = RequestId::read_canonical(reader)?;
+        let command_id = CommandId::read_canonical(reader)?;
+        let actor = ActorId::read_canonical(reader)?;
+        let tick = reader.read_u64()?;
+        let payload = P::read_canonical(reader)?;
+        Ok(Self {
+            version,
+            request_id,
+            command_id,
+            actor,
+            tick,
+            payload,
+        })
     }
 }
 

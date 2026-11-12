@@ -8,7 +8,9 @@
 
 use crate::command::{ActorId, CommandPayload, CommandRequest, RequestId};
 use crate::replay::ReplayRecorder;
-use crate::simulation::{Phase, Simulation, SimulationRunner, SimulationSystem, TickRate};
+use crate::simulation::{
+    Phase, Simulation, SimulationRunner, SimulationSystem, SystemId, TickRate,
+};
 
 /// The master RNG seed of the deterministic CI scenario.
 pub const SCENARIO_SEED: u64 = 0x5CEA_1105_5EED;
@@ -36,6 +38,10 @@ pub fn scenario_commands() -> Vec<CommandRequest<CommandPayload>> {
 pub struct ScenarioSystem;
 
 impl SimulationSystem<CommandPayload> for ScenarioSystem {
+    fn id(&self) -> SystemId {
+        SystemId("scenario")
+    }
+
     fn phase(&self) -> Phase {
         Phase::ApplyCommands
     }
@@ -70,7 +76,9 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
 
 /// Registers the scenario system set on a runner.
 pub fn setup_scenario(runner: &mut SimulationRunner<CommandPayload>) {
-    runner.register_system(ScenarioSystem);
+    runner
+        .register_system(ScenarioSystem)
+        .expect("scenario system id is unique");
 }
 
 /// Records the deterministic CI scenario for `ticks` ticks.

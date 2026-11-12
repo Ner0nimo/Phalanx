@@ -20,7 +20,11 @@ use crate::command::{
     CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
 };
 use crate::entity::EntityAllocator;
-use crate::hash::{CANONICAL_ENCODING_VERSION, CanonicalSerialize, Digest, canonical_digest};
+use crate::hash::{
+    CANONICAL_ENCODING_VERSION, CanonicalDecode, CanonicalError, CanonicalReader,
+    CanonicalSerialize, CanonicalSink, Digest, DigestAlgorithm, HashSink, SnapshotSink,
+    canonical_digest,
+};
 use crate::rng::RngStreams;
 
 pub use crate::TickOverflow;
@@ -267,7 +271,7 @@ impl<P> Simulation<P> {
 /// depends on storage layout. Renderer/GPU state and wall-clock data cannot
 /// enter because the authoritative types do not contain them.
 impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
-    fn write_canonical(&self, sink: &mut dyn crate::hash::CanonicalSink) {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u32(CANONICAL_ENCODING_VERSION);
         sink.write_u32(SIMULATION_SCHEMA_VERSION);
         sink.write_u64(self.tick);
@@ -280,23 +284,85 @@ impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
     }
 }
 
+impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        let encoding_version = reader.read_u32()?;
+        if encoding_version != CANONICAL_ENCODING_VERSION {
+            return Err(CanonicalError::UnsupportedVersion {
+                found: encoding_version,
+                expected: CANONICAL_ENCODING_VERSION,
+            });
+        }
+        let schema_version = reader.read_u32()?;
+        if schema_version != SIMULATION_SCHEMA_VERSION {
+            return Err(CanonicalError::UnsupportedVersion {
+                found: schema_version,
+                expected: SIMULATION_SCHEMA_VERSION,
+            });
+        }
+        Ok(Self {
+            tick: reader.read_u64()?,
+            entities: CanonicalDecode::read_canonical(reader)?,
+            rng: CanonicalDecode::read_canonical(reader)?,
+            pending_commands: CanonicalDecode::read_canonical(reader)?,
+            current_tick_commands: CanonicalDecode::read_canonical(reader)?,
+            seen_requests: CanonicalDecode::read_canonical(reader)?,
+            next_command_id: reader.read_u64()?,
+        })
+    }
+}
+
 impl<P: CanonicalSerialize> Simulation<P> {
     /// Produces the canonical state digest of the authoritative simulation
     /// state (ADR-0001 Decision §8). The concrete algorithm is hidden behind
     /// [`Digest`]; see [`crate::hash`] for the versioned encoding contract.
+    ///
+    /// This covers simulation state only; the runner's checkpoint digest
+    /// additionally covers every registered system's canonical state.
     #[must_use]
     pub fn canonical_digest(&self) -> Digest {
         canonical_digest(self)
     }
 }
 
+/// Stable identity of a registered system (issue #34: system-state ownership;
+/// issue #35: registration freeze and manifest). Unique within a runner;
+/// used to key the system's canonical state in checkpoints and snapshots, and
+/// in the replay system manifest.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SystemId(pub &'static str);
+
+impl CanonicalSerialize for SystemId {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_bytes(self.0.as_bytes());
+    }
+}
+
 /// A hook that runs inside one [`Phase`] of every tick.
+///
+/// # State ownership contract (issue #34, ADR-0001 Decision §8)
+///
+/// The preferred model is stateless systems: all authoritative mutable state
+/// lives in [`Simulation`], which is what the canonical checkpoint digest and
+/// snapshots cover. A system that keeps mutable state in `self` must treat it
+/// as authoritative: it MUST be written by [`SimulationSystem::write_canonical_state`]
+/// and restored by [`SimulationSystem::restore_canonical_state`], and any
+/// configuration that can affect behavior belongs in that state too. State
+/// missing from the canonical encoding is untracked: it cannot be checkpointed
+/// or restored, and any behavior depending on it will diverge after a restore.
+///
+/// Rebuildable caches are the exception: they are allowed only when rebuilt
+/// from authoritative state, excluded from the canonical encoding, and never
+/// consulted for an outcome before being validated against that state.
 ///
 /// Systems declare their phase and an explicit in-phase ordering key. The
 /// runner executes phases in [`Phase::SCHEDULE`] order; registration order
-/// only breaks exact (phase, order) ties and is therefore never what defines
-/// the schedule.
+/// only breaks exact (phase, order) ties (by [`SystemId`]) and is therefore
+/// never what defines the schedule.
 pub trait SimulationSystem<P> {
+    /// The stable, unique identity of this system.
+    fn id(&self) -> SystemId;
+
     /// The phase this system runs in.
     fn phase(&self) -> Phase;
 
@@ -308,12 +374,94 @@ pub trait SimulationSystem<P> {
     /// Stable diagnostic name used by tests and replay diagnostics.
     fn name(&self) -> &'static str;
 
+    /// Writes this system's authoritative state (including behavior-relevant
+    /// configuration) into the canonical stream. Stateless systems use the
+    /// default, which writes nothing. This is the ONLY system state included
+    /// in checkpoint digests and snapshots.
+    fn write_canonical_state(&self, _sink: &mut dyn CanonicalSink) {}
+
+    /// Restores authoritative state previously written by
+    /// [`SimulationSystem::write_canonical_state`]. The default suits
+    /// stateless systems: it succeeds only when no state bytes are present.
+    fn restore_canonical_state(
+        &mut self,
+        reader: &mut CanonicalReader<'_>,
+    ) -> Result<(), CanonicalError> {
+        reader.finish()
+    }
+
     /// Executes the system for the current tick. Placeholder hooks must not
     /// pretend gameplay systems exist.
     fn run(&mut self, simulation: &mut Simulation<P>, phase: Phase);
 }
 
+/// Structured reasons system registration is rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemRegistrationError {
+    /// A system with this ID is already registered; IDs must be unique so
+    /// canonical state can be keyed unambiguously.
+    DuplicateSystemId { id: SystemId },
+}
+
+impl std::fmt::Display for SystemRegistrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateSystemId { id } => {
+                write!(formatter, "duplicate system id: {}", id.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SystemRegistrationError {}
+
+/// Errors produced while restoring a runner snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotError {
+    /// The canonical byte stream was invalid, or a version field mismatched.
+    Canonical(CanonicalError),
+    /// The snapshot names a system ID that is not registered on this runner.
+    UnknownSystemId(String),
+    /// A registered system has no state in the snapshot.
+    MissingSystemState(SystemId),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Canonical(error) => write!(formatter, "invalid snapshot: {error}"),
+            Self::UnknownSystemId(name) => {
+                write!(formatter, "snapshot contains unknown system id: {name}")
+            }
+            Self::MissingSystemState(id) => {
+                write!(formatter, "snapshot has no state for system: {}", id.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+/// The canonical checkpoint digest over the simulation and every registered
+/// system's canonical state, keyed by system ID in execution order.
+fn checkpoint_digest<P: CanonicalSerialize>(
+    simulation: &Simulation<P>,
+    systems: &[RegisteredSystem<P>],
+) -> Digest {
+    let mut sink = HashSink::new(DigestAlgorithm::current());
+    simulation.write_canonical(&mut sink);
+    sink.write_u64(systems.len() as u64);
+    for registered in systems {
+        registered.system.id().write_canonical(&mut sink);
+        let mut state = SnapshotSink::new();
+        registered.system.write_canonical_state(&mut state);
+        sink.write_bytes(&state.bytes);
+    }
+    sink.finish()
+}
+
 struct RegisteredSystem<P> {
+    id: SystemId,
     phase: Phase,
     order: u64,
     system: Box<dyn SimulationSystem<P>>,
@@ -383,22 +531,107 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
 
     /// Registers a system. The phase schedule comes from [`Phase::SCHEDULE`]
     /// and each system's declared `(phase, order)`, not from registration
-    /// order.
-    pub fn register_system<S>(&mut self, system: S) -> &mut Self
+    /// order. System IDs must be unique: they key canonical system state in
+    /// checkpoints and snapshots.
+    pub fn register_system<S>(&mut self, system: S) -> Result<&mut Self, SystemRegistrationError>
     where
         S: SimulationSystem<P> + 'static,
     {
+        let id = system.id();
+        if self.systems.iter().any(|registered| registered.id == id) {
+            return Err(SystemRegistrationError::DuplicateSystemId { id });
+        }
         let registered = RegisteredSystem {
+            id,
             phase: system.phase(),
             order: system.order(),
             system: Box::new(system),
         };
         self.systems.push(registered);
         // Stable sort: the phase schedule dominates, so phase execution order
-        // never depends on registration order.
+        // never depends on registration order; the system ID is the final
+        // deterministic tie-break.
         self.systems
-            .sort_by_key(|registered| (registered.phase.index(), registered.order));
-        self
+            .sort_by_key(|registered| (registered.phase.index(), registered.order, registered.id));
+        Ok(self)
+    }
+
+    /// The registered systems in deterministic execution order.
+    fn ordered_systems(&self) -> &[RegisteredSystem<P>] {
+        &self.systems
+    }
+
+    /// Produces the canonical checkpoint digest of the full authoritative
+    /// state: the [`Simulation`] plus every registered system's canonical
+    /// state, keyed by [`SystemId`] in execution order (issue #34). This is
+    /// the digest recorded per tick at [`Phase::ProduceStateHash`].
+    #[must_use]
+    pub fn canonical_digest(&self) -> Digest {
+        checkpoint_digest(&self.simulation, self.ordered_systems())
+    }
+
+    /// Encodes a full snapshot of the authoritative state: the simulation
+    /// (encoding and schema versions included) plus each registered system's
+    /// canonical state keyed by [`SystemId`]. Stateless systems contribute an
+    /// empty state. Rebuildable caches are excluded by contract.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut sink = SnapshotSink::new();
+        self.simulation.write_canonical(&mut sink);
+        sink.write_u64(self.systems.len() as u64);
+        for registered in self.ordered_systems() {
+            registered.system.id().write_canonical(&mut sink);
+            let mut state = SnapshotSink::new();
+            registered.system.write_canonical_state(&mut state);
+            sink.write_bytes(&state.bytes);
+        }
+        sink.bytes
+    }
+
+    /// Restores a snapshot produced by [`SimulationRunner::snapshot`] into
+    /// this runner. The snapshot's system IDs must match the registered
+    /// systems exactly; each system's state is fed through its
+    /// [`SimulationSystem::restore_canonical_state`]. The encoding and schema
+    /// versions are validated and rejected on mismatch.
+    pub fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>
+    where
+        P: CanonicalDecode,
+    {
+        let mut reader = CanonicalReader::new(bytes);
+        self.simulation =
+            Simulation::read_canonical(&mut reader).map_err(SnapshotError::Canonical)?;
+        // Recorded per-tick digests beyond the restored tick are stale.
+        self.hashes
+            .truncate(usize::try_from(self.simulation.tick).unwrap_or(usize::MAX));
+        let count = reader.read_u64().map_err(SnapshotError::Canonical)?;
+        let count = usize::try_from(count)
+            .map_err(|_| SnapshotError::Canonical(CanonicalError::InvalidLength(count)))?;
+        let mut restored = vec![false; self.systems.len()];
+        for _ in 0..count {
+            let name_bytes = reader.read_bytes().map_err(SnapshotError::Canonical)?;
+            let name = String::from_utf8(name_bytes.to_vec())
+                .map_err(|_| SnapshotError::Canonical(CanonicalError::InvalidUtf8))?;
+            let position = self
+                .systems
+                .iter()
+                .position(|registered| registered.id.0 == name)
+                .ok_or_else(|| SnapshotError::UnknownSystemId(name.clone()))?;
+            let state_bytes = reader.read_bytes().map_err(SnapshotError::Canonical)?;
+            let mut state_reader = CanonicalReader::new(state_bytes);
+            self.systems[position]
+                .system
+                .restore_canonical_state(&mut state_reader)
+                .map_err(SnapshotError::Canonical)?;
+            state_reader.finish().map_err(SnapshotError::Canonical)?;
+            restored[position] = true;
+        }
+        reader.finish().map_err(SnapshotError::Canonical)?;
+        for (registered, restored) in self.systems.iter().zip(restored) {
+            if !restored {
+                return Err(SnapshotError::MissingSystemState(registered.id));
+            }
+        }
+        Ok(())
     }
 
     /// Queues a command to be applied at the boundary of its target tick.
@@ -481,10 +714,11 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             }
         }
 
-        // Phase 15 (produce state hash): hash after all phases ran, while the
-        // tick's applied commands are still visible.
+        // Phase 15 (produce state hash): checkpoint digest after all phases
+        // ran, while the tick's applied commands are still visible. It covers
+        // the simulation and every registered system's canonical state.
         if *record_hashes {
-            hashes.push(simulation.canonical_digest());
+            hashes.push(checkpoint_digest(simulation, systems));
         }
         simulation.current_tick_commands.clear();
         Ok(())
@@ -524,6 +758,10 @@ mod tests {
     }
 
     impl<P> SimulationSystem<P> for Probe {
+        fn id(&self) -> SystemId {
+            SystemId(self.name)
+        }
+
         fn phase(&self) -> Phase {
             self.phase
         }
@@ -565,6 +803,8 @@ mod tests {
                 trace: trace.clone(),
                 ingest_counts: ingest_counts.clone(),
             })
+            .expect("unique system id");
+        runner
             .register_system(Probe {
                 phase: Phase::ResolveCombat,
                 order: 0,
@@ -572,6 +812,8 @@ mod tests {
                 trace: trace.clone(),
                 ingest_counts: ingest_counts.clone(),
             })
+            .expect("unique system id");
+        runner
             .register_system(Probe {
                 phase: Phase::IngestCommands,
                 order: 1,
@@ -579,13 +821,16 @@ mod tests {
                 trace: trace.clone(),
                 ingest_counts: ingest_counts.clone(),
             })
+            .expect("unique system id");
+        runner
             .register_system(Probe {
                 phase: Phase::IngestCommands,
                 order: 0,
                 name: "ingest-a",
                 trace: trace.clone(),
                 ingest_counts: ingest_counts.clone(),
-            });
+            })
+            .expect("unique system id");
         runner
     }
 
@@ -686,13 +931,15 @@ mod tests {
     fn commands_are_applied_only_at_their_tick_boundary() {
         let counts = IngestCounts::default();
         let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
-        runner.register_system(Probe {
-            phase: Phase::IngestCommands,
-            order: 0,
-            name: "ingest",
-            trace: Trace::default(),
-            ingest_counts: counts.clone(),
-        });
+        runner
+            .register_system(Probe {
+                phase: Phase::IngestCommands,
+                order: 0,
+                name: "ingest",
+                trace: Trace::default(),
+                ingest_counts: counts.clone(),
+            })
+            .expect("unique system id");
 
         runner
             .submit_command(request(1, 3, 42))
@@ -721,6 +968,10 @@ mod tests {
         }
 
         impl SimulationSystem<u32> for CommandProbe {
+            fn id(&self) -> SystemId {
+                SystemId("command-probe")
+            }
+
             fn phase(&self) -> Phase {
                 Phase::IngestCommands
             }
@@ -744,7 +995,9 @@ mod tests {
 
         let log = CommandLog::default();
         let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
-        runner.register_system(CommandProbe { log: log.clone() });
+        runner
+            .register_system(CommandProbe { log: log.clone() })
+            .expect("unique system id");
 
         // Assigned command IDs follow submission order: 0, 1, 2, 3.
         let id0 = runner
@@ -889,6 +1142,10 @@ mod tests {
         }
 
         impl SimulationSystem<()> for WorldProbe {
+            fn id(&self) -> SystemId {
+                SystemId("world-probe")
+            }
+
             fn phase(&self) -> Phase {
                 Phase::ApplyCommands
             }
@@ -916,8 +1173,10 @@ mod tests {
         let log_b = Rc::new(RefCell::new(Vec::new()));
         let mut a: SimulationRunner<()> = SimulationRunner::new(TickRate::DEFAULT, 42);
         let mut b: SimulationRunner<()> = SimulationRunner::new(TickRate::DEFAULT, 42);
-        a.register_system(WorldProbe { log: log_a.clone() });
-        b.register_system(WorldProbe { log: log_b.clone() });
+        a.register_system(WorldProbe { log: log_a.clone() })
+            .expect("unique system id");
+        b.register_system(WorldProbe { log: log_b.clone() })
+            .expect("unique system id");
 
         a.advance_ticks(3).expect("advance");
         b.advance_ticks(3).expect("advance");
@@ -947,5 +1206,209 @@ mod tests {
         assert_eq!(simulation.pending_command_ticks().count(), 0);
         assert_eq!(simulation.rng().master_seed(), SEED);
         assert_eq!(simulation.entities().alive_count(), 0);
+    }
+
+    /// A stateful system: keeps authoritative mutable state in `self`, which
+    /// must flow through the canonical state hooks.
+    struct CounterSystem {
+        count: u64,
+    }
+
+    impl CounterSystem {
+        fn new() -> Self {
+            Self { count: 0 }
+        }
+    }
+
+    impl SimulationSystem<u32> for CounterSystem {
+        fn id(&self) -> SystemId {
+            SystemId("counter")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::ApplyCommands
+        }
+
+        fn name(&self) -> &'static str {
+            "counter"
+        }
+
+        fn write_canonical_state(&self, sink: &mut dyn CanonicalSink) {
+            sink.write_u64(self.count);
+        }
+
+        fn restore_canonical_state(
+            &mut self,
+            reader: &mut CanonicalReader<'_>,
+        ) -> Result<(), CanonicalError> {
+            self.count = reader.read_u64()?;
+            reader.finish()
+        }
+
+        fn run(&mut self, simulation: &mut Simulation<u32>, _phase: Phase) {
+            self.count += simulation.commands_for_current_tick().len() as u64 + 1;
+        }
+    }
+
+    #[test]
+    fn duplicate_system_ids_are_rejected() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner
+            .register_system(CounterSystem::new())
+            .expect("first registration");
+        assert_eq!(
+            runner.register_system(CounterSystem::new()).map(|_| ()),
+            Err(SystemRegistrationError::DuplicateSystemId {
+                id: SystemId("counter")
+            })
+        );
+    }
+
+    #[test]
+    fn system_state_is_part_of_the_checkpoint_digest() {
+        let mut a: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        let mut b: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        a.register_system(CounterSystem::new()).expect("id");
+        b.register_system(CounterSystem::new()).expect("id");
+        for runner in [&mut a, &mut b] {
+            runner
+                .submit_command(request(1, 2, 5))
+                .expect("future tick");
+        }
+        a.advance_ticks(3).expect("advance");
+        b.advance_ticks(3).expect("advance");
+
+        // Same inputs: identical checkpoint digests, and the last recorded
+        // per-tick digest is the checkpoint digest.
+        assert_eq!(a.canonical_digest(), b.canonical_digest());
+        assert_eq!(a.tick_hashes().last(), Some(&a.canonical_digest()));
+        // The system state is included: the checkpoint digest differs from
+        // the simulation-only digest once the system has state.
+        assert_ne!(a.canonical_digest(), a.simulation().canonical_digest());
+    }
+
+    #[test]
+    fn restored_snapshot_reproduces_subsequent_hashes() {
+        let make_runner = || {
+            let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+            runner.register_system(CounterSystem::new()).expect("id");
+            runner
+                .submit_command(request(1, 2, 5))
+                .expect("future tick");
+            runner
+        };
+
+        let mut a = make_runner();
+        a.advance_ticks(4).expect("advance to tick 4");
+        let snapshot = a.snapshot();
+        a.advance_ticks(4).expect("advance to tick 8");
+        let hashes_a = a.tick_hashes()[4..].to_vec();
+
+        // A runner that diverged (tick 6) restores the tick-4 snapshot and
+        // then reproduces the exact subsequent behavior and hashes.
+        let mut b = make_runner();
+        b.advance_ticks(6).expect("advance to tick 6");
+        assert_ne!(b.simulation().tick(), 4);
+        b.restore_snapshot(&snapshot).expect("restore");
+        assert_eq!(b.simulation().tick(), 4);
+        // Digests recorded beyond the restored tick were dropped.
+        assert_eq!(b.tick_hashes().len(), 4);
+        b.advance_ticks(4).expect("advance to tick 8");
+        assert_eq!(b.tick_hashes()[4..], hashes_a);
+        assert_eq!(b.canonical_digest(), a.canonical_digest());
+    }
+
+    #[test]
+    fn restore_rejects_mismatched_system_sets() {
+        struct Stateless;
+        impl SimulationSystem<u32> for Stateless {
+            fn id(&self) -> SystemId {
+                SystemId("extra")
+            }
+            fn phase(&self) -> Phase {
+                Phase::EmitEvents
+            }
+            fn name(&self) -> &'static str {
+                "extra"
+            }
+            fn run(&mut self, _simulation: &mut Simulation<u32>, _phase: Phase) {}
+        }
+
+        let mut a: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        a.register_system(CounterSystem::new()).expect("id");
+        a.advance_ticks(2).expect("advance");
+        let snapshot = a.snapshot();
+
+        // Snapshot names a system this runner does not have.
+        let mut empty: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        assert_eq!(
+            empty.restore_snapshot(&snapshot),
+            Err(SnapshotError::UnknownSystemId("counter".to_owned()))
+        );
+
+        // This runner has a registered system missing from the snapshot.
+        let mut with_extra: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        with_extra
+            .register_system(CounterSystem::new())
+            .expect("id");
+        with_extra.register_system(Stateless).expect("id");
+        assert_eq!(
+            with_extra.restore_snapshot(&snapshot),
+            Err(SnapshotError::MissingSystemState(SystemId("extra")))
+        );
+    }
+
+    #[test]
+    fn restore_rejects_wrong_encoding_version() {
+        let mut a: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        a.register_system(CounterSystem::new()).expect("id");
+        a.advance_ticks(1).expect("advance");
+        let mut snapshot = a.snapshot();
+        // Corrupt the encoding version (first u32).
+        snapshot[0..4].copy_from_slice(&99_u32.to_le_bytes());
+        let mut b: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        b.register_system(CounterSystem::new()).expect("id");
+        assert_eq!(
+            b.restore_snapshot(&snapshot),
+            Err(SnapshotError::Canonical(
+                CanonicalError::UnsupportedVersion {
+                    found: 99,
+                    expected: CANONICAL_ENCODING_VERSION
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn stateless_systems_round_trip_an_empty_state() {
+        let mut a: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        a.register_system(Probe {
+            phase: Phase::EmitEvents,
+            order: 0,
+            name: "probe",
+            trace: Trace::default(),
+            ingest_counts: IngestCounts::default(),
+        })
+        .expect("id");
+        a.advance_ticks(2).expect("advance");
+        let snapshot = a.snapshot();
+
+        let mut b: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        b.register_system(Probe {
+            phase: Phase::EmitEvents,
+            order: 0,
+            name: "probe",
+            trace: Trace::default(),
+            ingest_counts: IngestCounts::default(),
+        })
+        .expect("id");
+        b.advance_ticks(3).expect("diverge to tick 3");
+        b.restore_snapshot(&snapshot).expect("stateless restore");
+        assert_eq!(b.simulation().tick(), 2);
+        // Digests recorded beyond the restored tick were dropped.
+        assert_eq!(b.tick_hashes().len(), 2);
+        b.advance_ticks(2).expect("advance");
+        a.advance_ticks(2).expect("advance");
+        assert_eq!(a.tick_hashes()[2..], b.tick_hashes()[2..]);
     }
 }

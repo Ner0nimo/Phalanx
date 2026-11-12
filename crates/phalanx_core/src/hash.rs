@@ -307,6 +307,10 @@ pub enum CanonicalError {
     UnknownTag(u32),
     /// An unknown digest algorithm tag.
     UnknownDigestAlgorithm(u32),
+    /// A version field (encoding, schema, or envelope) is not supported.
+    UnsupportedVersion { found: u32, expected: u32 },
+    /// A decoded value failed structural validation.
+    InvalidState(&'static str),
     /// Bytes remained after decoding a complete value.
     TrailingBytes(usize),
 }
@@ -322,6 +326,13 @@ impl std::fmt::Display for CanonicalError {
             Self::UnknownDigestAlgorithm(tag) => {
                 write!(formatter, "unknown digest algorithm {tag}")
             }
+            Self::UnsupportedVersion { found, expected } => {
+                write!(
+                    formatter,
+                    "unsupported version {found} (expected {expected})"
+                )
+            }
+            Self::InvalidState(what) => write!(formatter, "invalid decoded state: {what}"),
             Self::TrailingBytes(count) => write!(formatter, "{count} trailing bytes after value"),
         }
     }

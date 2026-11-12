@@ -6,7 +6,9 @@
 //! bumped generation, and rejects stale IDs with structured errors instead of
 //! letting them resolve to a newly created entity.
 
-use crate::hash::{CanonicalSerialize, CanonicalSink};
+use crate::hash::{
+    CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink,
+};
 
 /// A stable logical entity identifier.
 ///
@@ -181,6 +183,21 @@ impl Default for EntityAllocator {
     }
 }
 
+impl CanonicalSerialize for EntityId {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u32(self.index);
+        sink.write_u64(self.generation);
+    }
+}
+
+impl CanonicalDecode for EntityId {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        let index = reader.read_u32()?;
+        let generation = reader.read_u64()?;
+        Ok(Self { index, generation })
+    }
+}
+
 /// Canonical form: slots in index order (alive flag + generation), then the
 /// free list in stack order. The hash depends on logical slot state, never on
 /// storage layout or allocation history beyond what the slots record.
@@ -196,6 +213,58 @@ impl CanonicalSerialize for EntityAllocator {
         for index in &self.free {
             sink.write_u32(*index);
         }
+    }
+}
+
+impl CanonicalDecode for EntityAllocator {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        let slot_count = reader.read_u64()?;
+        let slot_count =
+            usize::try_from(slot_count).map_err(|_| CanonicalError::InvalidLength(slot_count))?;
+        let alive = reader.read_u64()?;
+        let mut slots = Vec::with_capacity(slot_count.min(reader.remaining() / 9));
+        for _ in 0..slot_count {
+            let slot_alive = reader.read_bool()?;
+            let generation = reader.read_u64()?;
+            slots.push(Slot {
+                generation,
+                alive: slot_alive,
+            });
+        }
+        let free_count = reader.read_u64()?;
+        let free_count =
+            usize::try_from(free_count).map_err(|_| CanonicalError::InvalidLength(free_count))?;
+        let mut free = Vec::with_capacity(free_count.min(reader.remaining() / 4));
+        for _ in 0..free_count {
+            free.push(reader.read_u32()?);
+        }
+
+        // Structural validation at the boundary: the alive count must match
+        // the slots, and the free list must be exactly the dead slots.
+        let live = slots.iter().filter(|slot| slot.alive).count() as u64;
+        if live != alive {
+            return Err(CanonicalError::InvalidState(
+                "alive count does not match slots",
+            ));
+        }
+        if free.len() as u64 + alive != slots.len() as u64 {
+            return Err(CanonicalError::InvalidState(
+                "free list size does not match slots",
+            ));
+        }
+        let mut seen = vec![false; slots.len()];
+        for index in &free {
+            let slot = slots
+                .get(*index as usize)
+                .ok_or(CanonicalError::InvalidState(
+                    "free list references unknown slot",
+                ))?;
+            if slot.alive || seen[*index as usize] {
+                return Err(CanonicalError::InvalidState("invalid free list entry"));
+            }
+            seen[*index as usize] = true;
+        }
+        Ok(Self { slots, free, alive })
     }
 }
 
