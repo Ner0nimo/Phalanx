@@ -288,7 +288,7 @@ Use stable logical entity identifiers suitable for commands, replays, saves, and
 
 Entity lifecycle must define creation and destruction tick, generation/reuse behavior, ownership/team, group membership changes, reference invalidation, death/destruction events, and save/load identity restoration.
 
-Persistent references must be validated; stale references must return explicit errors rather than accidentally resolving to a newly created entity.
+Persistent references must be validated; stale references must return explicit errors rather than accidentally resolving to a newly created entity. Stable IDs are implemented as `EntityId` (slot index + generation) with `EntityAllocator` in `phalanx_core::entity` (`crates/phalanx_core/src/entity.rs`), which bumps the generation on release so stale IDs never resolve to reused slots.
 
 ### 6.3 Data definitions vs runtime state
 
@@ -546,7 +546,7 @@ The editor and scenario tools must be controllable without manual interaction. T
 
 Every request should support protocol/API version, request ID and command ID, explicit success/error result, stable entity and asset references, structured error code and human-readable explanation, validation-only/dry-run mode where meaningful, batch limits and transaction boundaries, idempotency semantics for retryable operations, explicit tick assignment for simulation-affecting commands, machine-readable output (diagnostics go to stderr or a separate channel), timeouts/cancellation for long-running operations, and capability checks with scoped filesystem access.
 
-Commands that affect a running simulation are queued for a defined tick boundary. Editor-only map mutations are not silently mixed with active match state.
+Commands that affect a running simulation are queued for a defined tick boundary. Editor-only map mutations are not silently mixed with active match state. The simulation-side command contract is the versioned `CommandEnvelope` (request ID, simulation-assigned command ID, target tick, actor, typed payload) in `phalanx_core::command` (`crates/phalanx_core/src/command.rs`), applied by `SimulationRunner` in ascending command-ID order at the target tick's boundary; late and duplicate commands are rejected with structured errors.
 
 ### 12.3 Agent integration
 

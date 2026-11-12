@@ -2,11 +2,17 @@
 //!
 //! The [`simulation`] module provides the fixed-tick [`simulation::SimulationRunner`]
 //! and the explicit [`simulation::Phase`] schedule required by ADR-0001 and
-//! `RtsEngineDoc.md` §6.1. The smoke scenario below is infrastructure
-//! validation only; it is deliberately not a gameplay simulation.
+//! `RtsEngineDoc.md` §6.1. The [`entity`], [`rng`], and [`command`] modules
+//! provide the stable entity IDs, deterministic RNG streams, and versioned
+//! tick-indexed command envelope that authoritative state is built on. The
+//! smoke scenario below is infrastructure validation only; it is deliberately
+//! not a gameplay simulation.
 
 #![forbid(unsafe_code)]
 
+pub mod command;
+pub mod entity;
+pub mod rng;
 pub mod simulation;
 
 /// A deterministic workload used to prove that the core can advance without
