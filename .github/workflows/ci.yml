@@ -77,3 +77,7 @@ jobs:
 
       - name: Scan for leaked secrets
         uses: gitleaks/gitleaks-action@v2
+        env:
+          # gitleaks-action v2 requires the token explicitly for PR scans;
+          # the default token with the workflow's contents: read is enough.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
