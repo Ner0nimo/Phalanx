@@ -297,7 +297,13 @@ impl BattleWorld {
                         destination: *destination,
                     });
                     state.move_destination = Some(*destination);
-                    let _ = self.movement.order_move(subject, *destination);
+                    if self.movement.order_move(subject, *destination).is_err() {
+                        self.events.push(BattleEvent::CommandFailed {
+                            unit: subject,
+                            reason: CommandFailReason::UnknownSubject,
+                            tick,
+                        });
+                    }
                 }
                 CommandPayload::Attack { target } => {
                     if attack_valid {
