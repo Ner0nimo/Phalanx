@@ -181,6 +181,89 @@ impl Phase {
     }
 }
 
+impl CanonicalSerialize for Phase {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u32(*self as u32);
+    }
+}
+
+impl CanonicalDecode for Phase {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        let tag = reader.read_u32()?;
+        Self::SCHEDULE
+            .get(tag.wrapping_sub(1) as usize)
+            .filter(|phase| **phase as u32 == tag)
+            .copied()
+            .ok_or(CanonicalError::UnknownTag(tag))
+    }
+}
+
+/// One entry of the finalized [`SystemManifest`]: a system's stable identity
+/// and its exact position in the schedule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SystemManifestEntry {
+    /// The system's stable unique ID.
+    pub id: SystemId,
+    /// The phase the system runs in.
+    pub phase: Phase,
+    /// The explicit in-phase ordering key.
+    pub order: u64,
+}
+
+impl CanonicalSerialize for SystemManifestEntry {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        self.id.write_canonical(sink);
+        self.phase.write_canonical(sink);
+        sink.write_u64(self.order);
+    }
+}
+
+/// The finalized, immutable system registry of a runner (issue #35): the
+/// systems in deterministic execution order. Recorded in replay metadata;
+/// its canonical digest is the manifest version compared during replay.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SystemManifest {
+    entries: Vec<SystemManifestEntry>,
+}
+
+impl SystemManifest {
+    /// The manifest entries in execution order (phase schedule, then the
+    /// explicit per-phase ordering key).
+    #[must_use]
+    pub fn entries(&self) -> &[SystemManifestEntry] {
+        &self.entries
+    }
+
+    /// Returns the number of registered systems.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether the manifest is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The canonical digest of the manifest: the stable manifest version,
+    /// identical across independent runner construction with the same
+    /// registrations in any registration order.
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        canonical_digest(self)
+    }
+}
+
+impl CanonicalSerialize for SystemManifest {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u64(self.entries.len() as u64);
+        for entry in &self.entries {
+            entry.write_canonical(sink);
+        }
+    }
+}
+
 /// Authoritative simulation state owned by the CPU simulation (ADR-0001
 /// Decision §1).
 ///
@@ -366,10 +449,10 @@ pub trait SimulationSystem<P> {
     /// The phase this system runs in.
     fn phase(&self) -> Phase;
 
-    /// Explicit ordering key within the phase. Defaults to 0.
-    fn order(&self) -> u64 {
-        0
-    }
+    /// Explicit ordering key within the phase. Required and unique per
+    /// phase: together with the phase schedule this fully determines
+    /// execution order, so registration order can never affect it.
+    fn order(&self) -> u64;
 
     /// Stable diagnostic name used by tests and replay diagnostics.
     fn name(&self) -> &'static str;
@@ -401,6 +484,14 @@ pub enum SystemRegistrationError {
     /// A system with this ID is already registered; IDs must be unique so
     /// canonical state can be keyed unambiguously.
     DuplicateSystemId { id: SystemId },
+    /// Another system already declared this ordering key in the same phase;
+    /// ordering keys must be unique per phase so execution order is fully
+    /// determined and never depends on registration order.
+    DuplicateOrderKey { phase: Phase, order: u64 },
+    /// The registry is frozen: registration is closed after
+    /// `finalize_registry` or after the first tick has executed, so a run's
+    /// behavior can never change mid-run without a versioned transition.
+    RegistryFrozen,
 }
 
 impl std::fmt::Display for SystemRegistrationError {
@@ -408,6 +499,14 @@ impl std::fmt::Display for SystemRegistrationError {
         match self {
             Self::DuplicateSystemId { id } => {
                 write!(formatter, "duplicate system id: {}", id.0)
+            }
+            Self::DuplicateOrderKey { phase, order } => write!(
+                formatter,
+                "duplicate ordering key {order} in phase {}",
+                phase.name()
+            ),
+            Self::RegistryFrozen => {
+                formatter.write_str("system registry is frozen (finalized or past the first tick)")
             }
         }
     }
@@ -477,6 +576,7 @@ pub struct SimulationRunner<P> {
     simulation: Simulation<P>,
     tick_rate: TickRate,
     systems: Vec<RegisteredSystem<P>>,
+    manifest: Option<SystemManifest>,
     hashes: Vec<Digest>,
     record_hashes: bool,
 }
@@ -491,6 +591,7 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             simulation: Simulation::new(rng_seed),
             tick_rate,
             systems: Vec::new(),
+            manifest: None,
             hashes: Vec::new(),
             record_hashes: true,
         }
@@ -537,23 +638,69 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     where
         S: SimulationSystem<P> + 'static,
     {
+        if self.manifest.is_some() || self.simulation.tick > 0 {
+            return Err(SystemRegistrationError::RegistryFrozen);
+        }
         let id = system.id();
         if self.systems.iter().any(|registered| registered.id == id) {
             return Err(SystemRegistrationError::DuplicateSystemId { id });
         }
+        let phase = system.phase();
+        let order = system.order();
+        if self
+            .systems
+            .iter()
+            .any(|registered| registered.phase == phase && registered.order == order)
+        {
+            return Err(SystemRegistrationError::DuplicateOrderKey { phase, order });
+        }
         let registered = RegisteredSystem {
             id,
-            phase: system.phase(),
-            order: system.order(),
+            phase,
+            order,
             system: Box::new(system),
         };
         self.systems.push(registered);
-        // Stable sort: the phase schedule dominates, so phase execution order
-        // never depends on registration order; the system ID is the final
-        // deterministic tie-break.
+        // Stable sort: the phase schedule and the explicit ordering key
+        // dominate, so execution order never depends on registration order;
+        // the system ID is the final deterministic tie-break.
         self.systems
             .sort_by_key(|registered| (registered.phase.index(), registered.order, registered.id));
         Ok(self)
+    }
+
+    /// Finalizes the registry: freezes it into a [`SystemManifest`] in
+    /// execution order. Registration already rejected duplicates, so this is
+    /// infallible and idempotent. Also called automatically on the first
+    /// tick, so registration is implicitly closed after the first tick.
+    pub fn finalize_registry(&mut self) -> &SystemManifest {
+        if self.manifest.is_none() {
+            let entries = self
+                .systems
+                .iter()
+                .map(|registered| SystemManifestEntry {
+                    id: registered.id,
+                    phase: registered.phase,
+                    order: registered.order,
+                })
+                .collect();
+            self.manifest = Some(SystemManifest { entries });
+        }
+        self.manifest.as_ref().expect("manifest was just set")
+    }
+
+    /// Returns the finalized system manifest, or `None` while the registry
+    /// is still open (before the first tick and before
+    /// [`SimulationRunner::finalize_registry`]).
+    #[must_use]
+    pub fn system_manifest(&self) -> Option<&SystemManifest> {
+        self.manifest.as_ref()
+    }
+
+    /// Returns whether the registry has been finalized.
+    #[must_use]
+    pub const fn is_finalized(&self) -> bool {
+        self.manifest.is_some()
     }
 
     /// The registered systems in deterministic execution order.
@@ -688,6 +835,8 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     /// in ascending command-ID order, then executes every phase in
     /// [`Phase::SCHEDULE`] order. Never reads wall-clock time.
     pub fn step_tick(&mut self) -> Result<(), TickOverflow> {
+        // One-way lifecycle: the first tick implicitly finalizes the registry.
+        self.finalize_registry();
         let next_tick = self.simulation.tick.checked_add(1).ok_or(TickOverflow)?;
         self.simulation.tick = next_tick;
         let mut commands = self
@@ -976,6 +1125,10 @@ mod tests {
                 Phase::IngestCommands
             }
 
+            fn order(&self) -> u64 {
+                0
+            }
+
             fn name(&self) -> &'static str {
                 "command-probe"
             }
@@ -1150,6 +1303,10 @@ mod tests {
                 Phase::ApplyCommands
             }
 
+            fn order(&self) -> u64 {
+                0
+            }
+
             fn name(&self) -> &'static str {
                 "world-probe"
             }
@@ -1227,6 +1384,10 @@ mod tests {
 
         fn phase(&self) -> Phase {
             Phase::ApplyCommands
+        }
+
+        fn order(&self) -> u64 {
+            0
         }
 
         fn name(&self) -> &'static str {
@@ -1328,6 +1489,10 @@ mod tests {
             fn phase(&self) -> Phase {
                 Phase::EmitEvents
             }
+
+            fn order(&self) -> u64 {
+                0
+            }
             fn name(&self) -> &'static str {
                 "extra"
             }
@@ -1410,5 +1575,123 @@ mod tests {
         b.advance_ticks(2).expect("advance");
         a.advance_ticks(2).expect("advance");
         assert_eq!(a.tick_hashes()[2..], b.tick_hashes()[2..]);
+    }
+
+    /// A minimal stateless system parameterized by id/phase/order.
+    struct Noop {
+        id: &'static str,
+        phase: Phase,
+        order: u64,
+    }
+
+    impl<P> SimulationSystem<P> for Noop {
+        fn id(&self) -> SystemId {
+            SystemId(self.id)
+        }
+
+        fn phase(&self) -> Phase {
+            self.phase
+        }
+
+        fn order(&self) -> u64 {
+            self.order
+        }
+
+        fn name(&self) -> &'static str {
+            self.id
+        }
+
+        fn run(&mut self, _simulation: &mut Simulation<P>, _phase: Phase) {}
+    }
+
+    fn noop(id: &'static str, phase: Phase, order: u64) -> Noop {
+        Noop { id, phase, order }
+    }
+
+    #[test]
+    fn registration_order_does_not_change_execution_or_manifest() {
+        let build = |reverse: bool| {
+            let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+            let systems = vec![
+                noop("a", Phase::IngestCommands, 0),
+                noop("b", Phase::IngestCommands, 1),
+                noop("c", Phase::ResolveCombat, 0),
+            ];
+            let systems = if reverse {
+                systems.into_iter().rev().collect::<Vec<_>>()
+            } else {
+                systems
+            };
+            for system in systems {
+                runner.register_system(system).expect("unique keys");
+            }
+            runner
+        };
+        let mut a = build(false);
+        let mut b = build(true);
+
+        // The manifest is stable across independent construction and
+        // independent of registration order.
+        assert_eq!(
+            a.finalize_registry().digest(),
+            b.finalize_registry().digest()
+        );
+        assert_eq!(a.system_manifest(), b.system_manifest());
+        let entries = a.system_manifest().expect("finalized").entries();
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id.0).collect();
+        assert_eq!(ids, ["a", "b", "c"], "manifest is in execution order");
+
+        a.advance_ticks(2).expect("advance");
+        b.advance_ticks(2).expect("advance");
+        assert_eq!(a.tick_hashes(), b.tick_hashes());
+    }
+
+    #[test]
+    fn duplicate_order_keys_in_a_phase_are_rejected() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner
+            .register_system(noop("a", Phase::EmitEvents, 0))
+            .expect("first key is fine");
+        assert_eq!(
+            runner
+                .register_system(noop("b", Phase::EmitEvents, 0))
+                .map(|_| ()),
+            Err(SystemRegistrationError::DuplicateOrderKey {
+                phase: Phase::EmitEvents,
+                order: 0
+            })
+        );
+        // The same ordering key in a different phase is fine.
+        runner
+            .register_system(noop("c", Phase::ValidateInvariants, 0))
+            .expect("different phase allows the same key");
+    }
+
+    #[test]
+    fn registration_is_closed_after_finalize_or_first_tick() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        assert!(!runner.is_finalized());
+        assert!(runner.system_manifest().is_none());
+        runner.finalize_registry();
+        assert!(runner.is_finalized());
+        assert_eq!(
+            runner
+                .register_system(noop("late", Phase::EmitEvents, 0))
+                .map(|_| ()),
+            Err(SystemRegistrationError::RegistryFrozen)
+        );
+        // Finalizing twice is idempotent.
+        runner.finalize_registry();
+
+        // The first tick implicitly finalizes an open registry.
+        let mut other: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        other.advance_ticks(1).expect("tick");
+        assert!(other.is_finalized());
+        assert_eq!(
+            other
+                .register_system(noop("late", Phase::EmitEvents, 0))
+                .map(|_| ()),
+            Err(SystemRegistrationError::RegistryFrozen)
+        );
     }
 }

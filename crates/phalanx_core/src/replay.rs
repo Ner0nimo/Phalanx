@@ -17,7 +17,7 @@ use crate::command::{
     CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
 };
 use crate::hash::{CanonicalSerialize, Digest, DigestAlgorithm};
-use crate::simulation::{SIMULATION_SCHEMA_VERSION, SimulationRunner, TickRate};
+use crate::simulation::{SIMULATION_SCHEMA_VERSION, SimulationRunner, SystemManifest, TickRate};
 
 /// The replay container format version. Recorded in every replay; bump on
 /// incompatible format changes.
@@ -29,6 +29,7 @@ pub struct ReplayRecording<P> {
     format_version: u32,
     simulation_version: u32,
     digest_algorithm: DigestAlgorithm,
+    system_manifest: SystemManifest,
     tick_rate: TickRate,
     rng_seed: u64,
     commands: Vec<CommandEnvelope<P>>,
@@ -37,13 +38,15 @@ pub struct ReplayRecording<P> {
 
 impl<P> ReplayRecording<P> {
     /// Creates an empty recording with the current format and simulation
-    /// schema versions and the current digest algorithm.
+    /// schema versions, the current digest algorithm, and an empty system
+    /// manifest.
     #[must_use]
     pub fn new(tick_rate: TickRate, rng_seed: u64) -> Self {
         Self {
             format_version: REPLAY_FORMAT_VERSION,
             simulation_version: SIMULATION_SCHEMA_VERSION,
             digest_algorithm: DigestAlgorithm::current(),
+            system_manifest: SystemManifest::default(),
             tick_rate,
             rng_seed,
             commands: Vec::new(),
@@ -68,6 +71,14 @@ impl<P> ReplayRecording<P> {
     #[must_use]
     pub const fn digest_algorithm(&self) -> DigestAlgorithm {
         self.digest_algorithm
+    }
+
+    /// Returns the finalized system manifest the run was recorded with.
+    /// Replays reject recordings whose required system manifest is
+    /// incompatible with the replay runner's.
+    #[must_use]
+    pub const fn system_manifest(&self) -> &SystemManifest {
+        &self.system_manifest
     }
 
     /// Returns the tick rate the recording was made with.
@@ -189,9 +200,13 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
         Ok(())
     }
 
-    /// Finishes the recording.
+    /// Finishes the recording. The runner's registry is finalized (if it was
+    /// not already) and the resulting system manifest is recorded as replay
+    /// compatibility metadata.
     #[must_use]
-    pub fn finish(self) -> ReplayRecording<P> {
+    pub fn finish(mut self) -> ReplayRecording<P> {
+        let manifest = self.runner.finalize_registry().clone();
+        self.recording.system_manifest = manifest;
         self.recording
     }
 }
@@ -234,7 +249,7 @@ impl ReplayReport {
 }
 
 /// Errors produced while replaying a recording.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayError {
     /// The recording's format version is not supported by this harness.
     UnsupportedFormatVersion { found: u32, expected: u32 },
@@ -244,6 +259,9 @@ pub enum ReplayError {
         expected: DigestAlgorithm,
         found: DigestAlgorithm,
     },
+    /// The recording's system manifest does not match the replay runner's
+    /// finalized registry; a different system set can change behavior.
+    IncompatibleSystemManifest { expected: Digest, found: Digest },
     /// A recorded command was rejected during replay.
     InvalidRecordedCommand(CommandSubmitError),
     /// The replay ran out of representable ticks.
@@ -263,6 +281,10 @@ impl std::fmt::Display for ReplayError {
             Self::IncompatibleDigestAlgorithm { expected, found } => write!(
                 formatter,
                 "incompatible digest algorithm: this build produces {expected:?}, recording uses {found:?}"
+            ),
+            Self::IncompatibleSystemManifest { expected, found } => write!(
+                formatter,
+                "incompatible system manifest: recording requires {expected}, replay runner has {found}"
             ),
             Self::InvalidRecordedCommand(error) => {
                 write!(formatter, "recorded command rejected: {error}")
@@ -313,6 +335,15 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
 
     let mut runner = SimulationRunner::new(recording.tick_rate(), recording.rng_seed());
     setup(&mut runner);
+    // The finalized system manifest is replay compatibility metadata: a
+    // recording made with a different system set is rejected explicitly.
+    let manifest = runner.finalize_registry().clone();
+    if manifest.digest() != recording.system_manifest().digest() {
+        return Err(ReplayError::IncompatibleSystemManifest {
+            expected: recording.system_manifest().digest(),
+            found: manifest.digest(),
+        });
+    }
     for envelope in recording.commands() {
         let request = CommandRequest {
             request_id: envelope.request_id(),
@@ -490,6 +521,22 @@ mod tests {
             runner.set_record_hashes(false);
         });
         assert_eq!(result, Err(ReplayError::HashRecordingDisabled));
+    }
+
+    #[test]
+    fn replay_rejects_incompatible_system_manifest() {
+        let recording = record_scenario(4);
+        assert!(!recording.system_manifest().is_empty());
+        // Replaying with a different (empty) system set must be rejected
+        // explicitly, not silently replayed against different behavior.
+        let result = replay_recording(&recording, 4, |_| {});
+        assert!(matches!(
+            result,
+            Err(ReplayError::IncompatibleSystemManifest { .. })
+        ));
+        // The matching setup is accepted (covered by the other tests).
+        let report = replay_recording(&recording, 4, setup_scenario).expect("matching manifest");
+        assert!(!report.diverged());
     }
 
     #[test]

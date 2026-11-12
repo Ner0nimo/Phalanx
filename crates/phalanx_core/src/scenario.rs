@@ -46,6 +46,10 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
         Phase::ApplyCommands
     }
 
+    fn order(&self) -> u64 {
+        0
+    }
+
     fn name(&self) -> &'static str {
         "scenario"
     }
