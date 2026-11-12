@@ -11,6 +11,7 @@
 //! commands are rejected with structured errors; they are never silently
 //! retargeted.
 
+use crate::entity::EntityId;
 use crate::hash::{
     CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink,
 };
@@ -35,13 +36,20 @@ pub struct CommandId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ActorId(pub u64);
 
-/// The initial command payload set. Kept deliberately small: this milestone
-/// defines the envelope contract, not the full editor/gameplay API.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The initial command payload set (`docs/vertical-slice-scenario.md` §4).
+/// Coordinates are `f32` meters, encoded as IEEE-754 LE bits (deterministic;
+/// see ADR-0001 numeric policy).
+#[derive(Clone, Debug, PartialEq)]
 pub enum CommandPayload {
-    /// Diagnostic payload used by infrastructure tests and the replay harness
-    /// until gameplay commands are defined. Not a gameplay command.
+    /// Diagnostic payload used by infrastructure tests and the replay harness.
+    /// Not a gameplay command.
     Diagnostics { value: u64 },
+    /// Path to the destination and stop.
+    Move { destination: (f32, f32) },
+    /// Path to the destination; engage enemies that enter weapon range.
+    AttackMove { destination: (f32, f32) },
+    /// Engage the target entity until it dies or a new command replaces it.
+    Attack { target: EntityId },
 }
 
 /// A command submitted to the simulation, before validation and ID
@@ -54,6 +62,9 @@ pub struct CommandRequest<P> {
     pub actor: ActorId,
     /// The tick at whose boundary the command must be applied.
     pub tick: u64,
+    /// The unit/entity the command applies to, when the payload is per-unit
+    /// (`None` for diagnostics).
+    pub subject: Option<EntityId>,
     /// Typed payload.
     pub payload: P,
 }
@@ -66,6 +77,7 @@ pub struct CommandEnvelope<P> {
     command_id: CommandId,
     actor: ActorId,
     tick: u64,
+    subject: Option<EntityId>,
     payload: P,
 }
 
@@ -77,6 +89,7 @@ impl<P> CommandEnvelope<P> {
         command_id: CommandId,
         actor: ActorId,
         tick: u64,
+        subject: Option<EntityId>,
         payload: P,
     ) -> Result<Self, CommandSubmitError> {
         if version != ENVELOPE_VERSION {
@@ -91,6 +104,7 @@ impl<P> CommandEnvelope<P> {
             command_id,
             actor,
             tick,
+            subject,
             payload,
         })
     }
@@ -123,6 +137,12 @@ impl<P> CommandEnvelope<P> {
     #[must_use]
     pub const fn tick(&self) -> u64 {
         self.tick
+    }
+
+    /// Returns the unit/entity the command applies to, if any.
+    #[must_use]
+    pub const fn subject(&self) -> Option<EntityId> {
+        self.subject
     }
 
     /// Returns the typed payload.
@@ -211,6 +231,18 @@ impl CanonicalSerialize for CommandPayload {
                 sink.write_u32(0);
                 sink.write_u64(*value);
             }
+            Self::Move { destination } => {
+                sink.write_u32(1);
+                destination.write_canonical(sink);
+            }
+            Self::AttackMove { destination } => {
+                sink.write_u32(2);
+                destination.write_canonical(sink);
+            }
+            Self::Attack { target } => {
+                sink.write_u32(3);
+                target.write_canonical(sink);
+            }
         }
     }
 }
@@ -220,6 +252,15 @@ impl CanonicalDecode for CommandPayload {
         match reader.read_u32()? {
             0 => Ok(Self::Diagnostics {
                 value: reader.read_u64()?,
+            }),
+            1 => Ok(Self::Move {
+                destination: CanonicalDecode::read_canonical(reader)?,
+            }),
+            2 => Ok(Self::AttackMove {
+                destination: CanonicalDecode::read_canonical(reader)?,
+            }),
+            3 => Ok(Self::Attack {
+                target: CanonicalDecode::read_canonical(reader)?,
             }),
             other => Err(CanonicalError::UnknownTag(other)),
         }
@@ -233,6 +274,7 @@ impl<P: CanonicalSerialize> CanonicalSerialize for CommandEnvelope<P> {
         self.command_id.write_canonical(sink);
         self.actor.write_canonical(sink);
         sink.write_u64(self.tick);
+        self.subject.write_canonical(sink);
         self.payload.write_canonical(sink);
     }
 }
@@ -250,6 +292,7 @@ impl<P: CanonicalDecode> CanonicalDecode for CommandEnvelope<P> {
         let command_id = CommandId::read_canonical(reader)?;
         let actor = ActorId::read_canonical(reader)?;
         let tick = reader.read_u64()?;
+        let subject = CanonicalDecode::read_canonical(reader)?;
         let payload = P::read_canonical(reader)?;
         Ok(Self {
             version,
@@ -257,6 +300,7 @@ impl<P: CanonicalDecode> CanonicalDecode for CommandEnvelope<P> {
             command_id,
             actor,
             tick,
+            subject,
             payload,
         })
     }
@@ -274,6 +318,7 @@ mod tests {
             CommandId(2),
             ActorId(3),
             4,
+            None,
             CommandPayload::Diagnostics { value: 5 },
         )
         .expect("current version is accepted");
@@ -292,7 +337,7 @@ mod tests {
     #[test]
     fn unsupported_envelope_version_is_rejected() {
         assert_eq!(
-            CommandEnvelope::new(0, RequestId(1), CommandId(1), ActorId(0), 1, ()),
+            CommandEnvelope::new(0, RequestId(1), CommandId(1), ActorId(0), 1, None, ()),
             Err(CommandSubmitError::UnsupportedVersion {
                 found: 0,
                 expected: ENVELOPE_VERSION
@@ -305,6 +350,7 @@ mod tests {
                 CommandId(1),
                 ActorId(0),
                 1,
+                None,
                 ()
             ),
             Err(CommandSubmitError::UnsupportedVersion {

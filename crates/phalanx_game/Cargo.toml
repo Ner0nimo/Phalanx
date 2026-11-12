@@ -1,0 +1,14 @@
+[package]
+name = "phalanx_game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Game rules and authoritative systems: first CPU-authoritative combat loop (issue #13). Depends on phalanx_core and phalanx_navigation only."
+
+[dependencies]
+phalanx_core = { path = "../phalanx_core" }
+phalanx_navigation = { path = "../phalanx_navigation" }
+
+[lints]
+workspace = true

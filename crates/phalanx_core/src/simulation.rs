@@ -841,6 +841,7 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             command_id,
             request.actor,
             request.tick,
+            request.subject,
             request.payload,
         )?;
         self.simulation
@@ -1024,6 +1025,7 @@ mod tests {
             request_id: RequestId(request_id),
             actor: ActorId(0),
             tick,
+            subject: None,
             payload,
         }
     }

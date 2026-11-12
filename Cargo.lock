@@ -7,6 +7,14 @@ name = "phalanx_core"
 version = "0.1.0"
 
 [[package]]
+name = "phalanx_game"
+version = "0.1.0"
+dependencies = [
+ "phalanx_core",
+ "phalanx_navigation",
+]
+
+[[package]]
 name = "phalanx_navigation"
 version = "0.1.0"
 dependencies = [
