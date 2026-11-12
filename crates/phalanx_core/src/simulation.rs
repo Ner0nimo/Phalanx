@@ -20,6 +20,7 @@ use crate::command::{
     CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
 };
 use crate::entity::EntityAllocator;
+use crate::hash::{CanonicalHasher, CanonicalSerialize};
 use crate::rng::RngStreams;
 
 pub use crate::TickOverflow;
@@ -28,6 +29,10 @@ pub use crate::TickOverflow;
 /// `RtsEngineDoc.md` §3.2; the final tick rate remains an open question in
 /// ADR-0001).
 pub const DEFAULT_TICKS_PER_SECOND: u32 = 20;
+
+/// The version of the authoritative simulation state layout. Recorded in
+/// replays and savegames; bump it on any change that alters canonical state.
+pub const SIMULATION_SCHEMA_VERSION: u32 = 1;
 
 /// The fixed simulation rate. This configures simulation time, not wall-clock
 /// scheduling: the runner itself never reads the clock.
@@ -252,6 +257,33 @@ impl<P> Simulation<P> {
     }
 }
 
+impl<P: CanonicalSerialize> Simulation<P> {
+    /// Produces the canonical state hash of the authoritative simulation
+    /// state (ADR-0001 Decision §8, `RtsEngineDoc.md` §13.3).
+    ///
+    /// The hash covers the schema version, tick, entity allocator, RNG stream
+    /// states, the accepted-request bookkeeping, and the commands applied at
+    /// the current tick. It uses stable logical ordering (slot index, stream
+    /// name, command ID) and never depends on storage layout. The pending
+    /// input queue is deliberately not hashed: it is the recorded command
+    /// stream (see [`crate::replay`]) and is compared through execution, so an
+    /// altered input is reported at the tick where it is applied rather than
+    /// at tick 1. Renderer/GPU state and wall-clock data cannot enter the hash
+    /// because the authoritative types do not contain them.
+    #[must_use]
+    pub fn canonical_hash(&self) -> u64 {
+        let mut hasher = CanonicalHasher::new();
+        hasher.write_u32(SIMULATION_SCHEMA_VERSION);
+        hasher.write_u64(self.tick);
+        self.entities.write_canonical(&mut hasher);
+        self.rng.write_canonical(&mut hasher);
+        self.current_tick_commands.write_canonical(&mut hasher);
+        self.seen_requests.write_canonical(&mut hasher);
+        hasher.write_u64(self.next_command_id);
+        hasher.finish()
+    }
+}
+
 /// A hook that runs inside one [`Phase`] of every tick.
 ///
 /// Systems declare their phase and an explicit in-phase ordering key. The
@@ -291,18 +323,44 @@ pub struct SimulationRunner<P> {
     simulation: Simulation<P>,
     tick_rate: TickRate,
     systems: Vec<RegisteredSystem<P>>,
+    hashes: Vec<u64>,
+    record_hashes: bool,
 }
 
-impl<P> SimulationRunner<P> {
+impl<P: CanonicalSerialize> SimulationRunner<P> {
     /// Creates a runner at the given fixed tick rate with the given explicit
-    /// master RNG seed and no systems registered.
+    /// master RNG seed and no systems registered. Per-tick state hash
+    /// recording is enabled by default.
     #[must_use]
     pub fn new(tick_rate: TickRate, rng_seed: u64) -> Self {
         Self {
             simulation: Simulation::new(rng_seed),
             tick_rate,
             systems: Vec::new(),
+            hashes: Vec::new(),
+            record_hashes: true,
         }
+    }
+
+    /// Returns the canonical state hash recorded for each executed tick, in
+    /// tick order. Empty when hash recording is disabled.
+    #[must_use]
+    pub fn tick_hashes(&self) -> &[u64] {
+        &self.hashes
+    }
+
+    /// Returns whether per-tick state hash recording is enabled.
+    #[must_use]
+    pub const fn record_hashes(&self) -> bool {
+        self.record_hashes
+    }
+
+    /// Enables or disables per-tick state hash recording. Hashing is always
+    /// available via [`Simulation::canonical_hash`]; recording may be disabled
+    /// in release builds (`RtsEngineDoc.md` §13.3) but must stay enabled in
+    /// tests and diagnostic builds.
+    pub fn set_record_hashes(&mut self, enabled: bool) {
+        self.record_hashes = enabled;
     }
 
     /// Returns the configured fixed tick rate.
@@ -405,6 +463,8 @@ impl<P> SimulationRunner<P> {
         let SimulationRunner {
             simulation,
             systems,
+            hashes,
+            record_hashes,
             ..
         } = self;
         for phase in Phase::SCHEDULE {
@@ -415,6 +475,11 @@ impl<P> SimulationRunner<P> {
             }
         }
 
+        // Phase 15 (produce state hash): hash after all phases ran, while the
+        // tick's applied commands are still visible.
+        if *record_hashes {
+            hashes.push(simulation.canonical_hash());
+        }
         simulation.current_tick_commands.clear();
         Ok(())
     }

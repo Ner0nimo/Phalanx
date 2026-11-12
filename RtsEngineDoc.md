@@ -574,11 +574,11 @@ Save loading must validate versions, references, limits, and invariants before a
 
 A replay contains replay format version, simulation/game rules version, initial map/scenario and content identifiers/hashes, player identity/configuration, deterministic RNG seeds and stream state as required, tick-indexed commands and other authoritative external inputs, and optional periodic state hashes/checkpoints.
 
-Replays must support seeking through checkpoints or deterministic resimulation. A replay mismatch report should identify the first divergent tick and provide subsystem-level diagnostics where feasible.
+Replays must support seeking through checkpoints or deterministic resimulation. A replay mismatch report should identify the first divergent tick and provide subsystem-level diagnostics where feasible. The replay harness is implemented in `phalanx_core::replay` (`crates/phalanx_core/src/replay.rs`) — `ReplayRecording`/`ReplayRecorder` capture format and simulation schema versions, tick rate, RNG seed, the tick-indexed command stream, and per-tick hashes, and `replay_recording` reports the first divergent tick — with a small deterministic CI scenario in `phalanx_core::scenario`.
 
 ### 13.3 State hashing
 
-Canonical state hashing must use stable ordering and explicit serialization of authoritative fields. Exclude pointers, padding bytes, GPU handles, renderer state, wall-clock timestamps, and other nondeterministic/transient data.
+Canonical state hashing must use stable ordering and explicit serialization of authoritative fields. Exclude pointers, padding bytes, GPU handles, renderer state, wall-clock timestamps, and other nondeterministic/transient data. Canonical hashing is implemented as `CanonicalHasher`/`CanonicalSerialize` in `phalanx_core::hash` and exposed as `Simulation::canonical_hash` (`crates/phalanx_core/src/simulation.rs`); the runner records per-tick hashes at the `ProduceStateHash` phase.
 
 Hashing may be configurable in release builds, but must be available in tests and diagnostic builds.
 

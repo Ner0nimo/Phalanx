@@ -5,14 +5,19 @@
 //! `RtsEngineDoc.md` §6.1. The [`entity`], [`rng`], and [`command`] modules
 //! provide the stable entity IDs, deterministic RNG streams, and versioned
 //! tick-indexed command envelope that authoritative state is built on. The
-//! smoke scenario below is infrastructure validation only; it is deliberately
-//! not a gameplay simulation.
+//! [`hash`] and [`replay`] modules provide canonical state hashing and the
+//! deterministic replay harness, with a small CI scenario in [`scenario`].
+//! The smoke scenario below is infrastructure validation only; it is
+//! deliberately not a gameplay simulation.
 
 #![forbid(unsafe_code)]
 
 pub mod command;
 pub mod entity;
+pub mod hash;
+pub mod replay;
 pub mod rng;
+pub mod scenario;
 pub mod simulation;
 
 /// A deterministic workload used to prove that the core can advance without
