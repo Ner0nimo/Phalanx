@@ -210,7 +210,7 @@ The stack is a proposal, not a reason to force a library into a poor fit. Record
 - **Window/input:** winit.
 - **Rendering/compute candidate:** evaluate wgpu against ash before selecting. wgpu reduces low-level Vulkan lifetime/synchronization work and offers multiple backends; ash offers direct Vulkan control at substantially higher engineering cost. Do not build both production backends.
 - **Shaders:** WGSL if using wgpu; GLSL/SPIR-V if using ash. Shader compilation and validation must be part of CI.
-- **ECS candidate:** bevy_ecs preferred for the first spike; compare with hecs using representative workloads. Do not build a custom ECS before measurements justify it.
+- **ECS candidate:** bevy_ecs vs hecs benchmarked on representative workloads at 10k/50k/100k entities; hecs selected for the initial implementation spike — see [ADR-0003](docs/adr/0003-ecs-selection.md) for measurements and revisit criteria. Do not build a custom ECS before measurements justify it.
 - **Math:** glam, subject to deterministic-simulation validation.
 - **CPU parallelism:** rayon only for jobs whose writes and reductions preserve deterministic outcomes.
 - **Serialization:** serde; versioned RON/JSON for editable definitions and maps, with a suitable binary format considered for runtime saves if profiling warrants it.
@@ -227,7 +227,7 @@ Before finalizing major choices, create isolated prototypes and record results:
 1. Render and update 10,000 instanced units with camera movement and selection highlighting.
 2. Run a representative compute workload with the candidate graphics API.
 3. Start CPU-only headless simulation on Windows and Linux.
-4. Benchmark ECS iteration and representative systems at 10k, 50k, and 100k entities.
+4. Benchmark ECS iteration and representative systems at 10k, 50k, and 100k entities (done for the library comparison — see [ADR-0003](docs/adr/0003-ecs-selection.md) and `benchmarks/ecs/`; repeat with real gameplay systems at M3).
 5. Run deterministic simulation tests with and without Rayon.
 6. Benchmark navigation for mixed movement profiles and crowded chokepoints.
 7. Validate asset import, animation, and hot-reload requirements.
@@ -686,7 +686,7 @@ Initial ADRs to create:
 
 - [0001-authoritative-simulation.md](docs/adr/0001-authoritative-simulation.md) (accepted; codifies the §3 simulation invariants and determinism contract)
 - 0002-determinism-and-numeric-model.md
-- 0003-ecs-selection.md
+- [0003-ecs-selection.md](docs/adr/0003-ecs-selection.md) (accepted as an initial spike selection; production commitment deferred to M3 validation)
 - 0004-rendering-backend.md
 - 0005-navigation-and-formation-model.md
 - 0006-territory-and-supply-model.md
