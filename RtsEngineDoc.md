@@ -682,7 +682,7 @@ All contributors must review architecture-sensitive changes against this documen
 
 Store ADRs in docs/adr/. Each ADR includes context, problem, alternatives, decision, consequences, and revisit criteria.
 
-Initial ADRs to create:
+ADR index (remaining entries are created as their decisions land):
 
 - [0001-authoritative-simulation.md](docs/adr/0001-authoritative-simulation.md) (accepted; codifies the §3 simulation invariants and determinism contract)
 - 0002-determinism-and-numeric-model.md

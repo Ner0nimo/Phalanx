@@ -32,7 +32,7 @@ fn print_planned_workload() {
     println!(
         "WORKLOAD candidate=wgpu instanced_markers={INSTANCED_MARKERS} instance_buffer_bytes={INSTANCE_BUFFER_BYTES} \
          terrain_mesh=grid draw_calls_planned=1 compute_buffer_bytes={COMPUTE_BUFFER_BYTES} \
-         note=\"planned; executed only when a GPU adapter is present\""
+         note=\"rendering not executed headless (no surface); compute is executed and result-verified when a GPU adapter is present\""
     );
 }
 
@@ -144,6 +144,17 @@ fn main() {
         cache: None,
     });
 
+    // Read-back buffer so the compute result is verified, not just submitted.
+    let read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("compute-readback"),
+        size: COMPUTE_BUFFER_BYTES as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Timing note: this measures CPU encode + submit + GPU wait, i.e.
+    // end-to-end submission latency, not pure GPU execution time (which would
+    // need GPU timestamp queries on real hardware).
     let start = Instant::now();
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("spike-compute-encoder"),
@@ -157,14 +168,52 @@ fn main() {
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(64, 1, 1);
     }
+    encoder.copy_buffer_to_buffer(
+        &compute_buffer,
+        0,
+        &read_buffer,
+        0,
+        COMPUTE_BUFFER_BYTES as u64,
+    );
     queue.submit([encoder.finish()]);
     let _ = device.poll(wgpu::PollType::Wait {
         submission_index: None,
         timeout: None,
     });
     let elapsed = start.elapsed();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    read_buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result.is_ok());
+        });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    let mapped = rx.recv().unwrap_or(false);
+    let verified = if mapped {
+        let data = read_buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("buffer mapped for reading");
+        // Buffer was zero-initialized; every u32 must now be 0 ^ 0x5EED0001.
+        let expected = 0x5EED_0001u32;
+        let ok = data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|chunk| u32::from_le_bytes(*chunk) == expected);
+        drop(data);
+        read_buffer.unmap();
+        ok
+    } else {
+        false
+    };
     println!(
-        "COMPUTE candidate=wgpu dispatched=true workgroups=64 buffer_bytes={COMPUTE_BUFFER_BYTES} time_ms={:.3}",
+        "COMPUTE candidate=wgpu dispatched=true workgroups=64 buffer_bytes={COMPUTE_BUFFER_BYTES} verified={verified} \
+         time_ms={:.3} timing=\"cpu encode+submit+wait (end-to-end latency, not pure GPU time)\"",
         elapsed.as_secs_f64() * 1000.0
     );
 

@@ -155,8 +155,12 @@ jobs:
       - name: Build release (both candidates)
         run: cargo build --release --all-features
 
-      - name: Run wgpu spike headless
+      # Headless init gate (required on every platform): both binaries must
+      # exit 0 and report structured init results. A GPU integration test that
+      # verifies an actual compute result is a separate future gate for
+      # GPU-equipped runners — see ADR-0004.
+      - name: Run wgpu spike headless (init gate)
         run: cargo run --release --no-default-features --features wgpu --bin wgpu-spike
 
-      - name: Run ash spike headless
+      - name: Run ash spike headless (init gate)
         run: cargo run --release --no-default-features --features ash --bin ash-spike
