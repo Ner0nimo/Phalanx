@@ -80,8 +80,12 @@ mod tests {
         let mut second = HeadlessSmokeScenario::new();
 
         for _ in 0..32 {
-            first.advance_tick().expect("tick counter should not overflow");
-            second.advance_tick().expect("tick counter should not overflow");
+            first
+                .advance_tick()
+                .expect("tick counter should not overflow");
+            second
+                .advance_tick()
+                .expect("tick counter should not overflow");
         }
 
         assert_eq!(first, second);
