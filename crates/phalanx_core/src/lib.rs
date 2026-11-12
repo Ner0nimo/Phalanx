@@ -23,31 +23,39 @@ impl HeadlessSmokeScenario {
     /// Creates a smoke scenario with a deterministic initial digest.
     #[must_use]
     pub const fn new() -> Self {
-        Self { tick: 0, digest: Self::INITIAL_DIGEST }
+        Self {
+            tick: 0,
+            digest: Self::INITIAL_DIGEST,
+        }
     }
 
     /// Returns the number of ticks advanced so far.
     #[must_use]
-    pub const fn tick(&self) -> u64 { self.tick }
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
 
     /// Returns a deterministic digest of the executed tick sequence.
     #[must_use]
-    pub const fn digest(&self) -> u64 { self.digest }
+    pub const fn digest(&self) -> u64 {
+        self.digest
+    }
 
     /// Advances the diagnostic scenario by one deterministic tick.
     ///
     /// Returns an error rather than wrapping the tick counter.
     pub fn advance_tick(&mut self) -> Result<(), TickOverflow> {
         let next_tick = self.tick.checked_add(1).ok_or(TickOverflow)?;
-        self.digest = self.digest.rotate_left(7)
-            ^ next_tick.wrapping_mul(Self::TICK_MIX);
+        self.digest = self.digest.rotate_left(7) ^ next_tick.wrapping_mul(Self::TICK_MIX);
         self.tick = next_tick;
         Ok(())
     }
 }
 
 impl Default for HeadlessSmokeScenario {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The diagnostic tick counter cannot represent another tick.
@@ -70,10 +78,12 @@ mod tests {
     fn identical_tick_sequences_produce_identical_digests() {
         let mut first = HeadlessSmokeScenario::new();
         let mut second = HeadlessSmokeScenario::new();
+
         for _ in 0..32 {
             first.advance_tick().expect("tick counter should not overflow");
             second.advance_tick().expect("tick counter should not overflow");
         }
+
         assert_eq!(first, second);
         assert_eq!(first.tick(), 32);
     }
@@ -81,6 +91,7 @@ mod tests {
     #[test]
     fn zero_ticks_preserve_the_initial_state() {
         let scenario = HeadlessSmokeScenario::new();
+
         assert_eq!(scenario.tick(), 0);
         assert_eq!(scenario.digest(), HeadlessSmokeScenario::new().digest());
     }
