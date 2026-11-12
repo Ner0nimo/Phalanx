@@ -20,8 +20,9 @@ The renderer API choice becomes a large sunk cost once low-level graphics infras
 
 ### Measured headless behavior (this machine; CI logs record the same on ubuntu/windows)
 
-- wgpu: instance with `InstanceFlags::VALIDATION` created; adapter request failed gracefully: `No suitable graphics adapter found; … vulkan drivers/libraries could not be loaded …` → structured `ADAPTER found=false`, exit 0. Validation/debug layers are built into wgpu (no external layer install).
-- ash: `ash::Entry::load()` failed gracefully: `libvulkan.so.1: cannot open shared object file` → structured `ADAPTER found=false`, exit 0. Validation requires the external `VK_LAYER_KHRONOS_validation` layer, which is absent on minimal systems.
+- wgpu on Linux (this sandbox): instance with `InstanceFlags::VALIDATION` created; adapter request failed gracefully: `No suitable graphics adapter found; … vulkan drivers/libraries could not be loaded …` → structured `ADAPTER found=false`, exit 0. Validation/debug layers are built into wgpu (no external layer install).
+- wgpu on Windows CI (`windows-latest`, software adapter "Microsoft Basic Render Driver", CPU): device created, WGSL validated, and the compute dispatch **executed and result-verified** — CI log: `COMPUTE candidate=wgpu dispatched=true workgroups=64 buffer_bytes=4096 verified=true time_ms=18.831` (end-to-end CPU-adapter latency, not a discrete-GPU figure).
+- ash: `ash::Entry::load()` failed gracefully on Linux: `libvulkan.so.1: cannot open shared object file` → structured `ADAPTER found=false`, exit 0; on CI runners the loader is present but `VK_LAYER_KHRONOS_validation` is absent (`available=false` on both OSes). Validation requires the external layer, which is absent on minimal systems.
 - **Dependency/build cost:** wgpu tree ≈ 149 crates (first cold release build ≈ 43 s here; warm ≈ 1 s), ash tree = 3 crates (`ash`, `libloading`, `cfg-if`, ≈ 1 s). Note wgpu's Vulkan backend itself embeds an `ash`-based HAL internally, but behind a safe API.
 - **Compute:** wgpu path validated a WGSL compute shader at `create_shader_module` and builds a compute pipeline + dispatch (executed when an adapter exists); ash path requires precompiled SPIR-V via an external toolchain (glslangValidator/shaderc), not exercised headless. wgpu reports adapter compute limits (`max_compute_workgroup_size_x`, etc.) from the device.
 
