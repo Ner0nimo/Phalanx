@@ -112,7 +112,9 @@ fn main() {
     let compute_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("compute"),
         size: COMPUTE_BUFFER_BYTES as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     queue.write_buffer(&compute_buffer, 0, &vec![0u8; COMPUTE_BUFFER_BYTES]);
