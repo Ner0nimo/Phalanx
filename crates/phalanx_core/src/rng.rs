@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::hash::{CanonicalHasher, CanonicalSerialize};
+
 const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const MIX1: u64 = 0xBF58_476D_1CE4_E5B9;
 const MIX2: u64 = 0x94D0_49BB_1331_11EB;
@@ -70,6 +72,12 @@ impl RngStream {
     /// Returns the next deterministic boolean.
     pub fn next_bool(&mut self) -> bool {
         self.next_u64() & 1 == 1
+    }
+}
+
+impl CanonicalSerialize for RngStream {
+    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
+        hasher.write_u64(self.state);
     }
 }
 
@@ -200,6 +208,19 @@ impl RngStreams {
             *stream = RngStream::from_state(*state);
         }
         Ok(())
+    }
+}
+
+/// Canonical form: master seed, then streams in name order (the registry is a
+/// `BTreeMap`), each with its recorded state.
+impl CanonicalSerialize for RngStreams {
+    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
+        hasher.write_u64(self.master_seed);
+        hasher.write_u64(self.streams.len() as u64);
+        for (name, stream) in &self.streams {
+            hasher.write_bytes(name.as_bytes());
+            stream.write_canonical(hasher);
+        }
     }
 }
 

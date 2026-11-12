@@ -11,6 +11,8 @@
 //! commands are rejected with structured errors; they are never silently
 //! retargeted.
 
+use crate::hash::{CanonicalHasher, CanonicalSerialize};
+
 /// The current command envelope schema version. Replays and savegames record
 /// it so older envelopes can be rejected or migrated explicitly.
 pub const ENVELOPE_VERSION: u32 = 1;
@@ -163,6 +165,46 @@ impl std::fmt::Display for CommandSubmitError {
 }
 
 impl std::error::Error for CommandSubmitError {}
+
+impl CanonicalSerialize for RequestId {
+    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
+        hasher.write_u64(self.0);
+    }
+}
+
+impl CanonicalSerialize for CommandId {
+    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
+        hasher.write_u64(self.0);
+    }
+}
+
+impl CanonicalSerialize for ActorId {
+    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
+        hasher.write_u64(self.0);
+    }
+}
+
+impl CanonicalSerialize for CommandPayload {
+    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
+        match self {
+            Self::Diagnostics { value } => {
+                hasher.write_u32(0);
+                hasher.write_u64(*value);
+            }
+        }
+    }
+}
+
+impl<P: CanonicalSerialize> CanonicalSerialize for CommandEnvelope<P> {
+    fn write_canonical(&self, hasher: &mut CanonicalHasher) {
+        hasher.write_u32(self.version);
+        self.request_id.write_canonical(hasher);
+        self.command_id.write_canonical(hasher);
+        self.actor.write_canonical(hasher);
+        hasher.write_u64(self.tick);
+        self.payload.write_canonical(hasher);
+    }
+}
 
 #[cfg(test)]
 mod tests {
