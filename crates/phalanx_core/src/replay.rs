@@ -7,7 +7,9 @@
 //! [`replay_recording`] replays a recording into a fresh simulation instance
 //! and reports the first tick whose state digest diverges, with
 //! subsystem-agnostic tick granularity. Recordings made with a different
-//! digest algorithm or an unsupported format version are rejected explicitly.
+//! digest algorithm, an unsupported replay format version, or an unsupported
+//! simulation schema version are rejected explicitly at the boundary, before
+//! the replay runner is constructed.
 //!
 //! A same-build replay on the same supported platform reproduces identical
 //! per-tick digests. Cross-platform bit-identical lockstep is a separate
@@ -254,6 +256,11 @@ impl ReplayReport {
 pub enum ReplayError {
     /// The recording's format version is not supported by this harness.
     UnsupportedFormatVersion { found: u32, expected: u32 },
+    /// The recording's simulation schema version is not supported by this
+    /// build. Replay-format compatibility and simulation-schema compatibility
+    /// are distinct checks: a recording can use a supported container format
+    /// but encode state against an incompatible simulation schema.
+    UnsupportedSimulationVersion { found: u32, expected: u32 },
     /// The recording's digest algorithm is not the one this build produces;
     /// digests of a different algorithm or width cannot be compared.
     IncompatibleDigestAlgorithm {
@@ -278,6 +285,10 @@ impl std::fmt::Display for ReplayError {
             Self::UnsupportedFormatVersion { found, expected } => write!(
                 formatter,
                 "unsupported replay format version {found} (expected {expected})"
+            ),
+            Self::UnsupportedSimulationVersion { found, expected } => write!(
+                formatter,
+                "unsupported simulation schema version {found} (expected {expected})"
             ),
             Self::IncompatibleDigestAlgorithm { expected, found } => write!(
                 formatter,
@@ -316,6 +327,12 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
         return Err(ReplayError::UnsupportedFormatVersion {
             found: recording.format_version(),
             expected: REPLAY_FORMAT_VERSION,
+        });
+    }
+    if recording.simulation_version() != SIMULATION_SCHEMA_VERSION {
+        return Err(ReplayError::UnsupportedSimulationVersion {
+            found: recording.simulation_version(),
+            expected: SIMULATION_SCHEMA_VERSION,
         });
     }
     let current_algorithm = DigestAlgorithm::current();
@@ -435,6 +452,30 @@ mod tests {
                 expected: REPLAY_FORMAT_VERSION
             })
         );
+    }
+
+    #[test]
+    fn unsupported_simulation_version_is_rejected_before_any_setup() {
+        let mut recording = record_scenario(4);
+        recording.simulation_version = SIMULATION_SCHEMA_VERSION + 1;
+        // The rejection must happen before the replay runner is even
+        // constructed: the setup closure panics if it is ever called.
+        let result = replay_recording(&recording, 4, |_| {
+            panic!("unsupported simulation version must be rejected before setup")
+        });
+        assert_eq!(
+            result,
+            Err(ReplayError::UnsupportedSimulationVersion {
+                found: SIMULATION_SCHEMA_VERSION + 1,
+                expected: SIMULATION_SCHEMA_VERSION
+            })
+        );
+        // An unmodified recording still replays and verifies.
+        let recording = record_scenario(4);
+        let report =
+            replay_recording(&recording, 4, setup_scenario).expect("valid recording replays");
+        assert!(!report.diverged());
+        assert_eq!(report.tick_hashes(), recording.tick_hashes());
     }
 
     #[test]
