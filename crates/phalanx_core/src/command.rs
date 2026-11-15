@@ -160,9 +160,24 @@ pub enum CommandSubmitError {
     /// The target tick is the current or a past tick; the simulation never
     /// applies commands retroactively or silently retargets them.
     LateTick { requested: u64, current: u64 },
-    /// The request ID was already submitted; duplicates are rejected rather
-    /// than applied twice.
+    /// The request ID was already submitted (at or below the actor's accepted
+    /// high-water mark); duplicates are rejected rather than applied twice.
     DuplicateRequest { request_id: RequestId },
+    /// The target tick is further in the future than the configured look-ahead
+    /// limit.
+    LookAheadExceeded {
+        requested: u64,
+        current: u64,
+        max_lookahead_ticks: u64,
+    },
+    /// The actor already has the maximum number of queued commands.
+    ActorPendingFull {
+        actor: ActorId,
+        count: u32,
+        limit: u32,
+    },
+    /// The simulation already has the maximum total number of queued commands.
+    PendingQueueFull { count: u32, limit: u32 },
     /// The command ID sequence is exhausted.
     IdSpaceExhausted,
 }
@@ -181,12 +196,178 @@ impl std::fmt::Display for CommandSubmitError {
             Self::DuplicateRequest { request_id } => {
                 write!(formatter, "duplicate command request {}", request_id.0)
             }
+            Self::LookAheadExceeded {
+                requested,
+                current,
+                max_lookahead_ticks,
+            } => write!(
+                formatter,
+                "command targets tick {requested}, but the look-ahead limit at tick {current} is {max_lookahead_ticks} ticks"
+            ),
+            Self::ActorPendingFull {
+                actor,
+                count,
+                limit,
+            } => write!(
+                formatter,
+                "actor {} already has {count} queued commands (limit {limit})",
+                actor.0
+            ),
+            Self::PendingQueueFull { count, limit } => {
+                write!(formatter, "pending command queue is full ({count}/{limit})")
+            }
             Self::IdSpaceExhausted => formatter.write_str("command ID space exhausted"),
         }
     }
 }
 
 impl std::error::Error for CommandSubmitError {}
+
+/// Validated limits for command ingress (issue #39): maximum target-tick
+/// look-ahead, pending-queue saturation per actor and in total, and the
+/// in-state applied-command transcript window. Keeping these bounded is what
+/// keeps memory and per-tick canonical-hash cost from growing with match
+/// duration; the full applied stream stays available in replay recordings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandLimits {
+    /// Maximum distance of a command's target tick from the current tick.
+    pub max_lookahead_ticks: u64,
+    /// Maximum queued (pending) commands per actor.
+    pub max_pending_per_actor: u32,
+    /// Maximum total queued (pending) commands across all actors.
+    pub max_pending_total: u32,
+    /// Maximum applied-command transcript entries kept in canonical state.
+    pub max_applied_history: u32,
+}
+
+impl CommandLimits {
+    /// Slice defaults: 30 s of look-ahead at 20 Hz, 64 queued commands per
+    /// actor, 1024 queued in total, 4096 applied entries kept in state.
+    pub const DEFAULT: Self = Self {
+        max_lookahead_ticks: 600,
+        max_pending_per_actor: 64,
+        max_pending_total: 1024,
+        max_applied_history: 4096,
+    };
+
+    /// Supported upper bound for [`CommandLimits::max_lookahead_ticks`]
+    /// (3 minutes at 20 Hz).
+    pub const MAX_LOOKAHEAD_TICKS: u64 = 3600;
+    /// Supported upper bound for [`CommandLimits::max_pending_per_actor`].
+    pub const MAX_PENDING_PER_ACTOR: u32 = 1024;
+    /// Supported upper bound for [`CommandLimits::max_pending_total`].
+    pub const MAX_PENDING_TOTAL: u32 = 65_536;
+    /// Supported upper bound for [`CommandLimits::max_applied_history`].
+    pub const MAX_APPLIED_HISTORY: u32 = 65_536;
+
+    /// Validates the limits against the supported bounds.
+    pub fn validate(&self) -> Result<(), InvalidCommandLimits> {
+        if self.max_lookahead_ticks == 0 || self.max_lookahead_ticks > Self::MAX_LOOKAHEAD_TICKS {
+            return Err(InvalidCommandLimits::LookAheadOutOfRange {
+                found: self.max_lookahead_ticks,
+                min: 1,
+                max: Self::MAX_LOOKAHEAD_TICKS,
+            });
+        }
+        if self.max_pending_per_actor == 0
+            || self.max_pending_per_actor > Self::MAX_PENDING_PER_ACTOR
+        {
+            return Err(InvalidCommandLimits::PendingPerActorOutOfRange {
+                found: self.max_pending_per_actor,
+                min: 1,
+                max: Self::MAX_PENDING_PER_ACTOR,
+            });
+        }
+        if self.max_pending_total < self.max_pending_per_actor {
+            return Err(InvalidCommandLimits::PendingTotalBelowPerActor {
+                per_actor: self.max_pending_per_actor,
+                total: self.max_pending_total,
+            });
+        }
+        if self.max_pending_total > Self::MAX_PENDING_TOTAL {
+            return Err(InvalidCommandLimits::PendingTotalOutOfRange {
+                found: self.max_pending_total,
+                max: Self::MAX_PENDING_TOTAL,
+            });
+        }
+        if self.max_applied_history == 0 || self.max_applied_history > Self::MAX_APPLIED_HISTORY {
+            return Err(InvalidCommandLimits::AppliedHistoryOutOfRange {
+                found: self.max_applied_history,
+                min: 1,
+                max: Self::MAX_APPLIED_HISTORY,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A [`CommandLimits`] value outside the supported bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidCommandLimits {
+    /// `max_lookahead_ticks` outside `1..=CommandLimits::MAX_LOOKAHEAD_TICKS`.
+    LookAheadOutOfRange { found: u64, min: u64, max: u64 },
+    /// `max_pending_per_actor` outside `1..=CommandLimits::MAX_PENDING_PER_ACTOR`.
+    PendingPerActorOutOfRange { found: u32, min: u32, max: u32 },
+    /// `max_pending_total` is smaller than `max_pending_per_actor`.
+    PendingTotalBelowPerActor { per_actor: u32, total: u32 },
+    /// `max_pending_total` above `CommandLimits::MAX_PENDING_TOTAL`.
+    PendingTotalOutOfRange { found: u32, max: u32 },
+    /// `max_applied_history` outside `1..=CommandLimits::MAX_APPLIED_HISTORY`.
+    AppliedHistoryOutOfRange { found: u32, min: u32, max: u32 },
+}
+
+impl std::fmt::Display for InvalidCommandLimits {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LookAheadOutOfRange { found, min, max } => write!(
+                formatter,
+                "max_lookahead_ticks {found} outside {min}..={max}"
+            ),
+            Self::PendingPerActorOutOfRange { found, min, max } => write!(
+                formatter,
+                "max_pending_per_actor {found} outside {min}..={max}"
+            ),
+            Self::PendingTotalBelowPerActor { per_actor, total } => write!(
+                formatter,
+                "max_pending_total {total} is smaller than max_pending_per_actor {per_actor}"
+            ),
+            Self::PendingTotalOutOfRange { found, max } => {
+                write!(formatter, "max_pending_total {found} above {max}")
+            }
+            Self::AppliedHistoryOutOfRange { found, min, max } => {
+                write!(
+                    formatter,
+                    "max_applied_history {found} outside {min}..={max}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for InvalidCommandLimits {}
+
+/// Failure to install new [`CommandLimits`] on a runner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandLimitsError {
+    /// The limits are outside the supported bounds.
+    Invalid(InvalidCommandLimits),
+    /// Limits can only be changed before the first tick; after that the
+    /// running configuration is fixed for determinism.
+    LockedAfterFirstTick,
+}
+
+impl std::fmt::Display for CommandLimitsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) => write!(formatter, "invalid command limits: {error}"),
+            Self::LockedAfterFirstTick => {
+                formatter.write_str("command limits are locked after the first tick")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommandLimitsError {}
 
 impl CanonicalSerialize for RequestId {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
