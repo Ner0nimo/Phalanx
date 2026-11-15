@@ -60,6 +60,13 @@ jobs:
       - name: Run CPU-only headless smoke scenario
         run: cargo run -p phalanx_runtime -- --headless --ticks 8
 
+      # Graphical presentation probe (issue #61): offscreen wgpu frames via
+      # phalanx_render. On GPU-less hosted runners this exits 0 with a
+      # structured no-adapter result; on GPU machines it renders and verifies
+      # clear-color pixels by readback.
+      - name: Run offscreen graphical presentation probe
+        run: cargo run -p phalanx_runtime -- --graphical --offscreen --frames 3
+
   audit:
     name: Dependency audit (cargo audit)
     runs-on: ubuntu-latest

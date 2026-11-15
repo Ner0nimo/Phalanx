@@ -3,6 +3,7 @@ members = [
     "crates/phalanx_core",
     "crates/phalanx_game",
     "crates/phalanx_navigation",
+    "crates/phalanx_render",
     "crates/phalanx_runtime",
 ]
 # The spike benchmarks are detached workspaces of their own (see ADR-0003 and

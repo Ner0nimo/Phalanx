@@ -260,6 +260,8 @@ Suggested Cargo workspace (names may evolve; boundaries should remain clear):
 - phalanx_core: simulation clock, world state, entity identity, commands, events, deterministic RNG, state hashing, simulation schedule.
 - phalanx_game: game rules and authoritative systems (combat, economy, production, territory, supply, research, unit definitions).
 - phalanx_navigation: nav representation, global pathfinding, flow fields, local movement constraints, formation movement.
+- phalanx_render: presentation only — wgpu backend init, windowed (winit) and offscreen presenters, frame loop (issue #61). Never owns authoritative state; `--headless` never touches it.
+- phalanx_runtime: CLI entry point; `--headless` runs the deterministic simulation without any graphics initialization, `--graphical` presents wgpu frames (issue #61).
 - phalanx_map: map schema, terrain data, region graph, map validation, import/export.
 - phalanx_ai: strategic, operational, and tactical AI. AI submits ordinary commands through the same validated command interface as players.
 - phalanx_render: renderer, materials, terrain rendering, instancing, LOD, overlays, visual effects.
@@ -576,6 +578,8 @@ Animation LOD must be considered for mass battles. glTF import alone does not pr
 *[Provisional] — depends on the headed-GPU validation path (issues #33, #61–#64).*
 
 Rendering must be optional for headless simulation. Renderer initialization failures must not be silently converted into a partially working graphical mode. The application layer reports the failure and selects a documented fallback only when requested.
+
+**Graphical runtime (issue #61, implemented):** `phalanx_runtime --graphical` opens a native `winit` window and presents continuously rendered wgpu frames (configurable clear color via `--clear RRGGBB`), with surface configuration from advertised capabilities, resize reconfiguration, and Lost/Outdated/Timeout/Occluded handling; adapter name/backend/driver/OS/build are logged at startup. `--graphical --offscreen` renders frames to an offscreen texture and verifies the readback pixels, so the full encode/submit/readback path is CI-verifiable without a display; on GPU-less machines it exits 0 with a structured no-adapter result. `--headless` is unchanged and never initializes graphics. The presentation path lives in `phalanx_render` and never touches authoritative simulation state.
 
 ---
 
