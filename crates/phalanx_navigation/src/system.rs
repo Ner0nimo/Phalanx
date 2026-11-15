@@ -4,6 +4,7 @@
 //! snapshots, and replays.
 
 use phalanx_core::command::CommandPayload;
+use phalanx_core::context::{SystemError, SystemOutput, TickContext};
 use phalanx_core::hash::{CanonicalError, CanonicalReader, CanonicalSink};
 use phalanx_core::simulation::{Phase, Simulation, SimulationSystem, SystemId};
 
@@ -72,7 +73,13 @@ impl SimulationSystem<CommandPayload> for MovementSystem {
         self.world.restore_state(reader)
     }
 
-    fn run(&mut self, _simulation: &mut Simulation<CommandPayload>, _phase: Phase) {
+    fn run(
+        &mut self,
+        _ctx: &TickContext,
+        _simulation: &mut Simulation<CommandPayload>,
+        _phase: Phase,
+    ) -> Result<SystemOutput<CommandPayload>, SystemError> {
         self.world.step();
+        Ok(SystemOutput::default())
     }
 }

@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod command;
+pub mod context;
 pub mod entity;
 pub mod hash;
 pub mod replay;
