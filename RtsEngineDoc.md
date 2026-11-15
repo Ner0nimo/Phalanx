@@ -8,9 +8,18 @@
 
 This document is both a game-design direction and an engineering contract for human developers and coding agents. It distinguishes binding decisions from choices that require prototypes. Agents must not silently turn an open question into a permanent architectural commitment.
 
+**Reading guide — stable contracts vs provisional design (issue #31):**
+
+- **[Stable contract]** — binding, validated architecture: §3 invariants, the §6 simulation model and §6.1 phase schedule, §12 command protocol, §13 savegame/replay/hash contracts, §15–§17 process gates, and accepted ADRs (ADR-0001…ADR-0004). These change only via an ADR.
+- **[Provisional]** — subsystem design the M1 vertical slice has not yet validated. Each provisional section names the milestone/issue that will validate it. Do not treat these as implementation commitments.
+- **[Deferred]** — explicitly out of scope for the current milestone; listed so it is not mistaken for planned work.
+- §18 milestones are the implementation baseline, and **M1 is the immediate baseline** until its exit criteria pass.
+
 ---
 
 ## 1. Product vision
+
+*[Provisional] game-design direction; validated by playtesting after the M1 slice, not by this document.*
 
 Phalanx aims to become an original spiritual successor in the large-scale RTS space occupied by Ashes of the Singularity (2016). It should capture the appeal of commanding enormous battles across a broad strategic battlefield without reproducing Ashes' proprietary content, exact faction designs, unit roster, maps, UI, terminology, or balance. Phalanx must establish its own setting, factions, mechanics, visual identity, and economic model.
 
@@ -52,6 +61,8 @@ The setting is deliberately undecided. It may be science fiction, near-future, a
 ---
 
 ## 2. Product and gameplay model
+
+*[Provisional] gameplay model; the M1 slice (docs/vertical-slice-scenario.md) validates only a small subset.*
 
 ### 2.1 Battlefield scale
 
@@ -137,6 +148,8 @@ Command queues and command replacement behavior must be consistent across single
 
 ## 3. Architecture invariants (binding)
 
+*[Stable contract] — binding invariants, codified by ADR-0001/ADR-0002; change only via ADR.*
+
 These invariants take precedence over convenience and local implementation preferences. Sections 3.1–3.5 are recorded as an accepted decision in [ADR-0001: Authoritative simulation and determinism contract](docs/adr/0001-authoritative-simulation.md).
 
 ### 3.1 Authoritative simulation is CPU-side
@@ -204,6 +217,8 @@ Choose the simplest architecture that preserves the invariants. Validate expensi
 
 ## 4. Proposed Rust technology stack
 
+*[Provisional] — spike-driven; ECS and renderer selections are initial (ADR-0003/ADR-0004), production commitment deferred to M3 validation (issue #32).*
+
 The stack is a proposal, not a reason to force a library into a poor fit. Record decisions in ADRs.
 
 - **Language/toolchain:** stable Rust; Cargo workspace.
@@ -238,6 +253,8 @@ Each spike must have a short report: hardware, versions, workload, measured resu
 
 ## 5. Workspace and subsystem boundaries
 
+*[Stable contract] for the workspace/crate layout (it exists and is CI-gated); crate contents evolve with milestones.*
+
 Suggested Cargo workspace (names may evolve; boundaries should remain clear):
 
 - phalanx_core: simulation clock, world state, entity identity, commands, events, deterministic RNG, state hashing, simulation schedule.
@@ -259,6 +276,8 @@ Dependency direction should be one-way: core types and simulation contracts must
 ---
 
 ## 6. Simulation model
+
+*[Stable contract] — implemented and replay-covered in phalanx_core (see §6.1–§6.4 notes); gameplay-specific definitions land with the slice.*
 
 ### 6.1 Tick schedule
 
@@ -335,6 +354,8 @@ Do not use an untyped global event bus as a substitute for clear ownership or di
 
 ## 7. Navigation, movement, and formations
 
+*[Provisional] — the movement prototype is implemented (issue #12, PR #59); flow fields, hierarchical nav, and formations (§7.3) are unvalidated and belong to M2.*
+
 Navigation is a core differentiator and must be designed as three cooperating layers.
 
 **Prototype status (issue #12):** `phalanx_navigation` implements the first CPU-only prototype: a 1 m `NavGrid` over static maps (obstacles inflated by the unit radius), deterministic A* route queries with explicit unreachable/blocked outcomes, a budgeted per-tick path-request queue, move orders with observable completed/failed status, route following with separation that never lets a unit cross an obstacle or another unit (movement is clamped against occupied cells; recomputed routes dynamically avoid congested cells), and machine-readable diagnostics (`NavDiagnostics`, canonical-encoded). The `MovementSystem` runs in `Phase::ResolveMovement` with its state in the canonical checkpoint digest, so movement is covered by replays and snapshots. Baseline benchmark: `benchmarks/navigation` (1k/10k units). Not yet implemented: flow fields, hierarchical navigation, GPU avoidance, formations (§7.3), multiple profiles beyond the data-driven `MovementProfile`.
@@ -369,6 +390,8 @@ RVO/ORCA-style algorithms are candidates, not a complete solution. Benchmark and
 
 ### 7.3 Formation movement
 
+*[Deferred to M2] — not validated by the M1 slice.*
+
 Formation movement must not be reduced to sending every member to the same point.
 
 Required concepts:
@@ -399,6 +422,8 @@ Provide editor overlays and machine-readable queries for nav cells/regions and m
 
 ## 8. Territory, supply, and operational warfare
 
+*[Deferred to M2] — not an M1 commitment; validated by issues #14/#15 and the M2 exit criteria.*
+
 ### 8.1 Region graph
 
 Maps may define a region graph independently of the movement grid. Nodes represent strategic areas or objectives; edges represent strategic adjacency, routes, or connections. The graph supports AI planning, front-line analysis, control propagation, and logistics.
@@ -426,6 +451,8 @@ The system should eventually support reinforcement priorities and transport capa
 ---
 
 ## 9. Core gameplay systems
+
+*[Provisional] — the combat loop prototype exists (issue #13, PR #60); economy/production/buildings/fog/AI (§9.2–§9.6) are validated by M2+ playtests.*
 
 Implement in phases; this list describes the intended system surface, not the first milestone.
 
@@ -481,6 +508,8 @@ Visibility updates may be scheduled and spatially accelerated, but gameplay deci
 
 ### 9.6 AI
 
+*[Deferred to M2] — skirmish AI validates via the public command interface in M2.*
+
 Use a hierarchy:
 
 - Strategic AI: economy priorities, expansion, region value, production planning, and overall objectives.
@@ -492,6 +521,8 @@ AI must issue the same validated commands as a player and observe the same permi
 ---
 
 ## 10. World, maps, and terrain
+
+*[Provisional] — the Crossing map and content-digest validation exist (issue #52); broader map pipelines validate with slice content (M1) and M2.*
 
 ### 10.1 Terrain representation
 
@@ -512,6 +543,8 @@ Map formats require schema versions and migration policy. Validation reports mus
 ---
 
 ## 11. Rendering and strategic readability
+
+*[Provisional] — backend spike only (ADR-0004); real-GPU hardware validation is issue #33; the headed graphical path is issues #61–#64.*
 
 ### 11.1 Rendering goals
 
@@ -540,11 +573,15 @@ Animation LOD must be considered for mass battles. glTF import alone does not pr
 
 ### 11.4 Renderer fallback
 
+*[Provisional] — depends on the headed-GPU validation path (issues #33, #61–#64).*
+
 Rendering must be optional for headless simulation. Renderer initialization failures must not be silently converted into a partially working graphical mode. The application layer reports the failure and selects a documented fallback only when requested.
 
 ---
 
 ## 12. Agent/editor command API
+
+*[Stable contract] for the versioned command envelope/ingress/arbitration protocol (implemented, replay-covered); agent-integration specifics (§12.3) are [Provisional].*
 
 The editor and scenario tools must be controllable without manual interaction. The initial transport is JSON Lines (one JSON object per line), but the protocol must be versioned and documented.
 
@@ -567,6 +604,8 @@ Coding agents must follow the repository-wide instructions in `AGENTS.md`. The c
 ---
 
 ## 13. Savegames, replays, and compatibility
+
+*[Stable contract] — implemented in phalanx_core::replay/hash with versioned formats and boundary rejection.*
 
 These are foundational systems, not polish.
 
@@ -598,6 +637,8 @@ The current algorithm is FNV-1a 64, a fast divergence check only — not a crypt
 
 ## 14. Performance and scalability
 
+*[Provisional] — targets are workload-defined and unvalidated until M3 (issue #32); benchmarks are build/lint-gated only on shared runners.*
+
 ### 14.1 Targets are workload-defined
 
 The long-term target is 10,000+ units in a large match. “10,000 units at 60 FPS on mid-range hardware” is not a sufficient acceptance criterion without a workload and hardware profile.
@@ -628,6 +669,8 @@ Any secondary data layout must have one clear owner and a documented synchroniza
 ---
 
 ## 15. Testing, CI, and quality gates
+
+*[Stable contract] — CI gates are binding (fmt, clippy -D warnings, tests on ubuntu+windows, headless smoke, audits).*
 
 Testing is a primary engineering requirement.
 
@@ -668,6 +711,8 @@ The scenario must be small enough for fast CI tests and have separate scaled var
 
 ## 16. Security and trust boundaries
 
+*[Stable contract] for the boundary principles; concrete hardening details are [Provisional] until M5.*
+
 Agent commands, imported projects, maps, saves, and scripts are untrusted input—even when supplied locally.
 
 - Define actor capabilities: trusted local editor owner, agent automation, imported project, packaged runtime.
@@ -683,6 +728,8 @@ Agent commands, imported projects, maps, saves, and scripts are untrusted input�
 ---
 
 ## 17. Development workflow and architecture governance
+
+*[Stable contract] — process rules (AGENTS.md, ADRs, review gates).*
 
 ### 17.1 Repository workflow and agent instructions
 
@@ -719,6 +766,8 @@ Use `AGENTS.md` for contributor-facing documentation and dependency-handling pro
 
 ## 18. Milestones and acceptance criteria
 
+*Baseline ordering; **M1 is the immediate implementation baseline** until its exit criteria pass (issue #31).*
+
 Milestones are capability gates, not calendar promises. Do not start broad content production before technical risks are proven.
 
 ### M0 — Repository and architecture foundation
@@ -733,6 +782,8 @@ Milestones are capability gates, not calendar promises. Do not start broad conte
 **Exit:** a small deterministic headless scenario runs on both OS targets.
 
 ### M1 — First playable vertical slice
+
+**This is the immediate implementation baseline (issue #31): current work proceeds against these requirements and the Crossing scenario until the M1 exit criteria pass; M2+ sections above are not commitments.**
 
 - Small 3D battlefield and camera.
 - Two teams and a small set of unit definitions.
@@ -795,6 +846,8 @@ Multiplayer is a separate product milestone and must not be treated as a small t
 
 ## 19. Multiplayer: future, but architecture-aware
 
+*[Deferred] — future acceptance target, not a commitment (ADR-0001 §9); no lockstep promise before cross-platform proof.*
+
 The initial product is singleplayer and skirmish AI. Networking is deferred, but simulation contracts preserve a path toward it.
 
 Before choosing lockstep or server-authoritative networking, evaluate cross-platform deterministic numeric behavior, command delay and input scheduling, late command handling and rollback requirements, state checksums and desync diagnosis, snapshot/resynchronization, host migration and disconnect behavior if required, anti-cheat and authority model, bandwidth for commands/snapshots/visibility, and AI determinism and simulation version compatibility.
@@ -806,6 +859,8 @@ Do not promise lockstep multiplayer until cross-platform determinism has been de
 ---
 
 ## 20. Open decisions
+
+*Open by definition — each entry must stay a question until its listed validation experiment decides it.*
 
 These are intentionally open and must be resolved with prototypes, design tests, or ADRs:
 
@@ -830,6 +885,8 @@ Every resolved decision with meaningful architectural impact must be recorded as
 ---
 
 ## 21. Final principle
+
+*[Stable contract].*
 
 Build the smallest complete version of the intended large-scale warfare experience first.
 
