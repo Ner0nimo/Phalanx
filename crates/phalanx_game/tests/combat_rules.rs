@@ -75,6 +75,7 @@ fn submit(
         .submit_command(CommandRequest {
             request_id: RequestId(request_id),
             actor: ActorId(actor),
+            session: phalanx_core::command::SessionId(0),
             tick,
             subject,
             payload,

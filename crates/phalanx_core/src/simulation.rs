@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::command::{
     ActorId, CommandEnvelope, CommandId, CommandLimits, CommandLimitsError, CommandRequest,
-    CommandSubmitError, ENVELOPE_VERSION, RequestId,
+    CommandSubmitError, ENVELOPE_VERSION, RequestId, SessionId,
 };
 use crate::entity::EntityAllocator;
 use crate::hash::{
@@ -38,10 +38,10 @@ pub const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 /// The version of the authoritative simulation state layout. Recorded in
 /// replays and savegames; bump it on any change that alters canonical state.
 /// The simulation schema version. Bumped when the canonical simulation state
-/// layout changes incompatibly (issue #39 changed command bookkeeping from an
-/// unbounded request map to per-actor high-water marks plus a bounded applied
-/// transcript, so schema 1 replays are rejected at the boundary, issue #30).
-pub const SIMULATION_SCHEMA_VERSION: u32 = 2;
+/// layout changes incompatibly (schema 2: bounded command bookkeeping, issue
+/// #39; schema 3: request identity scoped to (actor, session), issue #41).
+/// Older-schema replays are rejected at the boundary (issue #30).
+pub const SIMULATION_SCHEMA_VERSION: u32 = 3;
 
 /// The fixed simulation rate. This configures simulation time, not wall-clock
 /// scheduling: the runner itself never reads the clock.
@@ -294,12 +294,13 @@ pub struct Simulation<P> {
     /// so a recorded per-tick checkpoint digest equals the public digest once
     /// `step_tick` returns (issue #38).
     current_tick_commands: std::ops::Range<usize>,
-    /// Per-actor high-water mark of accepted request IDs. A retry at or below
-    /// the actor's mark is rejected as a duplicate (never applied twice),
-    /// while the dedup state stays bounded to one entry per actor instead of
-    /// growing with every accepted request (issue #39). Actor-scoped request
-    /// identity is prepared for per-session scoping (issue #41).
-    last_request_id_per_actor: BTreeMap<ActorId, RequestId>,
+    /// Per-(actor, session) high-water mark of accepted request IDs (issue
+    /// #41). A retry at or below the mark of the same actor+session is
+    /// rejected as a duplicate (never applied twice), while the dedup state
+    /// stays bounded to one entry per actor+session instead of growing with
+    /// every accepted request (issue #39). A new session of the same actor
+    /// starts a fresh local request-ID sequence.
+    last_request_id_per_session: BTreeMap<(ActorId, SessionId), RequestId>,
     next_command_id: u64,
 }
 
@@ -316,7 +317,7 @@ impl<P> Simulation<P> {
             applied_commands: Vec::new(),
             applied_command_count: 0,
             current_tick_commands: 0..0,
-            last_request_id_per_actor: BTreeMap::new(),
+            last_request_id_per_session: BTreeMap::new(),
             next_command_id: 0,
         }
     }
@@ -410,7 +411,7 @@ impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
         self.pending_commands.write_canonical(sink);
         sink.write_u64(self.applied_command_count);
         self.applied_commands.write_canonical(sink);
-        self.last_request_id_per_actor.write_canonical(sink);
+        self.last_request_id_per_session.write_canonical(sink);
         sink.write_u64(self.next_command_id);
     }
 }
@@ -439,7 +440,7 @@ impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
             applied_command_count: reader.read_u64()?,
             applied_commands: CanonicalDecode::read_canonical(reader)?,
             current_tick_commands: 0..0,
-            last_request_id_per_actor: CanonicalDecode::read_canonical(reader)?,
+            last_request_id_per_session: CanonicalDecode::read_canonical(reader)?,
             next_command_id: reader.read_u64()?,
         })
     }
@@ -903,16 +904,14 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
                 max_lookahead_ticks: self.command_limits.max_lookahead_ticks,
             });
         }
-        // Per-actor monotonic high-water mark (issue #39): a request ID at or
-        // below the actor's accepted mark is a retry and rejected, so an old
-        // retry can never be applied twice, while the dedup state stays
-        // bounded to one entry per actor. Different actors may reuse local
-        // request IDs (actor-scoped identity, issue #41).
-        if let Some(&last) = self
-            .simulation
-            .last_request_id_per_actor
-            .get(&request.actor)
-        {
+        // Per-(actor, session) monotonic high-water mark (issues #39/#41): a
+        // request ID at or below the accepted mark of the same actor+session
+        // is a retry and rejected, so an old retry can never be applied twice,
+        // while the dedup state stays bounded to one entry per actor+session.
+        // Different actors — or the same actor in a new session — may reuse
+        // local request IDs.
+        let identity = (request.actor, request.session);
+        if let Some(&last) = self.simulation.last_request_id_per_session.get(&identity) {
             if request.request_id <= last {
                 return Err(CommandSubmitError::DuplicateRequest {
                     request_id: request.request_id,
@@ -959,13 +958,14 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             request.request_id,
             command_id,
             request.actor,
+            request.session,
             request.tick,
             request.subject,
             request.payload,
         )?;
         self.simulation
-            .last_request_id_per_actor
-            .insert(request.actor, request.request_id);
+            .last_request_id_per_session
+            .insert(identity, request.request_id);
         self.simulation
             .pending_commands
             .entry(request.tick)
@@ -1054,6 +1054,7 @@ mod tests {
     use super::*;
     use crate::command::{
         ActorId, CommandId, CommandLimits, CommandLimitsError, InvalidCommandLimits, RequestId,
+        SessionId,
     };
     use crate::hash::canonical_encode;
 
@@ -1166,9 +1167,20 @@ mod tests {
     }
 
     fn request_from(actor: u64, request_id: u64, tick: u64, payload: u32) -> CommandRequest<u32> {
+        request_from_session(actor, 0, request_id, tick, payload)
+    }
+
+    fn request_from_session(
+        actor: u64,
+        session: u64,
+        request_id: u64,
+        tick: u64,
+        payload: u32,
+    ) -> CommandRequest<u32> {
         CommandRequest {
             request_id: RequestId(request_id),
             actor: ActorId(actor),
+            session: SessionId(session),
             tick,
             subject: None,
             payload,
@@ -1793,6 +1805,54 @@ mod tests {
             })
         );
         assert_eq!(runner.simulation().applied_command_count(), 4);
+    }
+
+    #[test]
+    fn request_identity_is_scoped_to_actor_and_session() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        // Independent actors may reuse the same local request ID.
+        runner
+            .submit_command(request_from_session(0, 0, 1, 10, 1))
+            .expect("actor 0 session 0");
+        runner
+            .submit_command(request_from_session(1, 0, 1, 10, 2))
+            .expect("actor 1 session 0 reuses request id 1");
+        // The same actor in a NEW session may also reuse it.
+        runner
+            .submit_command(request_from_session(0, 1, 1, 10, 3))
+            .expect("actor 0 session 1 reuses request id 1");
+        // A retry within the same actor+session is still a duplicate.
+        assert_eq!(
+            runner.submit_command(request_from_session(0, 0, 1, 11, 4)),
+            Err(CommandSubmitError::DuplicateRequest {
+                request_id: RequestId(1)
+            })
+        );
+        assert_eq!(
+            runner.submit_command(request_from_session(0, 1, 1, 11, 5)),
+            Err(CommandSubmitError::DuplicateRequest {
+                request_id: RequestId(1)
+            })
+        );
+        assert_eq!(
+            runner.submit_command(request_from_session(1, 0, 1, 11, 6)),
+            Err(CommandSubmitError::DuplicateRequest {
+                request_id: RequestId(1)
+            })
+        );
+        // But a higher request ID in the same actor+session is accepted.
+        runner
+            .submit_command(request_from_session(0, 0, 2, 11, 7))
+            .expect("next local request id in actor 0 session 0");
+        assert_eq!(
+            runner
+                .simulation()
+                .pending_commands
+                .values()
+                .flatten()
+                .count(),
+            4
+        );
     }
 
     #[test]

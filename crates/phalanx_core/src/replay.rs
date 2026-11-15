@@ -165,6 +165,7 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
             request.request_id,
             command_id,
             request.actor,
+            request.session,
             request.tick,
             request.subject,
             request.payload,
@@ -366,6 +367,7 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
         let request = CommandRequest {
             request_id: envelope.request_id(),
             actor: envelope.actor(),
+            session: envelope.session(),
             tick: envelope.tick(),
             subject: envelope.subject(),
             payload: envelope.payload().clone(),
@@ -490,6 +492,7 @@ mod tests {
             envelope.request_id(),
             envelope.command_id(),
             envelope.actor(),
+            envelope.session(),
             envelope.tick(),
             envelope.subject(),
             CommandPayload::Diagnostics { value: 999_999 },

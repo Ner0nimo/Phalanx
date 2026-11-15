@@ -2,7 +2,7 @@
 //! (`docs/vertical-slice-scenario.md` §2–§3, §8): map, teams, spawn layout,
 //! and the fixed command stream.
 
-use phalanx_core::command::{ActorId, CommandPayload, CommandRequest, RequestId};
+use phalanx_core::command::{ActorId, CommandPayload, CommandRequest, RequestId, SessionId};
 use phalanx_core::entity::EntityId;
 use phalanx_core::simulation::{Simulation, SimulationRunner, TickRate};
 use phalanx_navigation::crossing_map;
@@ -89,6 +89,7 @@ pub fn crossing_assault_commands(
         requests.push(CommandRequest {
             request_id: RequestId(next),
             actor: ActorId(TEAM_A),
+            session: SessionId(0),
             tick: 1,
             subject: Some(subject),
             payload: CommandPayload::AttackMove {
@@ -110,6 +111,7 @@ pub fn crossing_assault_commands(
         requests.push(CommandRequest {
             request_id: RequestId(next),
             actor: ActorId(TEAM_B),
+            session: SessionId(0),
             tick: 1,
             subject: Some(subject),
             payload,
