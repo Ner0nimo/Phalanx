@@ -170,7 +170,7 @@ Determinism requirements:
 - System execution order is explicit and versioned.
 - Entity and command iteration order must be stable wherever order can affect outcomes.
 - Parallel jobs must not introduce nondeterministic reductions, race-dependent writes, or order-dependent side effects.
-- Floating-point behavior must be documented. If cross-platform lockstep is required, use deterministic numeric strategies for authoritative calculations or prove chosen operations equivalent on supported targets. Fixed timestep alone is not determinism.
+- Floating-point/numeric behavior is governed by [ADR-0002](docs/adr/0002-determinism-and-numeric-model.md): authoritative math uses only exactly-defined IEEE-754 operations (no libm transcendentals, no fast-math/FTZ/FMA contraction — CI guards the manifests), NaN/infinities are invalid in authoritative state and rejected with structured errors at validation boundaries (`phalanx_core::numeric::require_finite_*`), `-0.0` and denormals are encoded bit-exactly (with an explicit normalize helper for sign-insensitive state), integers are exact with a defined round-half-away-from-zero division rule, and floats canonical-encode as IEEE-754 LE bits. The golden numeric vectors in `phalanx_core::numeric` must hash identically on the CI ubuntu and windows runners with the same stable toolchain; cross-compiler/cross-CPU bit identity is not claimed. If cross-platform lockstep is required later, use deterministic numeric strategies or prove chosen operations equivalent on supported targets. Fixed timestep alone is not determinism.
 - Authoritative commands are applied at defined tick boundaries.
 - All state-changing inputs are recorded in a command/event history.
 - A canonical state hash can be produced for any tick.
@@ -697,7 +697,7 @@ Store ADRs in docs/adr/. Each ADR includes context, problem, alternatives, decis
 ADR index (remaining entries are created as their decisions land):
 
 - [0001-authoritative-simulation.md](docs/adr/0001-authoritative-simulation.md) (accepted; codifies the §3 simulation invariants and determinism contract)
-- 0002-determinism-and-numeric-model.md
+- [0002-determinism-and-numeric-model.md](docs/adr/0002-determinism-and-numeric-model.md) (accepted; the numeric/floating-point determinism policy: permitted operations, fast-math constraints, NaN/-0.0/denormal handling, integer rounding, canonical float encoding, cross-OS golden-vector experiments)
 - [0003-ecs-selection.md](docs/adr/0003-ecs-selection.md) (accepted as an initial spike selection; production commitment deferred to M3 validation)
 - [0004-rendering-backend.md](docs/adr/0004-rendering-backend.md) (accepted for the production prototype; headed GPU validation is a recorded follow-up)
 - 0005-navigation-and-formation-model.md

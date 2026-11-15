@@ -17,6 +17,7 @@ pub mod command;
 pub mod context;
 pub mod entity;
 pub mod hash;
+pub mod numeric;
 pub mod replay;
 pub mod rng;
 pub mod scenario;

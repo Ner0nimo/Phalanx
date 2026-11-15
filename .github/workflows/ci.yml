@@ -33,6 +33,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # ADR-0002 §3: fast-math / FTZ-DAZ / FMA-contraction flags are
+      # forbidden in manifests for authoritative code.
+      - name: Guard against fast-math compiler flags (ADR-0002)
+        shell: bash
+        run: |
+          if grep -nEi 'fast-math|fp-contract|\bftz\b|\bdaz\b' Cargo.toml crates/*/Cargo.toml benchmarks/*/Cargo.toml; then
+            echo "::error::fast-math/FTZ/DAZ/FMA-contraction flags are forbidden in manifests (ADR-0002)"
+            exit 1
+          fi
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
