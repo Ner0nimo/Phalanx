@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual hardware-validation runs on a self-hosted GPU runner (issue #33,
+  # ADR-0004): never blocks PRs, since it does not run on pull_request.
+  workflow_dispatch:
 
 # Least privilege: jobs only need to read the repository contents.
 permissions:
@@ -208,3 +211,36 @@ jobs:
 
       - name: Run ash spike headless (init gate)
         run: cargo run --release --no-default-features --features ash --bin ash-spike
+
+  # Hardware validation gate for issue #33 / ADR-0004: runs ONLY on manual
+  # workflow_dispatch against a self-hosted runner labeled [self-hosted, gpu].
+  # It executes the wgpu spike in release on real GPU hardware and uploads the
+  # structured REPORT line as an artifact to be recorded in ADR-0004. It does
+  # not run on PRs, so a missing GPU runner never blocks merges; the required
+  # gate on hosted runners remains the headless init gate above.
+  gpu-validation:
+    name: GPU hardware validation (wgpu spike, manual)
+    needs: []
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, gpu]
+    defaults:
+      run:
+        working-directory: benchmarks/graphics
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release (wgpu candidate)
+        run: cargo build --release --no-default-features --features wgpu --bin wgpu-spike
+
+      - name: Run wgpu spike on GPU hardware (structured REPORT)
+        run: cargo run --release --no-default-features --features wgpu --bin wgpu-spike 2>&1 | tee wgpu-report.txt
+
+      - name: Upload the hardware-validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: wgpu-gpu-validation-report
+          path: benchmarks/graphics/wgpu-report.txt
