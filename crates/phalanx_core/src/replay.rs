@@ -15,8 +15,11 @@
 //! per-tick digests. Cross-platform bit-identical lockstep is a separate
 //! acceptance target and is not claimed here (ADR-0001 Decision §5).
 
+use std::collections::BTreeSet;
+
 use crate::command::{
-    CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
+    ActorId, CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
+    RequestId, SessionId,
 };
 use crate::hash::{CanonicalSerialize, Digest, DigestAlgorithm};
 use crate::rng::SEED_DERIVATION_VERSION;
@@ -249,9 +252,10 @@ impl ReplayReport {
     }
 
     /// Returns the first tick whose state hash differs from the recording, or
-    /// `None` if the replay reproduced the recording exactly. If the replay
-    /// and the recording cover different numbers of ticks, the first tick
-    /// not covered by both is reported as divergent.
+    /// `None` if the replay reproduced the recording exactly. Requesting more
+    /// ticks than the recording has checkpoint hashes for is rejected up front
+    /// with [`ReplayError::IncompleteCheckpointCoverage`] (issue #51), so
+    /// every executed tick is always compared.
     #[must_use]
     pub const fn first_divergent_tick(&self) -> Option<u64> {
         self.first_divergent_tick
@@ -289,6 +293,37 @@ pub enum ReplayError {
     IncompatibleSystemManifest { expected: Digest, found: Digest },
     /// A recorded command was rejected during replay.
     InvalidRecordedCommand(CommandSubmitError),
+    /// A recorded envelope uses an unsupported envelope schema version
+    /// (issue #51).
+    UnsupportedRecordedEnvelopeVersion {
+        index: usize,
+        found: u32,
+        expected: u32,
+    },
+    /// A recorded request identity `(actor, session, request_id)` is not
+    /// unique (issue #51).
+    DuplicateRecordedRequest {
+        index: usize,
+        actor: ActorId,
+        session: SessionId,
+        request_id: RequestId,
+    },
+    /// Recorded command IDs are not the expected ascending sequence from 0 in
+    /// submission order, or the replay runner assigned a different ID
+    /// (issue #51).
+    InvalidRecordedCommandIdSequence {
+        index: usize,
+        found: CommandId,
+        expected: CommandId,
+    },
+    /// A recorded command targets tick 0, which is never a valid future tick
+    /// at submission (issue #51).
+    InvalidRecordedCommandTick { index: usize, tick: u64 },
+    /// The recording does not contain per-tick hashes for the whole requested
+    /// replay interval, so playback could not verify it (issue #51) — in
+    /// particular a recording with zero expected hashes cannot verify any
+    /// positive tick count.
+    IncompleteCheckpointCoverage { recorded: usize, requested: u64 },
     /// The replay ran out of representable ticks.
     TickOverflow,
     /// Per-tick digest recording is disabled, so no fresh state digest exists
@@ -322,6 +357,44 @@ impl std::fmt::Display for ReplayError {
             Self::InvalidRecordedCommand(error) => {
                 write!(formatter, "recorded command rejected: {error}")
             }
+            Self::UnsupportedRecordedEnvelopeVersion {
+                index,
+                found,
+                expected,
+            } => write!(
+                formatter,
+                "recorded envelope {index} has unsupported version {found} (expected {expected})"
+            ),
+            Self::DuplicateRecordedRequest {
+                index,
+                actor,
+                session,
+                request_id,
+            } => write!(
+                formatter,
+                "recorded command {index} duplicates request identity (actor {}, session {}, request {})",
+                actor.0, session.0, request_id.0
+            ),
+            Self::InvalidRecordedCommandIdSequence {
+                index,
+                found,
+                expected,
+            } => write!(
+                formatter,
+                "recorded command {index} has id {} (expected {})",
+                found.0, expected.0
+            ),
+            Self::InvalidRecordedCommandTick { index, tick } => write!(
+                formatter,
+                "recorded command {index} targets invalid tick {tick}"
+            ),
+            Self::IncompleteCheckpointCoverage {
+                recorded,
+                requested,
+            } => write!(
+                formatter,
+                "recording has {recorded} checkpoint hashes but {requested} ticks were requested"
+            ),
             Self::TickOverflow => formatter.write_str("replay tick counter overflowed"),
             Self::HashRecordingDisabled => {
                 formatter.write_str("per-tick state hash recording is disabled")
@@ -332,12 +405,66 @@ impl std::fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
+/// Validates the recording's structure before any playback (issue #51):
+/// envelope versions, unique request identities, the ascending command-ID
+/// sequence from 0 in submission order, target ticks in the future, and
+/// per-tick hash coverage of the whole requested interval. Malformed or
+/// incomplete recordings are rejected as invalid input, never silently
+/// normalized.
+fn validate_recording_structure<P>(
+    recording: &ReplayRecording<P>,
+    ticks: u64,
+) -> Result<(), ReplayError> {
+    let mut seen_identities = BTreeSet::new();
+    for (index, envelope) in recording.commands().iter().enumerate() {
+        if envelope.version() != ENVELOPE_VERSION {
+            return Err(ReplayError::UnsupportedRecordedEnvelopeVersion {
+                index,
+                found: envelope.version(),
+                expected: ENVELOPE_VERSION,
+            });
+        }
+        let identity = (envelope.actor(), envelope.session(), envelope.request_id());
+        if !seen_identities.insert(identity) {
+            return Err(ReplayError::DuplicateRecordedRequest {
+                index,
+                actor: identity.0,
+                session: identity.1,
+                request_id: identity.2,
+            });
+        }
+        let expected_id = CommandId(index as u64);
+        if envelope.command_id() != expected_id {
+            return Err(ReplayError::InvalidRecordedCommandIdSequence {
+                index,
+                found: envelope.command_id(),
+                expected: expected_id,
+            });
+        }
+        if envelope.tick() == 0 {
+            return Err(ReplayError::InvalidRecordedCommandTick {
+                index,
+                tick: envelope.tick(),
+            });
+        }
+    }
+    let recorded_hashes = recording.tick_hashes().len();
+    if ticks > recorded_hashes as u64 {
+        return Err(ReplayError::IncompleteCheckpointCoverage {
+            recorded: recorded_hashes,
+            requested: ticks,
+        });
+    }
+    Ok(())
+}
+
 /// Replays a recording into a fresh simulation instance for exactly `ticks`
 /// ticks, registering systems through `setup`, and compares the per-tick
 /// canonical state digests against the recorded ones.
 ///
-/// All recorded commands are submitted up front in recorded order, mirroring
-/// how the recording was made, so command IDs and bookkeeping match exactly.
+/// The recording is validated first (issue #51), then all recorded commands
+/// are submitted up front in recorded order, mirroring how the recording was
+/// made, so command IDs and bookkeeping match exactly.
 #[allow(clippy::missing_panics_doc)]
 pub fn replay_recording<P: CanonicalSerialize + Clone>(
     recording: &ReplayRecording<P>,
@@ -362,6 +489,7 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
             expected: SEED_DERIVATION_VERSION,
         });
     }
+    validate_recording_structure(recording, ticks)?;
     let current_algorithm = DigestAlgorithm::current();
     if recording.digest_algorithm() != current_algorithm {
         return Err(ReplayError::IncompatibleDigestAlgorithm {
@@ -389,7 +517,7 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
             found: manifest.digest(),
         });
     }
-    for envelope in recording.commands() {
+    for (index, envelope) in recording.commands().iter().enumerate() {
         let request = CommandRequest {
             request_id: envelope.request_id(),
             actor: envelope.actor(),
@@ -398,9 +526,16 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
             subject: envelope.subject(),
             payload: envelope.payload().clone(),
         };
-        runner
+        let assigned = runner
             .submit_command(request)
             .map_err(ReplayError::InvalidRecordedCommand)?;
+        if assigned != envelope.command_id() {
+            return Err(ReplayError::InvalidRecordedCommandIdSequence {
+                index,
+                found: assigned,
+                expected: envelope.command_id(),
+            });
+        }
     }
 
     let mut tick_hashes = Vec::new();
@@ -416,17 +551,15 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
     }
 
     let recorded = recording.tick_hashes();
-    let mut first_divergent_tick = tick_hashes
+    // Pre-flight validation guarantees ticks <= recorded.len() (issue #51), so
+    // every executed tick is compared; an empty expected-hash vector with a
+    // positive tick count is rejected before playback instead of silently
+    // reporting no divergence.
+    let first_divergent_tick = tick_hashes
         .iter()
         .zip(recorded)
         .enumerate()
         .find_map(|(index, (actual, expected))| (actual != expected).then_some(index as u64 + 1));
-    // A length mismatch means the replay did not verify every recorded tick;
-    // report the first tick not covered by both as divergent.
-    if first_divergent_tick.is_none() && !recorded.is_empty() && tick_hashes.len() != recorded.len()
-    {
-        first_divergent_tick = Some(tick_hashes.len().min(recorded.len()) as u64 + 1);
-    }
 
     Ok(ReplayReport {
         ticks_executed: ticks,
@@ -547,6 +680,93 @@ mod tests {
         }
 
         fn run(&mut self, _simulation: &mut Simulation<CommandPayload>, _phase: Phase) {}
+    }
+
+    #[test]
+    fn malformed_recorded_commands_are_rejected_before_playback() {
+        // Duplicate request identity (same actor+session+request id).
+        let mut recording = record_scenario(4);
+        let dup = recording.commands()[0].clone();
+        recording.commands_mut()[1] = dup;
+        assert_eq!(
+            replay_recording(&recording, 4, setup_scenario),
+            Err(ReplayError::DuplicateRecordedRequest {
+                index: 1,
+                actor: ActorId(0),
+                session: SessionId(0),
+                request_id: RequestId(1)
+            })
+        );
+
+        // Command IDs must be the ascending sequence from 0.
+        let mut recording = record_scenario(4);
+        let envelope = &recording.commands()[1];
+        recording.commands_mut()[1] = CommandEnvelope::new(
+            ENVELOPE_VERSION,
+            envelope.request_id(),
+            CommandId(5),
+            envelope.actor(),
+            envelope.session(),
+            envelope.tick(),
+            envelope.subject(),
+            envelope.payload().clone(),
+        )
+        .expect("current version");
+        assert_eq!(
+            replay_recording(&recording, 4, setup_scenario),
+            Err(ReplayError::InvalidRecordedCommandIdSequence {
+                index: 1,
+                found: CommandId(5),
+                expected: CommandId(1)
+            })
+        );
+
+        // Tick 0 is never a valid target tick at submission.
+        let mut recording = record_scenario(4);
+        let envelope = &recording.commands()[0];
+        recording.commands_mut()[0] = CommandEnvelope::new(
+            ENVELOPE_VERSION,
+            envelope.request_id(),
+            envelope.command_id(),
+            envelope.actor(),
+            envelope.session(),
+            0,
+            envelope.subject(),
+            envelope.payload().clone(),
+        )
+        .expect("current version");
+        assert_eq!(
+            replay_recording(&recording, 4, setup_scenario),
+            Err(ReplayError::InvalidRecordedCommandTick { index: 0, tick: 0 })
+        );
+    }
+
+    #[test]
+    fn incomplete_checkpoint_coverage_is_rejected() {
+        // Overlong request: more ticks than recorded hashes.
+        let recording = record_scenario(4);
+        assert_eq!(
+            replay_recording(&recording, 5, setup_scenario),
+            Err(ReplayError::IncompleteCheckpointCoverage {
+                recorded: 4,
+                requested: 5
+            })
+        );
+        // The empty-hash edge case: zero recorded hashes cannot verify any
+        // positive tick count (previously reported no divergence).
+        let empty = record_scenario(0);
+        assert!(empty.tick_hashes().is_empty());
+        assert_eq!(
+            replay_recording(&empty, 3, setup_scenario),
+            Err(ReplayError::IncompleteCheckpointCoverage {
+                recorded: 0,
+                requested: 3
+            })
+        );
+        // A truncated replay (fewer ticks than recorded) still verifies fine.
+        let report = replay_recording(&recording, 2, setup_scenario).expect("partial replay ok");
+        assert!(!report.diverged());
+        assert_eq!(report.ticks_executed(), 2);
     }
 
     #[test]
@@ -700,13 +920,19 @@ mod tests {
     }
 
     #[test]
-    fn replay_length_mismatch_reports_the_first_unverified_tick() {
+    fn truncated_replay_verifies_the_executed_prefix() {
         let recording = record_scenario(SCENARIO_TICKS);
-        // Replay only half the recorded ticks: the common prefix matches, but
-        // ticks 9..=16 were never verified.
+        // Replay only half the recorded ticks (issue #51): every executed
+        // tick is verified against the recording; overlong requests are
+        // rejected with a structured error instead (see
+        // incomplete_checkpoint_coverage_is_rejected).
         let report = replay_recording(&recording, SCENARIO_TICKS / 2, setup_scenario)
             .expect("replay should succeed");
         assert_eq!(report.ticks_executed(), SCENARIO_TICKS / 2);
-        assert_eq!(report.first_divergent_tick(), Some(SCENARIO_TICKS / 2 + 1));
+        assert_eq!(report.first_divergent_tick(), None);
+        assert_eq!(
+            report.tick_hashes(),
+            &recording.tick_hashes()[..SCENARIO_TICKS as usize / 2]
+        );
     }
 }
