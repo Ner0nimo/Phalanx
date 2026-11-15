@@ -53,9 +53,10 @@ pub const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 /// schema 4: canonical per-command application outcomes, issue #43; schema 5:
 /// RNG registry finalization flag, issue #47; schema 6: versioned simulation
 /// config plus the canonical system-event transcript and termination record,
-/// issue #37).
+/// issue #37; schema 7: same-tick application order is the stable arbitration
+/// key, not command-ID/arrival order, issue #42).
 /// Older-schema replays are rejected at the boundary (issue #30).
-pub const SIMULATION_SCHEMA_VERSION: u32 = 6;
+pub const SIMULATION_SCHEMA_VERSION: u32 = 7;
 
 /// The fixed simulation rate. This configures simulation time, not wall-clock
 /// scheduling: the runner itself never reads the clock.
@@ -358,7 +359,8 @@ pub struct Simulation<P, E = ()> {
     entities: EntityAllocator,
     pending_commands: BTreeMap<u64, Vec<CommandEnvelope<P>>>,
     /// Durable transcript of commands applied at tick boundaries, in
-    /// application order (ascending command ID within each tick). Part of the
+    /// application order (the stable arbitration key within each tick, issue
+    /// #42). Part of the
     /// canonical state, bounded to the runner's `max_applied_history` window
     /// (issue #39); the full stream remains available in replay recordings.
     applied_commands: Vec<CommandEnvelope<P>>,
@@ -464,7 +466,7 @@ impl<P, E> Simulation<P, E> {
     }
 
     /// Returns the commands assigned to the tick currently being executed, in
-    /// ascending command-ID order. They are drained from the pending buffer at
+    /// arbitration-key order (issue #42). They are drained from the pending buffer at
     /// the tick boundary and are only visible while that tick runs.
     #[must_use]
     pub fn commands_for_current_tick(&self) -> &[CommandEnvelope<P>] {
@@ -1282,8 +1284,8 @@ impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
     ///
     /// This is the standard ingress: system-emitted intents
     /// ([`SystemIntent::Command`], issue #37) go through the exact same path,
-    /// with the same explicit target-tick and ascending command-ID ordering
-    /// semantics.
+    /// with the same explicit target-tick semantics; same-tick application
+    /// order is the arbitration key (issue #42), not submission order.
     pub fn submit_command(
         &mut self,
         request: CommandRequest<P>,
@@ -1294,7 +1296,7 @@ impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
 
     /// Advances the simulation by exactly one tick: increments the
     /// authoritative tick counter, drains the commands assigned to that tick
-    /// in ascending command-ID order, then executes every phase in
+    /// and arbitrates them into the stable key order (issue #42), then executes every phase in
     /// [`Phase::SCHEDULE`] order. Every hook receives the single authoritative
     /// [`TickContext`] for this tick (issue #37). Never reads wall-clock time.
     ///
@@ -1330,10 +1332,14 @@ impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
             .pending_commands
             .remove(&next_tick)
             .unwrap_or_default();
-        // Deterministic same-tick ordering: ascending command ID. The drained
-        // commands join the durable applied transcript; the current-tick view
-        // is just a range into it.
-        commands.sort_by_key(|envelope| envelope.command_id());
+        // Deterministic same-tick arbitration (issue #42): order by the
+        // stable arbitration key (actor, session, request ID, command ID),
+        // never by arrival order, so the same command set arbitrates
+        // identically regardless of which producer reached the runner first.
+        // Validation, application, and the transcript all follow this order.
+        // The drained commands join the durable applied transcript; the
+        // current-tick view is just a range into it.
+        commands.sort_by_key(|envelope| envelope.arbitration_key());
         // Lifecycle stages 3-4 (issue #43): application-time validation against
         // the authoritative state at the tick boundary, in deterministic
         // execution order across ApplyCommands systems; the first rejection
@@ -1724,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn same_tick_commands_apply_in_ascending_command_id_order() {
+    fn same_tick_commands_apply_in_arbitration_key_order() {
         struct CommandProbe {
             log: CommandLog,
         }
@@ -2947,7 +2953,8 @@ mod tests {
         }
         // The intent emitted at tick 1 targeted tick 2 and went through the
         // standard ingress: it got command ID 1 (after the external command
-        // with ID 0) and both applied at tick 2 in ascending command-ID order.
+        // with ID 0) and both applied at tick 2 in arbitration-key order
+        // (actor 0 before actor 9, issue #42).
         let applied = a.simulation().applied_commands();
         assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].command_id(), CommandId(0));
@@ -3190,5 +3197,181 @@ mod tests {
             runner.simulation().pending_command_ticks().next().is_none(),
             "the rejected intent was not queued"
         );
+    }
+    // ---- issue #42: deterministic multi-producer arbitration ----
+
+    #[test]
+    fn same_tick_arbitration_is_independent_of_producer_arrival_order() {
+        // The same command set submitted in different arrival orders must
+        // arbitrate identically at the tick boundary.
+        let build = |reverse: bool| {
+            let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+            // Request IDs are monotonic per (actor, session), but the
+            // cross-producer arrival order is scrambled in the reversed run.
+            let requests = if reverse {
+                vec![
+                    request_from(2, 1, 1, 20),
+                    request_from(1, 1, 1, 10),
+                    request_from(1, 2, 1, 11),
+                    request_from(2, 2, 1, 21),
+                ]
+            } else {
+                vec![
+                    request_from(1, 1, 1, 10),
+                    request_from(2, 1, 1, 20),
+                    request_from(1, 2, 1, 11),
+                    request_from(2, 2, 1, 21),
+                ]
+            };
+            for request in requests {
+                runner.submit_command(request).expect("submit");
+            }
+            runner
+        };
+        let mut first = build(false);
+        let mut second = build(true);
+        first.step_tick().expect("tick 1");
+        second.step_tick().expect("tick 1");
+        // Command IDs are arrival-order identities, so they differ between the
+        // two runs...
+        let ids = |runner: &SimulationRunner<u32>| {
+            runner
+                .simulation()
+                .applied_commands()
+                .iter()
+                .map(|envelope| envelope.command_id())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(ids(&first), ids(&second));
+        // ...but the arbitration order (actor, session, request_id) is
+        // identical, and the transcript records it.
+        let order = |runner: &SimulationRunner<u32>| {
+            runner
+                .simulation()
+                .applied_commands()
+                .iter()
+                .map(|envelope| {
+                    (
+                        envelope.actor(),
+                        envelope.session(),
+                        envelope.request_id(),
+                        *envelope.payload(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (ActorId(1), SessionId(0), RequestId(1), 10),
+            (ActorId(1), SessionId(0), RequestId(2), 11),
+            (ActorId(2), SessionId(0), RequestId(1), 20),
+            (ActorId(2), SessionId(0), RequestId(2), 21),
+        ];
+        assert_eq!(order(&first), expected);
+        assert_eq!(order(&first), order(&second));
+        // Outcomes are recorded in arbitration order as well.
+        assert_eq!(first.simulation().applied_outcomes().len(), 4);
+        assert!(
+            first
+                .simulation()
+                .applied_outcomes()
+                .iter()
+                .all(|(_, outcome)| *outcome == CommandOutcome::Applied)
+        );
+    }
+
+    struct SubjectApplier {
+        log: Rc<RefCell<Vec<(ActorId, u32)>>>,
+        last: Rc<RefCell<Option<(ActorId, u32)>>>,
+    }
+
+    impl SimulationSystem<u32> for SubjectApplier {
+        fn id(&self) -> SystemId {
+            SystemId("applier")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::ApplyCommands
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "applier"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            _ctx: &TickContext,
+            simulation: &mut Simulation<u32>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32>, SystemError> {
+            // Applies commands in the order the runner arbitrated them;
+            // for one subject the last applied command wins.
+            for envelope in simulation.commands_for_current_tick() {
+                self.log
+                    .borrow_mut()
+                    .push((envelope.actor(), *envelope.payload()));
+                *self.last.borrow_mut() = Some((envelope.actor(), *envelope.payload()));
+            }
+            Ok(SystemOutput::default())
+        }
+    }
+
+    #[test]
+    fn conflicting_same_subject_commands_resolve_last_in_arbitration_order() {
+        let build = |reverse: bool| {
+            let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let last = Rc::new(RefCell::new(None));
+            runner
+                .register_system(SubjectApplier {
+                    log: log.clone(),
+                    last: last.clone(),
+                })
+                .expect("id");
+            let subject = runner
+                .simulation_mut()
+                .entities_mut()
+                .allocate()
+                .expect("entity");
+            let from = |actor: u64, request_id: u64, payload: u32| CommandRequest {
+                request_id: RequestId(request_id),
+                actor: ActorId(actor),
+                session: SessionId(0),
+                tick: 1,
+                subject: Some(subject),
+                payload,
+            };
+            let requests = if reverse {
+                vec![from(2, 1, 200), from(1, 1, 100)]
+            } else {
+                vec![from(1, 1, 100), from(2, 1, 200)]
+            };
+            for request in requests {
+                runner.submit_command(request).expect("submit");
+            }
+            (runner, log, last)
+        };
+        let (mut a, log_a, last_a) = build(false);
+        let (mut b, log_b, last_b) = build(true);
+        a.step_tick().expect("tick 1");
+        b.step_tick().expect("tick 1");
+        // Arbitration order is (actor 1, req 1) then (actor 2, req 1) in both
+        // runs, regardless of arrival order; the last in arbitration order
+        // wins for the shared subject.
+        assert_eq!(*log_a.borrow(), vec![(ActorId(1), 100), (ActorId(2), 200)]);
+        assert_eq!(*log_a.borrow(), *log_b.borrow());
+        assert_eq!(*last_a.borrow(), Some((ActorId(2), 200)));
+        assert_eq!(*last_a.borrow(), *last_b.borrow());
     }
 }

@@ -6,10 +6,14 @@
 //! request ID (for duplicate detection), a command ID (assigned by the
 //! simulation in submission order), the target tick, the actor/source and
 //! session, and a typed payload. Commands are applied only at their target
-//! tick's boundary, and same-tick commands run in ascending command-ID
-//! order, so command application is tick-indexed and order-stable. Invalid,
-//! late, and duplicate commands are rejected with structured errors; they
-//! are never silently retargeted.
+//! tick's boundary, and same-tick commands run in the stable arbitration-key
+//! order ([`CommandEnvelope::arbitration_key`]: actor, session, request ID,
+//! then command ID as a defensive tie-break), which is independent of
+//! producer arrival order (issue #42) — so command application is
+//! tick-indexed and order-stable no matter which producer reached the runner
+//! first. The command ID is only an arrival-order identity, never an
+//! ordering guarantee. Invalid, late, and duplicate commands are rejected
+//! with structured errors; they are never silently retargeted.
 //!
 //! Request identity is scoped to `(ActorId, SessionId, RequestId)` (issue
 //! #41): producers generate local monotonic request IDs per session, so
@@ -33,6 +37,17 @@
 //!    [`CommandOutcome`] (`Applied` or `Rejected { reason }`) recorded in the
 //!    durable transcript, so replays reproduce accepted and rejected commands
 //!    alike.
+//!
+//! Same-tick arbitration (issue #42): at the target tick's boundary the
+//! queued commands are ordered by [`CommandEnvelope::arbitration_key`], never
+//! by arrival order; validation and application then proceed in that order.
+//! Conflicting commands (e.g. two producers ordering the same subject for the
+//! same tick) resolve deterministically: application-time validation rejects
+//! in arbitration order (first rejection wins), and per-subject mutations
+//! apply in arbitration order, so the last command in arbitration order wins
+//! for that subject. Recordings keep the submission-order command stream with
+//! assigned command IDs, so a replay reproduces the identical per-tick sets
+//! and therefore the identical arbitration result.
 
 use crate::entity::EntityId;
 use crate::hash::{
@@ -160,7 +175,21 @@ impl<P> CommandEnvelope<P> {
         self.request_id
     }
 
-    /// Returns the simulation-assigned command ID.
+    /// The stable arbitration key defining same-tick application order
+    /// (issue #42): `(actor, session, request_id)`, with the command ID as a
+    /// defensive final tie-break. The key depends only on producer identity
+    /// and producer-local sequence — never on which producer reached the
+    /// runner first — so an identical command set arbitrates identically in
+    /// every run. Request identity is unique within a run (duplicate retries
+    /// are rejected at ingress), so the command ID tie-break is not normally
+    /// reached.
+    #[must_use]
+    pub const fn arbitration_key(&self) -> (ActorId, SessionId, RequestId, CommandId) {
+        (self.actor, self.session, self.request_id, self.command_id)
+    }
+
+    /// Returns the simulation-assigned command ID (an arrival-order identity,
+    /// not an ordering guarantee — see [`CommandEnvelope::arbitration_key`]).
     #[must_use]
     pub const fn command_id(&self) -> CommandId {
         self.command_id
