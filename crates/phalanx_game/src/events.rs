@@ -18,6 +18,29 @@ pub enum CommandFailReason {
     InvalidTarget,
 }
 
+impl CommandFailReason {
+    /// The core [`phalanx_core::command::CommandOutcome::Rejected`] reason
+    /// code for this reason (issue #43): battle command validators report
+    /// failures with these codes, and application maps them back to the typed
+    /// reason.
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::UnknownSubject => 1,
+            Self::InvalidTarget => 2,
+        }
+    }
+
+    /// Maps a validator reason code back to the typed reason; `None` for codes
+    /// outside the battle validator code space.
+    pub const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::UnknownSubject),
+            2 => Some(Self::InvalidTarget),
+            _ => None,
+        }
+    }
+}
+
 impl CanonicalSerialize for CommandFailReason {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u32(match self {

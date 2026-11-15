@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use phalanx_core::command::{CommandEnvelope, CommandPayload};
+use phalanx_core::command::{CommandEnvelope, CommandOutcome, CommandPayload};
 use phalanx_core::entity::{EntityAllocator, EntityId};
 use phalanx_core::hash::{
     CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink, Digest,
@@ -252,8 +252,10 @@ impl BattleWorld {
 
     /// Applies the commands assigned to the current tick (called in
     /// `Phase::ApplyCommands`). A new command replaces the unit's current
-    /// one; invalid subjects/targets fail with a structured event and never
-    /// resolve to a reused entity.
+    /// one. The canonical outcome of each command was decided at this tick's
+    /// boundary (lifecycle stages 3-4, issue #43): rejected commands are
+    /// recorded as structured `CommandFailed` events and never applied, so
+    /// stale subjects/targets never resolve to a reused entity.
     pub fn apply_commands(&mut self, simulation: &Simulation<CommandPayload>) {
         let tick = simulation.tick();
         let envelopes: Vec<CommandEnvelope<CommandPayload>> =
@@ -262,22 +264,22 @@ impl BattleWorld {
             let Some(subject) = envelope.subject() else {
                 continue;
             };
-            let Some(team) = self.combat.get(&subject).map(|state| state.team) else {
+            if let Some(CommandOutcome::Rejected { reason }) =
+                simulation.command_outcome(envelope.command_id())
+            {
+                let reason = CommandFailReason::from_code(reason)
+                    .expect("battle validators only emit battle reason codes");
                 self.events.push(BattleEvent::CommandFailed {
                     unit: subject,
-                    reason: CommandFailReason::UnknownSubject,
+                    reason,
                     tick,
                 });
                 continue;
-            };
-            let attack_valid = match envelope.payload() {
-                CommandPayload::Attack { target } => self
-                    .combat
-                    .get(target)
-                    .is_some_and(|other| other.team != team),
-                _ => true,
-            };
-            let state = self.combat.get_mut(&subject).expect("checked above");
+            }
+            let state = self
+                .combat
+                .get_mut(&subject)
+                .expect("accepted at the tick boundary");
             match envelope.payload() {
                 CommandPayload::Move { destination } => {
                     state.command = Some(BattleCommand::Move {
@@ -306,18 +308,9 @@ impl BattleWorld {
                     }
                 }
                 CommandPayload::Attack { target } => {
-                    if attack_valid {
-                        state.command = Some(BattleCommand::Attack { target: *target });
-                        state.target = Some(*target);
-                    } else {
-                        state.command = None;
-                        state.target = None;
-                        self.events.push(BattleEvent::CommandFailed {
-                            unit: subject,
-                            reason: CommandFailReason::InvalidTarget,
-                            tick,
-                        });
-                    }
+                    // Target validity was validated at this tick's boundary.
+                    state.command = Some(BattleCommand::Attack { target: *target });
+                    state.target = Some(*target);
                 }
                 CommandPayload::Diagnostics { .. } => {}
             }

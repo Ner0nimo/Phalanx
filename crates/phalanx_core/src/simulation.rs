@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 
 use crate::command::{
-    ActorId, CommandEnvelope, CommandId, CommandLimits, CommandLimitsError, CommandRequest,
-    CommandSubmitError, ENVELOPE_VERSION, RequestId, SessionId,
+    ActorId, CommandEnvelope, CommandId, CommandLimits, CommandLimitsError, CommandOutcome,
+    CommandRequest, CommandSubmitError, CommandVerdict, ENVELOPE_VERSION, RequestId, SessionId,
 };
 use crate::entity::EntityAllocator;
 use crate::hash::{
@@ -39,9 +39,10 @@ pub const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 /// replays and savegames; bump it on any change that alters canonical state.
 /// The simulation schema version. Bumped when the canonical simulation state
 /// layout changes incompatibly (schema 2: bounded command bookkeeping, issue
-/// #39; schema 3: request identity scoped to (actor, session), issue #41).
+/// #39; schema 3: request identity scoped to (actor, session), issue #41;
+/// schema 4: canonical per-command application outcomes, issue #43).
 /// Older-schema replays are rejected at the boundary (issue #30).
-pub const SIMULATION_SCHEMA_VERSION: u32 = 3;
+pub const SIMULATION_SCHEMA_VERSION: u32 = 4;
 
 /// The fixed simulation rate. This configures simulation time, not wall-clock
 /// scheduling: the runner itself never reads the clock.
@@ -285,6 +286,11 @@ pub struct Simulation<P> {
     /// canonical state, bounded to the runner's `max_applied_history` window
     /// (issue #39); the full stream remains available in replay recordings.
     applied_commands: Vec<CommandEnvelope<P>>,
+    /// Durable per-command application outcomes, parallel to
+    /// `applied_commands` (issue #43, lifecycle stage 4). Rejected-at-
+    /// application commands stay in the transcript, so replays reproduce
+    /// them. Bounded to the same window as `applied_commands`.
+    applied_outcomes: Vec<(CommandId, CommandOutcome)>,
     /// Total number of commands applied so far (the transcript keeps only a
     /// bounded window, so the count preserves the total).
     applied_command_count: u64,
@@ -315,6 +321,7 @@ impl<P> Simulation<P> {
             entities: EntityAllocator::new(),
             pending_commands: BTreeMap::new(),
             applied_commands: Vec::new(),
+            applied_outcomes: Vec::new(),
             applied_command_count: 0,
             current_tick_commands: 0..0,
             last_request_id_per_session: BTreeMap::new(),
@@ -371,6 +378,23 @@ impl<P> Simulation<P> {
         &self.applied_commands
     }
 
+    /// Returns the durable per-command application outcomes in application
+    /// order (issue #43). Parallel to [`Simulation::applied_commands`].
+    #[must_use]
+    pub fn applied_outcomes(&self) -> &[(CommandId, CommandOutcome)] {
+        &self.applied_outcomes
+    }
+
+    /// Returns the recorded outcome of an applied command, if it is still in
+    /// the bounded transcript window.
+    #[must_use]
+    pub fn command_outcome(&self, command_id: CommandId) -> Option<CommandOutcome> {
+        self.applied_outcomes
+            .iter()
+            .find(|(id, _)| *id == command_id)
+            .map(|(_, outcome)| *outcome)
+    }
+
     /// Returns the total number of commands applied since tick 0 (the
     /// transcript keeps only a bounded window of the most recent ones).
     #[must_use]
@@ -411,6 +435,7 @@ impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
         self.pending_commands.write_canonical(sink);
         sink.write_u64(self.applied_command_count);
         self.applied_commands.write_canonical(sink);
+        self.applied_outcomes.write_canonical(sink);
         self.last_request_id_per_session.write_canonical(sink);
         sink.write_u64(self.next_command_id);
     }
@@ -439,6 +464,7 @@ impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
             pending_commands: CanonicalDecode::read_canonical(reader)?,
             applied_command_count: reader.read_u64()?,
             applied_commands: CanonicalDecode::read_canonical(reader)?,
+            applied_outcomes: CanonicalDecode::read_canonical(reader)?,
             current_tick_commands: 0..0,
             last_request_id_per_session: CanonicalDecode::read_canonical(reader)?,
             next_command_id: reader.read_u64()?,
@@ -528,6 +554,20 @@ pub trait SimulationSystem<P> {
         reader: &mut CanonicalReader<'_>,
     ) -> Result<(), CanonicalError> {
         reader.finish()
+    }
+
+    /// Application-time command validation (lifecycle stage 3, issue #43).
+    /// Called once per queued command at its target tick's boundary, in
+    /// deterministic execution order across `Phase::ApplyCommands` systems,
+    /// before that phase runs — i.e. against the authoritative world state at
+    /// application time. The first [`CommandVerdict::Reject`] wins and becomes
+    /// the command's canonical [`CommandOutcome`]. The default accepts.
+    fn validate_command(
+        &mut self,
+        _simulation: &Simulation<P>,
+        _envelope: &CommandEnvelope<P>,
+    ) -> CommandVerdict {
+        CommandVerdict::Accept
     }
 
     /// Executes the system for the current tick. Placeholder hooks must not
@@ -992,8 +1032,29 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         // commands join the durable applied transcript; the current-tick view
         // is just a range into it.
         commands.sort_by_key(|envelope| envelope.command_id());
+        // Lifecycle stages 3-4 (issue #43): application-time validation against
+        // the authoritative state at the tick boundary, in deterministic
+        // execution order across ApplyCommands systems; the first rejection
+        // wins and is recorded as the command's canonical outcome.
+        let mut outcomes: Vec<(CommandId, CommandOutcome)> = Vec::with_capacity(commands.len());
+        for envelope in &commands {
+            let mut outcome = CommandOutcome::Applied;
+            for registered in &mut self.systems {
+                if registered.phase == Phase::ApplyCommands {
+                    if let CommandVerdict::Reject { reason } = registered
+                        .system
+                        .validate_command(&self.simulation, envelope)
+                    {
+                        outcome = CommandOutcome::Rejected { reason };
+                        break;
+                    }
+                }
+            }
+            outcomes.push((envelope.command_id(), outcome));
+        }
         let start = self.simulation.applied_commands.len();
         self.simulation.applied_commands.append(&mut commands);
+        self.simulation.applied_outcomes.extend(outcomes);
         self.simulation.applied_command_count +=
             (self.simulation.applied_commands.len() - start) as u64;
         self.simulation.current_tick_commands = start..self.simulation.applied_commands.len();
@@ -1029,9 +1090,9 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         // match duration.
         let cap = usize::try_from(command_limits.max_applied_history).unwrap_or(usize::MAX);
         if simulation.applied_commands.len() > cap {
-            simulation
-                .applied_commands
-                .drain(..simulation.applied_commands.len() - cap);
+            let drop = simulation.applied_commands.len() - cap;
+            simulation.applied_commands.drain(..drop);
+            simulation.applied_outcomes.drain(..drop);
         }
         Ok(())
     }
@@ -1053,8 +1114,8 @@ mod tests {
 
     use super::*;
     use crate::command::{
-        ActorId, CommandId, CommandLimits, CommandLimitsError, InvalidCommandLimits, RequestId,
-        SessionId,
+        ActorId, CommandId, CommandLimits, CommandLimitsError, CommandOutcome, CommandVerdict,
+        InvalidCommandLimits, RequestId, SessionId,
     };
     use crate::hash::canonical_encode;
 
@@ -1897,6 +1958,99 @@ mod tests {
         );
         assert_eq!(runner.simulation().applied_command_count(), 12);
         assert_eq!(runner.simulation().applied_commands().len(), 4);
+    }
+
+    struct RejectOn42;
+
+    impl SimulationSystem<u32> for RejectOn42 {
+        fn id(&self) -> SystemId {
+            SystemId("reject-42")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::ApplyCommands
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "reject-42"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn validate_command(
+            &mut self,
+            _simulation: &Simulation<u32>,
+            envelope: &CommandEnvelope<u32>,
+        ) -> CommandVerdict {
+            if envelope.payload() == &42 {
+                CommandVerdict::Reject { reason: 7 }
+            } else {
+                CommandVerdict::Accept
+            }
+        }
+
+        fn run(&mut self, _simulation: &mut Simulation<u32>, _phase: Phase) {}
+    }
+
+    #[test]
+    fn application_time_rejection_is_recorded_in_the_canonical_transcript() {
+        let make = || {
+            let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+            runner.register_system(RejectOn42).expect("id");
+            runner
+                .submit_command(request(1, 2, 1))
+                .expect("accepted payload");
+            runner
+                .submit_command(request(2, 2, 42))
+                .expect("structurally valid");
+            runner
+                .submit_command(request(3, 2, 3))
+                .expect("accepted payload");
+            runner
+        };
+        let mut a = make();
+        let mut b = make();
+        a.advance_ticks(2).expect("advance");
+        b.advance_ticks(2).expect("advance");
+
+        let outcomes = a.simulation().applied_outcomes();
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[0], (CommandId(0), CommandOutcome::Applied));
+        assert_eq!(
+            outcomes[1],
+            (CommandId(1), CommandOutcome::Rejected { reason: 7 })
+        );
+        assert_eq!(outcomes[2], (CommandId(2), CommandOutcome::Applied));
+        assert_eq!(
+            a.simulation().command_outcome(CommandId(1)),
+            Some(CommandOutcome::Rejected { reason: 7 })
+        );
+        // Outcomes are canonical state: identical runs produce identical
+        // hashes and outcomes.
+        assert_eq!(a.tick_hashes(), b.tick_hashes());
+        assert_eq!(a.canonical_digest(), b.canonical_digest());
+
+        // Structural (ingress) rejections never enter the transcript.
+        assert_eq!(
+            a.submit_command(request(4, 2, 9)),
+            Err(CommandSubmitError::LateTick {
+                requested: 2,
+                current: 2
+            })
+        );
+        a.step_tick().expect("tick 3");
+        assert_eq!(a.simulation().applied_command_count(), 3);
+        assert_eq!(a.simulation().applied_outcomes().len(), 3);
     }
 
     #[test]

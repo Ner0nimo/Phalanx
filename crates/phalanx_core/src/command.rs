@@ -19,6 +19,20 @@
 //! version (currently 2, which added the session field) and the simulation
 //! schema version make the identity semantics explicit and versioned for
 //! replay compatibility.
+//!
+//! The command lifecycle has explicit, ordered stages (issue #43):
+//! 1. **Ingress** (`SimulationRunner::submit_command`): envelope schema,
+//!    request identity/dedup, look-ahead and queue limits — structural errors
+//!    are rejected before queue insertion.
+//! 2. **Authorization and state-independent validation**: validator systems
+//!    may reject on policy alone (e.g. actor vs. subject ownership).
+//! 3. **Application-time validation** (`SimulationSystem::validate_command`):
+//!    checked against the authoritative world at the command's target tick,
+//!    in deterministic system execution order; the first rejection wins.
+//! 4. **Deterministic result**: every queued command gets a canonical
+//!    [`CommandOutcome`] (`Applied` or `Rejected { reason }`) recorded in the
+//!    durable transcript, so replays reproduce accepted and rejected commands
+//!    alike.
 
 use crate::entity::EntityId;
 use crate::hash::{
@@ -253,6 +267,54 @@ impl std::fmt::Display for CommandSubmitError {
 }
 
 impl std::error::Error for CommandSubmitError {}
+
+/// A validator's verdict on one queued command at application time
+/// (lifecycle stage 3, issue #43).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandVerdict {
+    /// Accept; the command is applied by a system during
+    /// `Phase::ApplyCommands`.
+    Accept,
+    /// Reject with a validator-defined reason code (the validator documents
+    /// its code space); recorded canonically as [`CommandOutcome::Rejected`].
+    Reject { reason: u64 },
+}
+
+/// The deterministic outcome of a queued command, decided at its target
+/// tick's boundary (lifecycle stage 4, issue #43). Recorded in the durable
+/// canonical transcript, so replays reproduce accepted and rejected commands
+/// alike.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandOutcome {
+    /// No validator rejected it; applied by a system.
+    Applied,
+    /// Rejected at application time with a validator-defined reason code.
+    Rejected { reason: u64 },
+}
+
+impl CanonicalSerialize for CommandOutcome {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        match self {
+            Self::Applied => sink.write_u32(0),
+            Self::Rejected { reason } => {
+                sink.write_u32(1);
+                sink.write_u64(*reason);
+            }
+        }
+    }
+}
+
+impl CanonicalDecode for CommandOutcome {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        match reader.read_u32()? {
+            0 => Ok(Self::Applied),
+            1 => Ok(Self::Rejected {
+                reason: reader.read_u64()?,
+            }),
+            other => Err(CanonicalError::UnknownTag(other)),
+        }
+    }
+}
 
 /// Validated limits for command ingress (issue #39): maximum target-tick
 /// look-ahead, pending-queue saturation per actor and in total, and the
