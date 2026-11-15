@@ -67,12 +67,14 @@ jobs:
       - name: Run offscreen graphical presentation probe
         run: cargo run -p phalanx_runtime -- --graphical --offscreen --frames 3
 
-      # Sim-to-render probe (issue #63): offscreen battle mode steps the real
-      # simulation per frame and draws the extracted snapshot. On GPU-less
-      # hosted runners this exits 0 with a structured no-adapter result; on
-      # GPU machines it renders and verifies background + obstacle + team
-      # color pixels by readback.
-      - name: Run offscreen battle snapshot probe
+      # Autonomous battle probe (issues #63/#64): offscreen battle mode runs
+      # the real simulation to MatchOver (no unit commands; deterministic
+      # winner/tick) and, when a GPU adapter exists, renders snapshot frames
+      # and verifies background + obstacle + winner-color-present +
+      # loser-color-absent pixels by readback. On GPU-less hosted runners it
+      # exits 0 with a structured no-adapter result after the CPU-only
+      # simulation probe.
+      - name: Run offscreen autonomous battle probe
         run: cargo run -p phalanx_runtime -- --graphical --offscreen --battle --frames 8
 
   audit:

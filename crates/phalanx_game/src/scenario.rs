@@ -31,6 +31,14 @@ pub const SPAWN_PAD_A: (f32, f32) = (20.0, 100.0);
 /// Team B spawn pad center (spec §8): (180, 100) on the Crossing map.
 pub const SPAWN_PAD_B: (f32, f32) = (180.0, 100.0);
 
+/// Team A spawn pad center for the autonomous battle (issue #64): (90, 100),
+/// 20 m from Team B's pad — inside weapon range of skirmishers (30 m) at
+/// spawn, so the engagement starts immediately and resolves instead of
+/// degenerating into a same-speed mutual chase across the map.
+pub const AUTONOMOUS_PAD_A: (f32, f32) = (90.0, 100.0);
+/// Team B spawn pad center for the autonomous battle (issue #64): (110, 100).
+pub const AUTONOMOUS_PAD_B: (f32, f32) = (110.0, 100.0);
+
 /// Builds the battle world over the Crossing map with the slice roster.
 #[must_use]
 pub fn battle_world() -> BattleWorld {
@@ -47,6 +55,14 @@ pub fn battle_world() -> BattleWorld {
 /// Registers the battle systems on a runner and returns the shared world.
 pub fn setup_battle(runner: &mut SimulationRunner<CommandPayload>) -> SharedBattleWorld {
     register_battle_systems(runner, battle_world())
+}
+
+/// Registers the battle systems in the autonomous stance (issue #64): units
+/// acquire, approach, and engage without any per-unit commands.
+pub fn setup_autonomous_battle(runner: &mut SimulationRunner<CommandPayload>) -> SharedBattleWorld {
+    let mut world = battle_world();
+    world.set_autonomous(true);
+    register_battle_systems(runner, world)
 }
 
 /// Spawns one team's 6 units (3 strikers + 3 skirmishers) on its spawn pad in

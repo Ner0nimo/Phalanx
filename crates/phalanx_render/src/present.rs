@@ -71,6 +71,10 @@ pub enum PresentError {
         /// Found RGBA.
         found: [u8; 4],
     },
+    /// A pixel buffer did not have the expected length.
+    InvalidPixelBuffer { expected: usize, found: usize },
+    /// Writing a screenshot file failed.
+    Io(String),
 }
 
 impl fmt::Display for PresentError {
@@ -86,6 +90,11 @@ impl fmt::Display for PresentError {
                 formatter,
                 "pixel {pixel} mismatch: expected {expected:02x?} found {found:02x?}"
             ),
+            Self::InvalidPixelBuffer { expected, found } => write!(
+                formatter,
+                "pixel buffer length mismatch: expected {expected} bytes, found {found}"
+            ),
+            Self::Io(error) => write!(formatter, "screenshot write failed: {error}"),
         }
     }
 }
@@ -389,9 +398,74 @@ pub fn verify_clear_pixels_background(
     Ok(())
 }
 
+/// Writes an RGBA8 readback as a binary PPM (P6) screenshot file — the
+/// completion evidence for the graphical battle (issue #64). Pure CPU file
+/// I/O over GPU-produced pixels; no CPU framebuffer rendering is involved in
+/// producing the frame itself.
+pub fn write_ppm(
+    path: &std::path::Path,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<(), PresentError> {
+    use std::io::Write;
+    let expected_len = width as usize * height as usize * 4;
+    if pixels.len() != expected_len {
+        return Err(PresentError::InvalidPixelBuffer {
+            expected: expected_len,
+            found: pixels.len(),
+        });
+    }
+    let mut file =
+        std::fs::File::create(path).map_err(|error| PresentError::Io(error.to_string()))?;
+    writeln!(file, "P6\n{width} {height}\n255")
+        .map_err(|error| PresentError::Io(error.to_string()))?;
+    for chunk in pixels.chunks_exact(4) {
+        file.write_all(&chunk[..3])
+            .map_err(|error| PresentError::Io(error.to_string()))?;
+    }
+    file.flush()
+        .map_err(|error| PresentError::Io(error.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_ppm_produces_a_valid_p6_file() {
+        let width = 4_u32;
+        let height = 2_u32;
+        let mut pixels = Vec::new();
+        for i in 0..width * height {
+            pixels.extend_from_slice(&[i as u8, 255 - i as u8, 7, 255]);
+        }
+        let path = std::env::temp_dir().join("phalanx_write_ppm_test.p6");
+        write_ppm(&path, &pixels, width, height).expect("write");
+        let bytes = std::fs::read(&path).expect("read back");
+        let _ = std::fs::remove_file(&path);
+        let header = format!("P6\n{width} {height}\n255\n");
+        assert!(bytes.starts_with(header.as_bytes()), "P6 header");
+        assert_eq!(bytes.len(), header.len() + (width * height * 3) as usize);
+        // First pixel RGB = (0, 255, 7); last = (7, 248, 7).
+        assert_eq!(&bytes[header.len()..header.len() + 3], &[0, 255, 7]);
+        let tail = &bytes[bytes.len() - 3..];
+        assert_eq!(tail, &[7, 248, 7]);
+    }
+
+    #[test]
+    fn write_ppm_rejects_a_wrong_sized_buffer() {
+        let path = std::env::temp_dir().join("phalanx_write_ppm_bad.p6");
+        let error = write_ppm(&path, &[0u8; 3], 2, 2).expect_err("must reject");
+        assert_eq!(
+            error,
+            PresentError::InvalidPixelBuffer {
+                expected: 16,
+                found: 3
+            }
+        );
+    }
 
     #[test]
     fn clear_color_parses_hex_forms() {

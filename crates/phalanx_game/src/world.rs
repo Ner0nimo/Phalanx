@@ -155,6 +155,9 @@ pub struct BattleWorld {
     pub events: Vec<BattleEvent>,
     /// Winner team once the match is over.
     pub match_over: Option<u64>,
+    /// Autonomous stance (issue #64): when set, units without a command
+    /// acquire, approach, and engage enemies on their own.
+    pub autonomous: bool,
 }
 
 impl BattleWorld {
@@ -177,6 +180,7 @@ impl BattleWorld {
             combat: BTreeMap::new(),
             events: Vec::new(),
             match_over: None,
+            autonomous: false,
         }
     }
 
@@ -237,6 +241,14 @@ impl BattleWorld {
     #[must_use]
     pub fn teams(&self) -> &BTreeSet<u64> {
         &self.teams
+    }
+
+    /// Enables/disables the autonomous stance (issue #64): units without a
+    /// command then acquire the nearest enemy in sight, navigate toward it
+    /// when outside weapon range, and hold-and-fire in range. Part of the
+    /// canonical state (round-trips through write/restore).
+    pub fn set_autonomous(&mut self, autonomous: bool) {
+        self.autonomous = autonomous;
     }
 
     /// Living unit count per team (only teams with at least one living unit
@@ -347,10 +359,9 @@ impl BattleWorld {
     /// The movement destination implied by the unit's command and target:
     /// hold and fire when the target is in weapon range; otherwise move
     /// (Attack chases the target, AttackMove continues to its destination).
+    /// In the autonomous stance (issue #64) a unit without a command chases
+    /// its acquired target until it is in weapon range, then holds.
     fn desired_destination(&self, id: EntityId, state: &CombatState) -> Option<(f32, f32)> {
-        let Some(command) = &state.command else {
-            return None;
-        };
         let position = self.movement.unit(id).map(|unit| unit.position)?;
         let in_range = state.target.and_then(|target| {
             let target_position = self.movement.unit(target)?.position;
@@ -359,6 +370,16 @@ impl BattleWorld {
             let dz = target_position.1 - position.1;
             Some((dx * dx + dz * dz).sqrt() <= def.weapon.range_m)
         });
+        let Some(command) = &state.command else {
+            // Autonomous stance: chase the acquired target when out of weapon
+            // range, hold and fire when in range.
+            if self.autonomous && in_range != Some(true) {
+                return state
+                    .target
+                    .and_then(|target| self.movement.unit(target).map(|unit| unit.position));
+            }
+            return None;
+        };
         match command {
             BattleCommand::Move { destination } => Some(*destination),
             BattleCommand::AttackMove { destination } => {
@@ -422,7 +443,9 @@ impl BattleWorld {
                 self.combat[id].command,
                 Some(BattleCommand::Attack { .. }) | Some(BattleCommand::AttackMove { .. })
             );
-            if !has_attack_command {
+            // In the autonomous stance (issue #64) units without an attack
+            // command acquire targets as well; otherwise they hold fire.
+            if !has_attack_command && !self.autonomous {
                 self.combat.get_mut(id).expect("id").target = None;
                 continue;
             }
@@ -582,6 +605,7 @@ impl BattleWorld {
             .write_canonical(sink);
         self.events.write_canonical(sink);
         self.match_over.write_canonical(sink);
+        self.autonomous.write_canonical(sink);
     }
 
     /// Restores canonical battle state, validating the roster digest.
@@ -600,6 +624,7 @@ impl BattleWorld {
         self.combat = combat.into_iter().collect();
         self.events = CanonicalDecode::read_canonical(reader)?;
         self.match_over = CanonicalDecode::read_canonical(reader)?;
+        self.autonomous = CanonicalDecode::read_canonical(reader)?;
         Ok(())
     }
 }
