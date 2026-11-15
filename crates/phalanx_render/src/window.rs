@@ -24,7 +24,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::Window;
 
 use crate::backend::{AdapterReport, init_from_adapter, instance_descriptor};
-use crate::present::{ClearColor, choose_surface_config, render_clear_to_view};
+use crate::geometry::{DebugPipeline, OrthoProjection, demo_shapes};
+use crate::present::{ClearColor, choose_surface_config};
 
 /// Structured errors of the windowed presentation path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +96,7 @@ struct WindowState {
     backend: crate::GpuBackend,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    pipeline: DebugPipeline,
 }
 
 struct ClearApp {
@@ -161,6 +163,7 @@ impl ApplicationHandler for ClearApp {
         let size = window.inner_size();
         let config = choose_surface_config(&capabilities, size.width.max(1), size.height.max(1));
         surface.configure(&backend.device, &config);
+        let pipeline = DebugPipeline::new(&backend.device, config.format);
         // Startup log: adapter name, backend, device info (issue #61).
         println!("{report}");
         println!(
@@ -172,6 +175,7 @@ impl ApplicationHandler for ClearApp {
             backend,
             surface,
             config,
+            pipeline,
         });
         self.state
             .as_ref()
@@ -213,11 +217,18 @@ impl ApplicationHandler for ClearApp {
                         let view = frame
                             .texture
                             .create_view(&wgpu::TextureViewDescriptor::default());
-                        render_clear_to_view(
+                        // Debug geometry over the clear color (issue #62). The
+                        // projection is recomputed per frame from the current
+                        // surface size, so resizing keeps geometry in place.
+                        let aspect = state.config.width as f32 / state.config.height.max(1) as f32;
+                        let projection = OrthoProjection::CROSSING_VIEW.for_aspect(aspect);
+                        state.pipeline.render(
                             &state.backend.device,
                             &state.backend.queue,
                             &view,
                             self.clear.to_wgpu(),
+                            &projection,
+                            &demo_shapes(),
                         );
                         state.backend.queue.present(frame);
                         // Continuously present frames.

@@ -4,8 +4,8 @@ use phalanx_core::hash::Digest;
 use phalanx_core::scenario::{SCENARIO_SEED, scenario_commands, setup_scenario};
 use phalanx_core::simulation::{SimulationRunner, TickRate};
 use phalanx_render::{
-    BackendError, ClearColor, DEFAULT_CLEAR, OffscreenTarget, init_headless, run_windowed,
-    verify_clear_pixels,
+    BackendError, ClearColor, DEFAULT_CLEAR, DebugPipeline, OffscreenTarget, OrthoProjection,
+    count_color, demo_shapes, init_headless, run_windowed, verify_clear_pixels_background,
 };
 
 fn main() -> ExitCode {
@@ -73,16 +73,36 @@ fn run_graphical(offscreen: bool, frames: u64, clear: ClearColor) -> Result<(), 
             println!("{report}");
             let target = OffscreenTarget::new(&backend.device, OFFSCREEN_SIZE, OFFSCREEN_SIZE)
                 .map_err(|error| error.to_string())?;
+            // Issue #62: render debug geometry (not just a clear) and verify
+            // both the background and every shape color in the readback.
+            let mut pipeline = DebugPipeline::new(&backend.device, OffscreenTarget::FORMAT);
+            let shapes = demo_shapes();
+            let projection = OrthoProjection::CROSSING_VIEW.for_aspect(1.0);
             for _ in 0..frames {
-                target.render_clear(&backend.device, &backend.queue, clear);
+                pipeline.render(
+                    &backend.device,
+                    &backend.queue,
+                    &target.view,
+                    clear.to_wgpu(),
+                    &projection,
+                    &shapes,
+                );
             }
             let pixels = target
                 .read_back(&backend.device, &backend.queue)
                 .map_err(|error| error.to_string())?;
-            verify_clear_pixels(&pixels, target.width, target.height, clear)
+            verify_clear_pixels_background(&pixels, target.width, target.height, clear, &shapes)
                 .map_err(|error| format!("offscreen frame verification failed: {error}"))?;
+            for shape in &shapes {
+                if count_color(&pixels, shape.color()) == 0 {
+                    return Err(format!(
+                        "offscreen frame verification failed: shape color {:?} not rendered",
+                        shape.color()
+                    ));
+                }
+            }
             println!(
-                "FRAME offscreen frames={frames} size={}x{} clear=verified pixels ok",
+                "FRAME offscreen frames={frames} size={}x{} clear=verified shapes=verified pixels ok",
                 target.width, target.height
             );
             Ok(())
