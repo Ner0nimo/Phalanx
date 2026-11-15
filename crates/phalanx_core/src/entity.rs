@@ -8,7 +8,9 @@
 //! validated, atomic snapshot/restore (issue #45): a snapshot captures
 //! everything that affects future allocation (slot generations, alive flags,
 //! free-list stack order, live count), and restore rejects inconsistent input
-//! without touching the allocator.
+//! without touching the allocator. When a slot's generation reaches `u64::MAX`
+//! it is permanently retired instead of wrapping around, so a stale ID can
+//! never become valid again through generation overflow (issue #44).
 
 use crate::hash::{
     CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink,
@@ -63,6 +65,11 @@ pub enum EntityError {
     /// The allocator cannot grow further because the slot index space is
     /// exhausted.
     SpaceExhausted,
+    /// The slot's generation is at u64::MAX, so releasing cannot bump it
+    /// further. The slot is retired permanently: it is marked dead, the live
+    /// count is decremented, but it is NOT returned to the free list, so no
+    /// wrapped generation can ever make a stale ID valid again (issue #44).
+    GenerationExhausted { index: u32 },
 }
 
 impl std::fmt::Display for EntityError {
@@ -78,6 +85,10 @@ impl std::fmt::Display for EntityError {
                 "stale entity id for slot {index}: generation {found} does not match current generation {expected}"
             ),
             Self::SpaceExhausted => formatter.write_str("entity slot index space exhausted"),
+            Self::GenerationExhausted { index } => write!(
+                formatter,
+                "entity slot {index} generation exhausted; the slot is permanently retired"
+            ),
         }
     }
 }
@@ -142,6 +153,12 @@ impl EntityAllocator {
     /// The slot's generation is bumped immediately, so stale copies of `id`
     /// can never resolve to the entity that later reuses the slot. Releasing
     /// an unknown or stale ID is an explicit error, not a silent no-op.
+    ///
+    /// If the slot's generation is already `u64::MAX` it cannot be bumped
+    /// further: the release still marks the slot dead and decrements the live
+    /// count, but returns [`EntityError::GenerationExhausted`] and does NOT
+    /// return the slot to the free list, permanently retiring the slot so no
+    /// wrapped generation can resurrect a stale ID (issue #44).
     pub fn release(&mut self, id: EntityId) -> Result<(), EntityError> {
         let slot = self
             .slots
@@ -155,10 +172,20 @@ impl EntityAllocator {
             });
         }
         slot.alive = false;
-        slot.generation += 1;
-        self.free.push(id.index);
         self.alive -= 1;
-        Ok(())
+        match slot.generation.checked_add(1) {
+            Some(next) => {
+                slot.generation = next;
+                self.free.push(id.index);
+                Ok(())
+            }
+            None => {
+                // Generation exhaustion (issue #44): the slot stays dead with
+                // generation u64::MAX and is never recycled, so a stale ID can
+                // never become valid again through wrap-around.
+                Err(EntityError::GenerationExhausted { index: id.index })
+            }
+        }
     }
 
     /// Returns whether `id` currently refers to a live entity.
@@ -272,11 +299,6 @@ impl CanonicalDecode for EntityAllocator {
                 "alive count does not match slots",
             ));
         }
-        if free.len() as u64 + alive != slots.len() as u64 {
-            return Err(CanonicalError::InvalidState(
-                "free list size does not match slots",
-            ));
-        }
         let mut seen = vec![false; slots.len()];
         for index in &free {
             let slot = slots
@@ -288,6 +310,20 @@ impl CanonicalDecode for EntityAllocator {
                 return Err(CanonicalError::InvalidState("invalid free list entry"));
             }
             seen[*index as usize] = true;
+        }
+        // Dead slots not in the free list are permanently retired
+        // (generation-exhausted, issue #44) and must be at generation u64::MAX.
+        for (index, slot) in slots.iter().enumerate() {
+            if !slot.alive && !seen[index] && slot.generation != u64::MAX {
+                return Err(CanonicalError::InvalidState(
+                    "dead slot outside the free list is not generation-exhausted",
+                ));
+            }
+        }
+        if free.len() as u64 + alive > slots.len() as u64 {
+            return Err(CanonicalError::InvalidState(
+                "free list size does not match slots",
+            ));
         }
         // Generation sanity: live slots start at generation 1, released slots
         // are bumped on release, so a dead slot is always at generation >= 2.
@@ -460,5 +496,85 @@ mod tests {
         let next = allocator.allocate().expect("allocate");
         assert_eq!(next.index(), id.index());
         assert_ne!(next.generation(), id.generation());
+    }
+
+    #[test]
+    fn release_at_max_generation_retires_the_slot_permanently() {
+        let mut allocator = EntityAllocator::new();
+        let id = allocator.allocate().expect("allocate");
+        assert_eq!(id, EntityId::from_raw_parts(0, 1));
+        // Simulate a slot whose generation has reached u64::MAX (issue #44).
+        allocator.slots[0].generation = u64::MAX;
+        let exhausted = EntityId::from_raw_parts(0, u64::MAX);
+
+        // Releasing cannot bump the generation further: structured error, and
+        // the slot is retired (dead, not returned to the free list).
+        assert_eq!(
+            allocator.release(exhausted),
+            Err(EntityError::GenerationExhausted { index: 0 })
+        );
+        assert_eq!(allocator.alive_count(), 0);
+        assert!(allocator.free.is_empty());
+        assert!(!allocator.slots[0].alive);
+        assert_eq!(allocator.slots[0].generation, u64::MAX);
+        assert!(!allocator.contains(exhausted));
+
+        // The stale ID is still rejected afterwards (no wrap-around
+        // resurrection)...
+        assert!(matches!(
+            allocator.release(exhausted),
+            Err(EntityError::StaleId { .. })
+        ));
+        // ...and the next allocation gets a FRESH slot instead of recycling
+        // the retired one.
+        let next = allocator.allocate().expect("allocate");
+        assert_eq!(next.index(), 1);
+        assert_eq!(next.generation(), 1);
+        assert_eq!(allocator.slot_count(), 2);
+        assert!(!allocator.contains(exhausted));
+
+        // The retired slot round-trips through the canonical snapshot: decode
+        // accepts a dead slot outside the free list only at generation
+        // u64::MAX, and restore keeps the slot permanently out of the free list.
+        let snapshot = allocator.snapshot();
+        let digest_before = canonical_digest(&allocator);
+        let mut reference: EntityAllocator = canonical_decode(&snapshot).expect("decode snapshot");
+        assert_eq!(canonical_digest(&reference), digest_before);
+        allocator.restore(&snapshot).expect("restore snapshot");
+        assert_eq!(canonical_digest(&allocator), digest_before);
+        let after = allocator.allocate().expect("allocate");
+        assert_eq!(after.index(), 2);
+        assert!(!allocator.contains(exhausted));
+        let after_ref = reference.allocate().expect("allocate");
+        assert_eq!(after_ref, after);
+    }
+
+    #[test]
+    fn decode_rejects_dead_slots_outside_the_free_list_unless_retired() {
+        // A dead slot that is not in the free list and not at u64::MAX is
+        // inconsistent state, not a retired slot.
+        let mut sink = SnapshotSink::new();
+        sink.write_u64(1); // slot count
+        sink.write_u64(0); // alive count
+        sink.write_bool(false); // slot 0 dead
+        sink.write_u64(5); // generation 5: bumped, but not exhausted
+        sink.write_u64(0); // free count
+        assert!(canonical_decode::<EntityAllocator>(&sink.bytes).is_err());
+
+        // A dead slot at u64::MAX outside the free list is a valid retired
+        // slot, and it is never recycled.
+        let mut sink = SnapshotSink::new();
+        sink.write_u64(1);
+        sink.write_u64(0);
+        sink.write_bool(false);
+        sink.write_u64(u64::MAX);
+        sink.write_u64(0);
+        let mut restored: EntityAllocator =
+            canonical_decode(&sink.bytes).expect("retired slot decodes");
+        assert_eq!(restored.alive_count(), 0);
+        assert_eq!(restored.slot_count(), 1);
+        let next = restored.allocate().expect("allocate");
+        assert_eq!(next.index(), 1);
+        assert!(!restored.contains(EntityId::from_raw_parts(0, u64::MAX)));
     }
 }
