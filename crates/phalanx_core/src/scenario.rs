@@ -65,7 +65,11 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
     }
 
     fn run(&mut self, simulation: &mut Simulation<CommandPayload>, _phase: Phase) {
-        let _ambient = simulation.rng_mut().stream("ambient").next_u64();
+        let _ambient = simulation
+            .rng_mut()
+            .stream("ambient")
+            .expect("declared at setup")
+            .next_u64();
         let values: Vec<u64> = simulation
             .commands_for_current_tick()
             .iter()
@@ -82,6 +86,7 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
             let _draw = simulation
                 .rng_mut()
                 .stream("combat")
+                .expect("declared at setup")
                 .next_u64_below(value + 1)
                 .expect("value + 1 is non-zero");
         }
@@ -93,6 +98,18 @@ pub fn setup_scenario(runner: &mut SimulationRunner<CommandPayload>) {
     runner
         .register_system(ScenarioSystem)
         .expect("scenario system id is unique");
+    // Systems declare their RNG streams at setup (issue #47); the registry is
+    // finalized on the first tick, after which unknown names are errors.
+    runner
+        .simulation_mut()
+        .rng_mut()
+        .declare("combat")
+        .expect("declare combat stream");
+    runner
+        .simulation_mut()
+        .rng_mut()
+        .declare("ambient")
+        .expect("declare ambient stream");
 }
 
 /// Records the deterministic CI scenario for `ticks` ticks.

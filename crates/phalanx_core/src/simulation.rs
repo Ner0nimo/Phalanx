@@ -40,9 +40,10 @@ pub const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 /// The simulation schema version. Bumped when the canonical simulation state
 /// layout changes incompatibly (schema 2: bounded command bookkeeping, issue
 /// #39; schema 3: request identity scoped to (actor, session), issue #41;
-/// schema 4: canonical per-command application outcomes, issue #43).
+/// schema 4: canonical per-command application outcomes, issue #43; schema 5:
+/// RNG registry finalization flag, issue #47).
 /// Older-schema replays are rejected at the boundary (issue #30).
-pub const SIMULATION_SCHEMA_VERSION: u32 = 4;
+pub const SIMULATION_SCHEMA_VERSION: u32 = 5;
 
 /// The fixed simulation rate. This configures simulation time, not wall-clock
 /// scheduling: the runner itself never reads the clock.
@@ -1019,8 +1020,11 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     /// in ascending command-ID order, then executes every phase in
     /// [`Phase::SCHEDULE`] order. Never reads wall-clock time.
     pub fn step_tick(&mut self) -> Result<(), TickOverflow> {
-        // One-way lifecycle: the first tick implicitly finalizes the registry.
+        // One-way lifecycle: the first tick implicitly finalizes the system
+        // registry and the RNG stream registry (issue #47), so neither can
+        // change mid-run.
         self.finalize_registry();
+        self.simulation.rng.finalize();
         let next_tick = self.simulation.tick.checked_add(1).ok_or(TickOverflow)?;
         self.simulation.tick = next_tick;
         let mut commands = self
@@ -1584,7 +1588,11 @@ mod tests {
                     .entities_mut()
                     .allocate()
                     .expect("allocate entity");
-                let draw = simulation.rng_mut().stream("combat").next_u64();
+                let draw = simulation
+                    .rng_mut()
+                    .stream("combat")
+                    .expect("declared at setup")
+                    .next_u64();
                 self.log.borrow_mut().push((
                     simulation.tick(),
                     entity.index(),
@@ -1602,6 +1610,14 @@ mod tests {
             .expect("unique system id");
         b.register_system(WorldProbe { log: log_b.clone() })
             .expect("unique system id");
+        a.simulation_mut()
+            .rng_mut()
+            .declare("combat")
+            .expect("declare stream at setup");
+        b.simulation_mut()
+            .rng_mut()
+            .declare("combat")
+            .expect("declare stream at setup");
 
         a.advance_ticks(3).expect("advance");
         b.advance_ticks(3).expect("advance");
