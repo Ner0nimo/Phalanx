@@ -292,7 +292,7 @@ Use stable logical entity identifiers suitable for commands, replays, saves, and
 
 Entity lifecycle must define creation and destruction tick, generation/reuse behavior, ownership/team, group membership changes, reference invalidation, death/destruction events, and save/load identity restoration.
 
-Persistent references must be validated; stale references must return explicit errors rather than accidentally resolving to a newly created entity. Stable IDs are implemented as `EntityId` (slot index + generation) with `EntityAllocator` in `phalanx_core::entity` (`crates/phalanx_core/src/entity.rs`), which bumps the generation on release so stale IDs never resolve to reused slots.
+Persistent references must be validated; stale references must return explicit errors rather than accidentally resolving to a newly created entity. Stable IDs are implemented as `EntityId` (slot index + generation) with `EntityAllocator` in `phalanx_core::entity` (`crates/phalanx_core/src/entity.rs`), which bumps the generation on release so stale IDs never resolve to reused slots. The allocator has a validated, atomic snapshot/restore API (issue #45): `snapshot()` captures slot generations, alive flags, free-list stack order, and live count — everything that affects future allocation — and `restore()` validates slot/free-list consistency and generation sanity, rejecting malformed input without changing the allocator.
 
 ### 6.3 Data definitions vs runtime state
 

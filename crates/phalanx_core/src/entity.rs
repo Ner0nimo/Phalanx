@@ -4,10 +4,15 @@
 //! archetype location or a raw memory index, so it stays stable across normal
 //! storage changes. [`EntityAllocator`] hands out IDs, recycles slots with a
 //! bumped generation, and rejects stale IDs with structured errors instead of
-//! letting them resolve to a newly created entity.
+//! letting them resolve to a newly created entity. The allocator supports
+//! validated, atomic snapshot/restore (issue #45): a snapshot captures
+//! everything that affects future allocation (slot generations, alive flags,
+//! free-list stack order, live count), and restore rejects inconsistent input
+//! without touching the allocator.
 
 use crate::hash::{
     CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink,
+    canonical_decode, canonical_encode,
 };
 
 /// A stable logical entity identifier.
@@ -175,6 +180,26 @@ impl EntityAllocator {
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
+
+    /// Encodes a full snapshot of the allocator: every slot (alive flag +
+    /// generation) in index order, the free list in stack order, and the live
+    /// count — everything that determines future allocation behavior
+    /// (issue #45).
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        canonical_encode(self)
+    }
+
+    /// Restores from a snapshot produced by [`EntityAllocator::snapshot`].
+    ///
+    /// The encoding is validated (slot/free-list consistency, alive count,
+    /// and generation sanity) before anything is assigned, so restore is
+    /// atomic: on any error the allocator is left unchanged.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<(), CanonicalError> {
+        let restored = canonical_decode::<Self>(bytes)?;
+        *self = restored;
+        Ok(())
+    }
 }
 
 impl Default for EntityAllocator {
@@ -264,6 +289,16 @@ impl CanonicalDecode for EntityAllocator {
             }
             seen[*index as usize] = true;
         }
+        // Generation sanity: live slots start at generation 1, released slots
+        // are bumped on release, so a dead slot is always at generation >= 2.
+        for slot in &slots {
+            let minimum = if slot.alive { 1 } else { 2 };
+            if slot.generation < minimum {
+                return Err(CanonicalError::InvalidState(
+                    "slot generation below its minimum",
+                ));
+            }
+        }
         Ok(Self { slots, free, alive })
     }
 }
@@ -271,6 +306,7 @@ impl CanonicalDecode for EntityAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::{SnapshotSink, canonical_digest};
 
     #[test]
     fn ids_are_stable_while_alive_regardless_of_other_allocations() {
@@ -352,5 +388,77 @@ mod tests {
         let allocator = EntityAllocator::default();
         assert_eq!(allocator.alive_count(), 0);
         assert_eq!(allocator.slot_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_restore_round_trip_preserves_future_allocations() {
+        let mut allocator = EntityAllocator::new();
+        // Build a specific slot/free-list state: allocate 5, release 2.
+        let ids: Vec<EntityId> = (0..5)
+            .map(|_| allocator.allocate().expect("allocate"))
+            .collect();
+        allocator.release(ids[1]).expect("release");
+        allocator.release(ids[3]).expect("release");
+        let snapshot = allocator.snapshot();
+        let digest_before = canonical_digest(&allocator);
+
+        // Mutate, then restore: the snapshot is the exact prior state.
+        allocator.allocate().expect("allocate");
+        allocator.release(ids[0]).expect("release");
+        allocator.restore(&snapshot).expect("valid snapshot");
+        assert_eq!(canonical_digest(&allocator), digest_before);
+
+        // Identical subsequent allocate/release sequences produce identical
+        // IDs on the restored allocator and on a fresh decode of the snapshot.
+        let mut reference: EntityAllocator = canonical_decode(&snapshot).expect("decode snapshot");
+        let sequence = |alloc: &mut EntityAllocator| {
+            let mut out = Vec::new();
+            out.push(alloc.allocate().expect("allocate"));
+            out.push(alloc.allocate().expect("allocate"));
+            alloc.release(ids[2]).expect("release");
+            out.push(alloc.allocate().expect("allocate"));
+            let first = out[0];
+            alloc.release(first).expect("release");
+            out.push(alloc.allocate().expect("allocate"));
+            out
+        };
+        assert_eq!(sequence(&mut allocator), sequence(&mut reference));
+        assert_eq!(canonical_digest(&allocator), canonical_digest(&reference));
+    }
+
+    #[test]
+    fn restore_rejects_malformed_snapshots_and_leaves_allocator_unchanged() {
+        let mut allocator = EntityAllocator::new();
+        let id = allocator.allocate().expect("allocate");
+        allocator.release(id).expect("release");
+        let digest_before = canonical_digest(&allocator);
+        let alive_before = allocator.alive_count();
+        let snapshot = allocator.snapshot();
+
+        // Truncated bytes.
+        assert!(allocator.restore(&snapshot[..snapshot.len() / 2]).is_err());
+        // Corrupted length prefix (huge slot count).
+        let mut corrupted = snapshot.clone();
+        corrupted[0] ^= 0xFF;
+        assert!(allocator.restore(&corrupted).is_err());
+        // Structurally valid encoding but inconsistent state: the free list
+        // references a live slot (slot_count=1, alive=1, slot alive gen 1,
+        // free_count=1, free=[0]).
+        let mut sink = SnapshotSink::new();
+        sink.write_u64(1);
+        sink.write_u64(1);
+        sink.write_bool(true);
+        sink.write_u64(1);
+        sink.write_u64(1);
+        sink.write_u32(0);
+        assert!(allocator.restore(&sink.bytes).is_err());
+
+        // Failed restores left the allocator unchanged and functional.
+        assert_eq!(canonical_digest(&allocator), digest_before);
+        assert_eq!(allocator.alive_count(), alive_before);
+        assert!(!allocator.contains(id));
+        let next = allocator.allocate().expect("allocate");
+        assert_eq!(next.index(), id.index());
+        assert_ne!(next.generation(), id.generation());
     }
 }
