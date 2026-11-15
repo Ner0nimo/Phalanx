@@ -1,6 +1,8 @@
 //! Integration tests for the movement/nav prototype on the "Crossing" map
 //! (issue #12 acceptance criteria; `docs/vertical-slice-scenario.md` §2/§5/§9).
 
+use std::collections::BTreeMap;
+
 use phalanx_core::command::CommandPayload;
 use phalanx_core::entity::EntityId;
 use phalanx_core::replay::{ReplayRecorder, replay_recording};
@@ -271,7 +273,7 @@ fn replay_reproduces_identical_per_tick_hashes() {
             .register_system(MovementSystem::new(world))
             .expect("id");
     };
-    let report = replay_recording(&recording, 120, setup).expect("replay");
+    let report = replay_recording(&recording, 120, &BTreeMap::new(), setup).expect("replay");
     assert!(
         !report.diverged(),
         "first divergent tick: {:?}",

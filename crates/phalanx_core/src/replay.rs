@@ -15,11 +15,11 @@
 //! per-tick digests. Cross-platform bit-identical lockstep is a separate
 //! acceptance target and is not claimed here (ADR-0001 Decision §5).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::command::{
-    ActorId, CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
-    RequestId, SessionId,
+    ActorId, CommandEnvelope, CommandId, CommandLimits, CommandLimitsError, CommandRequest,
+    CommandSubmitError, ENVELOPE_VERSION, RequestId, SessionId,
 };
 use crate::hash::{CanonicalSerialize, Digest, DigestAlgorithm};
 use crate::rng::SEED_DERIVATION_VERSION;
@@ -27,8 +27,9 @@ use crate::simulation::{SIMULATION_SCHEMA_VERSION, SimulationRunner, SystemManif
 
 /// The replay container format version. Recorded in every replay; bump on
 /// incompatible format changes. Version 2 added the RNG seed-derivation
-/// version to the compatibility metadata (issue #47).
-pub const REPLAY_FORMAT_VERSION: u32 = 2;
+/// version (issue #47); version 3 added the explicit end tick, the recorded
+/// command limits, and named content digests (issue #52).
+pub const REPLAY_FORMAT_VERSION: u32 = 3;
 
 /// An immutable record of one deterministic simulation run.
 #[derive(Clone, Debug)]
@@ -40,8 +41,11 @@ pub struct ReplayRecording<P> {
     system_manifest: SystemManifest,
     tick_rate: TickRate,
     rng_seed: u64,
+    command_limits: CommandLimits,
+    content_digests: BTreeMap<String, Digest>,
     commands: Vec<CommandEnvelope<P>>,
     tick_hashes: Vec<Digest>,
+    end_tick: u64,
 }
 
 impl<P> ReplayRecording<P> {
@@ -58,8 +62,11 @@ impl<P> ReplayRecording<P> {
             system_manifest: SystemManifest::default(),
             tick_rate,
             rng_seed,
+            command_limits: CommandLimits::DEFAULT,
+            content_digests: BTreeMap::new(),
             commands: Vec::new(),
             tick_hashes: Vec::new(),
+            end_tick: 0,
         }
     }
 
@@ -110,6 +117,29 @@ impl<P> ReplayRecording<P> {
         self.rng_seed
     }
 
+    /// Returns the command ingress limits the recording was made with
+    /// (issue #52); replay applies them to the fresh runner.
+    #[must_use]
+    pub const fn command_limits(&self) -> &CommandLimits {
+        &self.command_limits
+    }
+
+    /// Returns the named content digests the recording requires (issue #52):
+    /// canonical digests of scenario/map/gameplay content, keyed by name. They
+    /// are content identities, not filesystem paths, so they do not depend on
+    /// machine-local layout.
+    #[must_use]
+    pub fn content_digests(&self) -> &BTreeMap<String, Digest> {
+        &self.content_digests
+    }
+
+    /// Returns the explicit final recorded tick: the number of executed ticks
+    /// (= checkpoint hash count) when the recording was finished (issue #52).
+    #[must_use]
+    pub const fn end_tick(&self) -> u64 {
+        self.end_tick
+    }
+
     /// Returns the recorded command stream in submission (command-ID) order.
     #[must_use]
     pub fn commands(&self) -> &[CommandEnvelope<P>] {
@@ -133,9 +163,17 @@ impl<P> ReplayRecording<P> {
         self.commands.push(envelope);
     }
 
-    /// Appends a per-tick state digest to the recording.
+    /// Appends a per-tick state digest to the recording. Each executed tick
+    /// advances the explicit end tick.
     pub fn push_tick_hash(&mut self, digest: Digest) {
         self.tick_hashes.push(digest);
+        self.end_tick = self.tick_hashes.len() as u64;
+    }
+
+    /// Records a required content identity (issue #52): a canonical digest of
+    /// named scenario/map/gameplay content that replay must verify.
+    pub fn push_content_digest(&mut self, name: &str, digest: Digest) {
+        self.content_digests.insert(name.to_owned(), digest);
     }
 }
 
@@ -167,6 +205,11 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
     #[must_use]
     pub const fn runner_mut(&mut self) -> &mut SimulationRunner<P> {
         &mut self.runner
+    }
+
+    /// Records a required content identity on the recording (issue #52).
+    pub fn push_content_digest(&mut self, name: &str, digest: Digest) {
+        self.recording.push_content_digest(name, digest);
     }
 
     /// Submits a command to the run and records its envelope.
@@ -226,6 +269,7 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
     pub fn finish(mut self) -> ReplayRecording<P> {
         let manifest = self.runner.finalize_registry().clone();
         self.recording.system_manifest = manifest;
+        self.recording.command_limits = *self.runner.command_limits();
         self.recording
     }
 }
@@ -324,6 +368,21 @@ pub enum ReplayError {
     /// particular a recording with zero expected hashes cannot verify any
     /// positive tick count.
     IncompleteCheckpointCoverage { recorded: usize, requested: u64 },
+    /// The recording's explicit end tick does not match its checkpoint count
+    /// (issue #52).
+    InconsistentEndTick { end_tick: u64, checkpoints: usize },
+    /// The recording requires content that the replay environment did not
+    /// provide (issue #52).
+    MissingContent { name: String },
+    /// A required content digest does not match the replay environment's
+    /// content (issue #52).
+    IncompatibleContent {
+        name: String,
+        expected: Digest,
+        found: Digest,
+    },
+    /// The recorded command limits are not valid (issue #52).
+    InvalidRecordedCommandLimits(CommandLimitsError),
     /// The replay ran out of representable ticks.
     TickOverflow,
     /// Per-tick digest recording is disabled, so no fresh state digest exists
@@ -395,6 +454,27 @@ impl std::fmt::Display for ReplayError {
                 formatter,
                 "recording has {recorded} checkpoint hashes but {requested} ticks were requested"
             ),
+            Self::InconsistentEndTick {
+                end_tick,
+                checkpoints,
+            } => write!(
+                formatter,
+                "recorded end tick {end_tick} does not match {checkpoints} checkpoint hashes"
+            ),
+            Self::MissingContent { name } => {
+                write!(formatter, "recording requires missing content: {name}")
+            }
+            Self::IncompatibleContent {
+                name,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "content {name} digest mismatch: recording requires {expected:?}, replay has {found:?}"
+            ),
+            Self::InvalidRecordedCommandLimits(error) => {
+                write!(formatter, "recorded command limits are invalid: {error}")
+            }
             Self::TickOverflow => formatter.write_str("replay tick counter overflowed"),
             Self::HashRecordingDisabled => {
                 formatter.write_str("per-tick state hash recording is disabled")
@@ -414,6 +494,7 @@ impl std::error::Error for ReplayError {}
 fn validate_recording_structure<P>(
     recording: &ReplayRecording<P>,
     ticks: u64,
+    content: &BTreeMap<String, Digest>,
 ) -> Result<(), ReplayError> {
     let mut seen_identities = BTreeSet::new();
     for (index, envelope) in recording.commands().iter().enumerate() {
@@ -455,6 +536,28 @@ fn validate_recording_structure<P>(
             requested: ticks,
         });
     }
+    // The explicit end tick must be consistent with the checkpoints (issue
+    // #52): one hash per executed tick.
+    if recording.end_tick != recorded_hashes as u64 {
+        return Err(ReplayError::InconsistentEndTick {
+            end_tick: recording.end_tick,
+            checkpoints: recorded_hashes,
+        });
+    }
+    // Required content identities must be provided and match (issue #52).
+    for (name, expected) in recording.content_digests() {
+        match content.get(name) {
+            None => return Err(ReplayError::MissingContent { name: name.clone() }),
+            Some(found) if found != expected => {
+                return Err(ReplayError::IncompatibleContent {
+                    name: name.clone(),
+                    expected: expected.clone(),
+                    found: found.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
     Ok(())
 }
 
@@ -462,13 +565,21 @@ fn validate_recording_structure<P>(
 /// ticks, registering systems through `setup`, and compares the per-tick
 /// canonical state digests against the recorded ones.
 ///
-/// The recording is validated first (issue #51), then all recorded commands
-/// are submitted up front in recorded order, mirroring how the recording was
-/// made, so command IDs and bookkeeping match exactly.
+/// `content` provides the replay environment's named content identities (map,
+/// roster, ...) as canonical digests; every content digest the recording
+/// requires must be present and match (issue #52).
+///
+/// The recording is validated first (issues #51/#52), then all recorded
+/// commands are submitted up front in recorded order, mirroring how the
+/// recording was made, so command IDs and bookkeeping match exactly. The
+/// recorded command limits are applied to the fresh runner, with the
+/// look-ahead limit relaxed to the maximum because replay submits all
+/// recorded commands at tick 0.
 #[allow(clippy::missing_panics_doc)]
 pub fn replay_recording<P: CanonicalSerialize + Clone>(
     recording: &ReplayRecording<P>,
     ticks: u64,
+    content: &BTreeMap<String, Digest>,
     setup: impl FnOnce(&mut SimulationRunner<P>),
 ) -> Result<ReplayReport, ReplayError> {
     if recording.format_version() != REPLAY_FORMAT_VERSION {
@@ -489,7 +600,7 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
             expected: SEED_DERIVATION_VERSION,
         });
     }
-    validate_recording_structure(recording, ticks)?;
+    validate_recording_structure(recording, ticks, content)?;
     let current_algorithm = DigestAlgorithm::current();
     if recording.digest_algorithm() != current_algorithm {
         return Err(ReplayError::IncompatibleDigestAlgorithm {
@@ -507,6 +618,11 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
     }
 
     let mut runner = SimulationRunner::new(recording.tick_rate(), recording.rng_seed());
+    let mut limits = *recording.command_limits();
+    limits.max_lookahead_ticks = CommandLimits::MAX_LOOKAHEAD_TICKS;
+    runner
+        .set_command_limits(limits)
+        .map_err(ReplayError::InvalidRecordedCommandLimits)?;
     setup(&mut runner);
     // The finalized system manifest is replay compatibility metadata: a
     // recording made with a different system set is rejected explicitly.
@@ -580,7 +696,7 @@ mod tests {
     #[test]
     fn same_build_replay_reproduces_per_tick_hashes() {
         let recording = record_scenario(SCENARIO_TICKS);
-        let report = replay_recording(&recording, SCENARIO_TICKS, setup_scenario)
+        let report = replay_recording(&recording, SCENARIO_TICKS, &BTreeMap::new(), setup_scenario)
             .expect("replay should succeed");
 
         assert_eq!(report.ticks_executed(), SCENARIO_TICKS);
@@ -589,7 +705,7 @@ mod tests {
         assert_eq!(report.tick_hashes(), recording.tick_hashes());
 
         // Replaying twice gives identical results.
-        let again = replay_recording(&recording, SCENARIO_TICKS, setup_scenario)
+        let again = replay_recording(&recording, SCENARIO_TICKS, &BTreeMap::new(), setup_scenario)
             .expect("second replay should succeed");
         assert_eq!(report, again);
     }
@@ -609,7 +725,7 @@ mod tests {
         let mut recording = record_scenario(4);
         recording.format_version = REPLAY_FORMAT_VERSION + 1;
         assert_eq!(
-            replay_recording(&recording, 4, setup_scenario),
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::UnsupportedFormatVersion {
                 found: REPLAY_FORMAT_VERSION + 1,
                 expected: REPLAY_FORMAT_VERSION
@@ -623,7 +739,7 @@ mod tests {
         recording.simulation_version = SIMULATION_SCHEMA_VERSION + 1;
         // The rejection must happen before the replay runner is even
         // constructed: the setup closure panics if it is ever called.
-        let result = replay_recording(&recording, 4, |_| {
+        let result = replay_recording(&recording, 4, &BTreeMap::new(), |_| {
             panic!("unsupported simulation version must be rejected before setup")
         });
         assert_eq!(
@@ -635,8 +751,8 @@ mod tests {
         );
         // An unmodified recording still replays and verifies.
         let recording = record_scenario(4);
-        let report =
-            replay_recording(&recording, 4, setup_scenario).expect("valid recording replays");
+        let report = replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario)
+            .expect("valid recording replays");
         assert!(!report.diverged());
         assert_eq!(report.tick_hashes(), recording.tick_hashes());
     }
@@ -683,13 +799,90 @@ mod tests {
     }
 
     #[test]
+    fn replay_metadata_includes_end_tick_limits_and_content() {
+        let recording = record_scenario(4);
+        assert_eq!(recording.end_tick(), 4);
+        assert_eq!(recording.end_tick(), recording.tick_hashes().len() as u64);
+        assert_eq!(recording.command_limits(), &CommandLimits::DEFAULT);
+        assert!(recording.content_digests().is_empty());
+
+        // Inconsistent end tick is rejected before playback (issue #52).
+        let mut recording = record_scenario(4);
+        recording.end_tick = 99;
+        assert_eq!(
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
+            Err(ReplayError::InconsistentEndTick {
+                end_tick: 99,
+                checkpoints: 4
+            })
+        );
+    }
+
+    #[test]
+    fn required_content_identities_are_validated_before_playback() {
+        let mut recorder = ReplayRecorder::new(TickRate::DEFAULT, 0x00C0_FFEE);
+        setup_scenario(recorder.runner_mut());
+        let map_digest = crate::hash::canonical_digest(&"crossing-map-bytes".to_owned());
+        recorder.push_content_digest("map", map_digest.clone());
+        recorder.advance_ticks(2).expect("ticks");
+        let recording = recorder.finish();
+        assert_eq!(recording.content_digests().get("map"), Some(&map_digest));
+
+        // Missing content is rejected.
+        assert_eq!(
+            replay_recording(&recording, 2, &BTreeMap::new(), setup_scenario),
+            Err(ReplayError::MissingContent {
+                name: "map".to_owned()
+            })
+        );
+        // A different content digest is rejected.
+        let wrong = BTreeMap::from([(
+            "map".to_owned(),
+            crate::hash::canonical_digest(&"other".to_owned()),
+        )]);
+        assert_eq!(
+            replay_recording(&recording, 2, &wrong, setup_scenario),
+            Err(ReplayError::IncompatibleContent {
+                name: "map".to_owned(),
+                expected: map_digest.clone(),
+                found: crate::hash::canonical_digest(&"other".to_owned()),
+            })
+        );
+        // The matching content replays and verifies.
+        let right = BTreeMap::from([("map".to_owned(), map_digest)]);
+        let report =
+            replay_recording(&recording, 2, &right, setup_scenario).expect("replay succeeds");
+        assert!(!report.diverged());
+    }
+
+    #[test]
+    fn recorded_command_limits_are_applied_to_the_replay_runner() {
+        let limits = CommandLimits {
+            max_lookahead_ticks: 50,
+            ..CommandLimits::DEFAULT
+        };
+        let mut recorder = ReplayRecorder::new(TickRate::DEFAULT, 0x00C0_FFEE);
+        recorder
+            .runner_mut()
+            .set_command_limits(limits)
+            .expect("valid limits");
+        setup_scenario(recorder.runner_mut());
+        recorder.advance_ticks(2).expect("ticks");
+        let recording = recorder.finish();
+        assert_eq!(recording.command_limits(), &limits);
+        let report =
+            replay_recording(&recording, 2, &BTreeMap::new(), setup_scenario).expect("replay");
+        assert!(!report.diverged());
+    }
+
+    #[test]
     fn malformed_recorded_commands_are_rejected_before_playback() {
         // Duplicate request identity (same actor+session+request id).
         let mut recording = record_scenario(4);
         let dup = recording.commands()[0].clone();
         recording.commands_mut()[1] = dup;
         assert_eq!(
-            replay_recording(&recording, 4, setup_scenario),
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::DuplicateRecordedRequest {
                 index: 1,
                 actor: ActorId(0),
@@ -713,7 +906,7 @@ mod tests {
         )
         .expect("current version");
         assert_eq!(
-            replay_recording(&recording, 4, setup_scenario),
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::InvalidRecordedCommandIdSequence {
                 index: 1,
                 found: CommandId(5),
@@ -736,7 +929,7 @@ mod tests {
         )
         .expect("current version");
         assert_eq!(
-            replay_recording(&recording, 4, setup_scenario),
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::InvalidRecordedCommandTick { index: 0, tick: 0 })
         );
     }
@@ -746,7 +939,7 @@ mod tests {
         // Overlong request: more ticks than recorded hashes.
         let recording = record_scenario(4);
         assert_eq!(
-            replay_recording(&recording, 5, setup_scenario),
+            replay_recording(&recording, 5, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::IncompleteCheckpointCoverage {
                 recorded: 4,
                 requested: 5
@@ -757,14 +950,15 @@ mod tests {
         let empty = record_scenario(0);
         assert!(empty.tick_hashes().is_empty());
         assert_eq!(
-            replay_recording(&empty, 3, setup_scenario),
+            replay_recording(&empty, 3, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::IncompleteCheckpointCoverage {
                 recorded: 0,
                 requested: 3
             })
         );
         // A truncated replay (fewer ticks than recorded) still verifies fine.
-        let report = replay_recording(&recording, 2, setup_scenario).expect("partial replay ok");
+        let report = replay_recording(&recording, 2, &BTreeMap::new(), setup_scenario)
+            .expect("partial replay ok");
         assert!(!report.diverged());
         assert_eq!(report.ticks_executed(), 2);
     }
@@ -778,7 +972,7 @@ mod tests {
         );
         recording.rng_derivation_version = crate::rng::SEED_DERIVATION_VERSION + 1;
         assert_eq!(
-            replay_recording(&recording, 4, setup_scenario),
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::IncompatibleRngDerivationVersion {
                 found: crate::rng::SEED_DERIVATION_VERSION + 1,
                 expected: crate::rng::SEED_DERIVATION_VERSION
@@ -808,7 +1002,8 @@ mod tests {
         recorder.advance_ticks(3).expect("ticks");
         let recording = recorder.finish();
 
-        let report = replay_recording(&recording, 3, setup).expect("replay should succeed");
+        let report = replay_recording(&recording, 3, &BTreeMap::new(), setup)
+            .expect("replay should succeed");
         assert!(!report.diverged(), "rejected commands replay identically");
         assert_eq!(report.tick_hashes(), recording.tick_hashes());
     }
@@ -835,7 +1030,7 @@ mod tests {
         // The pending command queue is authoritative input state and is part
         // of the canonical digest from submission, so the altered command
         // diverges the state already at tick 1.
-        let report = replay_recording(&recording, SCENARIO_TICKS, setup_scenario)
+        let report = replay_recording(&recording, SCENARIO_TICKS, &BTreeMap::new(), setup_scenario)
             .expect("replay should succeed");
         assert!(report.diverged());
         assert_eq!(report.first_divergent_tick(), Some(1));
@@ -852,7 +1047,7 @@ mod tests {
         // compared against this build's digests and is rejected explicitly.
         recording.digest_algorithm = crate::hash::DigestAlgorithm::Fnv1a32;
         assert_eq!(
-            replay_recording(&recording, 4, setup_scenario),
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
             Err(ReplayError::IncompatibleDigestAlgorithm {
                 expected: crate::hash::DigestAlgorithm::Fnv1a64,
                 found: crate::hash::DigestAlgorithm::Fnv1a32,
@@ -864,7 +1059,7 @@ mod tests {
     fn altered_rng_seed_diverges_at_the_first_rng_tick() {
         let mut recording = record_scenario(SCENARIO_TICKS);
         recording.rng_seed = recording.rng_seed().wrapping_add(1);
-        let report = replay_recording(&recording, SCENARIO_TICKS, setup_scenario)
+        let report = replay_recording(&recording, SCENARIO_TICKS, &BTreeMap::new(), setup_scenario)
             .expect("replay should succeed");
         assert_eq!(report.first_divergent_tick(), Some(1));
     }
@@ -896,7 +1091,7 @@ mod tests {
 
         // Replay side: same guard.
         let recording = record_scenario(4);
-        let result = replay_recording(&recording, 4, |runner| {
+        let result = replay_recording(&recording, 4, &BTreeMap::new(), |runner| {
             setup_scenario(runner);
             runner.set_record_hashes(false);
         });
@@ -909,13 +1104,14 @@ mod tests {
         assert!(!recording.system_manifest().is_empty());
         // Replaying with a different (empty) system set must be rejected
         // explicitly, not silently replayed against different behavior.
-        let result = replay_recording(&recording, 4, |_| {});
+        let result = replay_recording(&recording, 4, &BTreeMap::new(), |_| {});
         assert!(matches!(
             result,
             Err(ReplayError::IncompatibleSystemManifest { .. })
         ));
         // The matching setup is accepted (covered by the other tests).
-        let report = replay_recording(&recording, 4, setup_scenario).expect("matching manifest");
+        let report = replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario)
+            .expect("matching manifest");
         assert!(!report.diverged());
     }
 
@@ -926,8 +1122,13 @@ mod tests {
         // tick is verified against the recording; overlong requests are
         // rejected with a structured error instead (see
         // incomplete_checkpoint_coverage_is_rejected).
-        let report = replay_recording(&recording, SCENARIO_TICKS / 2, setup_scenario)
-            .expect("replay should succeed");
+        let report = replay_recording(
+            &recording,
+            SCENARIO_TICKS / 2,
+            &BTreeMap::new(),
+            setup_scenario,
+        )
+        .expect("replay should succeed");
         assert_eq!(report.ticks_executed(), SCENARIO_TICKS / 2);
         assert_eq!(report.first_divergent_tick(), None);
         assert_eq!(

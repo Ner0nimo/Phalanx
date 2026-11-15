@@ -6,8 +6,11 @@
 //! two independent runs are bit-identical, and a snapshot/restore round trip
 //! continues the run identically (canonical system-state hooks, issue #34).
 
+use std::collections::BTreeMap;
+
 use phalanx_core::command::{CommandEnvelope, CommandPayload, ENVELOPE_VERSION};
 use phalanx_core::entity::EntityId;
+use phalanx_core::hash::canonical_digest;
 use phalanx_core::replay::{ReplayRecorder, ReplayRecording, replay_recording};
 use phalanx_core::simulation::{SimulationRunner, TickRate};
 use phalanx_game::events::BattleEvent;
@@ -15,6 +18,7 @@ use phalanx_game::scenario::{
     SCENARIO_SEED, TEAM_A, TEAM_B, crossing_assault_commands, setup_battle, spawn_team,
 };
 use phalanx_game::{SharedBattleWorld, slice_roster};
+use phalanx_navigation::crossing_map;
 
 /// Acceptance budget from the spec §8: the match ends no later than tick 2000.
 const MAX_TICKS: u64 = 2000;
@@ -32,8 +36,18 @@ struct Assault {
 /// Records the scripted scenario: spawn both teams, submit all twelve
 /// commands for tick 1, then advance until `MatchOver` (bounded by
 /// `MAX_TICKS`).
+fn assault_content() -> BTreeMap<String, phalanx_core::hash::Digest> {
+    BTreeMap::from([
+        ("map".to_owned(), canonical_digest(&crossing_map())),
+        ("roster".to_owned(), slice_roster().digest()),
+    ])
+}
+
 fn record_assault() -> Assault {
     let mut recorder = ReplayRecorder::new(TickRate::DEFAULT, SCENARIO_SEED);
+    for (name, digest) in assault_content() {
+        recorder.push_content_digest(&name, digest);
+    }
     let world = setup_battle(recorder.runner_mut());
     let ids_a = spawn_team(
         recorder.runner_mut().simulation_mut(),
@@ -140,8 +154,13 @@ fn crossing_assault_team_a_wins_within_2000_ticks() {
 #[test]
 fn replay_reproduces_identical_per_tick_hashes() {
     let assault = record_assault();
-    let report =
-        replay_recording(&assault.recording, assault.ticks, replay_setup).expect("replay succeeds");
+    let report = replay_recording(
+        &assault.recording,
+        assault.ticks,
+        &assault_content(),
+        replay_setup,
+    )
+    .expect("replay succeeds");
     assert_eq!(report.ticks_executed(), assault.ticks);
     assert_eq!(
         report.first_divergent_tick(),
@@ -171,13 +190,41 @@ fn an_altered_command_diverges_at_its_target_tick() {
     )
     .expect("current envelope version");
 
-    let report = replay_recording(&altered, assault.ticks, replay_setup).expect("replay succeeds");
+    let report = replay_recording(&altered, assault.ticks, &assault_content(), replay_setup)
+        .expect("replay succeeds");
     assert!(report.diverged(), "altering one command must be detected");
     assert_eq!(
         report.first_divergent_tick(),
         Some(1),
         "the pending command queue is authoritative state from submission"
     );
+}
+
+#[test]
+fn replay_rejects_missing_or_mismatched_content_identity() {
+    let assault = record_assault();
+    assert!(assault.recording.content_digests().contains_key("map"));
+    assert!(assault.recording.content_digests().contains_key("roster"));
+    // Missing content is rejected before any tick is executed.
+    assert!(matches!(
+        replay_recording(
+            &assault.recording,
+            assault.ticks,
+            &BTreeMap::new(),
+            replay_setup
+        ),
+        Err(phalanx_core::replay::ReplayError::MissingContent { .. })
+    ));
+    // A mismatched digest is rejected too.
+    let mut wrong = assault_content();
+    wrong.insert(
+        "roster".to_owned(),
+        phalanx_core::hash::canonical_digest(&"other".to_owned()),
+    );
+    assert!(matches!(
+        replay_recording(&assault.recording, assault.ticks, &wrong, replay_setup),
+        Err(phalanx_core::replay::ReplayError::IncompatibleContent { .. })
+    ));
 }
 
 #[test]
