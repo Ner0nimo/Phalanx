@@ -1211,6 +1211,7 @@ version = "0.1.0"
 dependencies = [
  "phalanx_core",
  "phalanx_navigation",
+ "phalanx_render",
 ]
 
 [[package]]
@@ -1234,6 +1235,8 @@ name = "phalanx_runtime"
 version = "0.1.0"
 dependencies = [
  "phalanx_core",
+ "phalanx_game",
+ "phalanx_navigation",
  "phalanx_render",
 ]
 

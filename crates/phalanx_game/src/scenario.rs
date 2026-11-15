@@ -26,6 +26,11 @@ pub const SCENARIO_PLANNER_BUDGET: u32 = 64;
 /// Units per team: 3 strikers + 3 skirmishers (spec §3).
 pub const UNITS_PER_TEAM: usize = 6;
 
+/// Team A spawn pad center (spec §8): (20, 100) on the Crossing map.
+pub const SPAWN_PAD_A: (f32, f32) = (20.0, 100.0);
+/// Team B spawn pad center (spec §8): (180, 100) on the Crossing map.
+pub const SPAWN_PAD_B: (f32, f32) = (180.0, 100.0);
+
 /// Builds the battle world over the Crossing map with the slice roster.
 #[must_use]
 pub fn battle_world() -> BattleWorld {

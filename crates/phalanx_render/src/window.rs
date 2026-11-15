@@ -1,6 +1,8 @@
 //! The windowed graphical frame loop (issue #61): a native `winit` window
-//! presenting a continuously rendered clear-color frame through a wgpu
-//! surface.
+//! presenting continuously rendered frames through a wgpu surface. The frame
+//! contents come from a caller-provided callback ([`run_windowed_with`]): the
+//! demo debug scene via [`run_windowed`], or the actual simulation snapshot in
+//! battle mode (issue #63).
 //!
 //! Behavior contract:
 //! - adapter name/backend/driver are logged at startup (plus OS/arch/build
@@ -71,14 +73,42 @@ impl From<crate::BackendError> for RenderError {
     }
 }
 
-/// Runs the windowed presentation loop until the window is closed: a native
-/// window showing a continuously presented clear-color frame.
+/// A frame callback: renders one frame into `view` (the current surface
+/// texture view), given the device, queue, debug pipeline, and the view
+/// aspect (width/height). The app handles surface acquisition, presentation,
+/// resize, and exit; the callback owns what is drawn.
+pub type FrameCallback =
+    dyn FnMut(&wgpu::Device, &wgpu::Queue, &mut DebugPipeline, &wgpu::TextureView, f32);
+
+/// Runs the windowed presentation loop until the window is closed, drawing
+/// the demo debug scene (issue #62) over a clear-color background.
 pub fn run_windowed(clear: ClearColor, title: &str) -> Result<(), RenderError> {
+    run_windowed_with(title, move |device, queue, pipeline, view, aspect| {
+        let projection = OrthoProjection::CROSSING_VIEW.for_aspect(aspect);
+        pipeline.render(
+            device,
+            queue,
+            view,
+            clear.to_wgpu(),
+            &projection,
+            &demo_shapes(),
+        );
+    })
+}
+
+/// Runs the windowed presentation loop until the window is closed, calling
+/// `frame` for every redraw with the current surface view (issue #63: the
+/// runtime passes a callback that steps the simulation and renders the
+/// extracted snapshot).
+pub fn run_windowed_with<F>(title: &str, frame: F) -> Result<(), RenderError>
+where
+    F: FnMut(&wgpu::Device, &wgpu::Queue, &mut DebugPipeline, &wgpu::TextureView, f32) + 'static,
+{
     let event_loop = EventLoop::new().map_err(|error| RenderError::EventLoop(error.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = ClearApp {
-        clear,
+    let mut app = FrameApp {
         title: title.to_owned(),
+        frame: Box::new(frame),
         state: None,
         fatal: None,
     };
@@ -99,14 +129,14 @@ struct WindowState {
     pipeline: DebugPipeline,
 }
 
-struct ClearApp {
-    clear: ClearColor,
+struct FrameApp {
     title: String,
+    frame: Box<FrameCallback>,
     state: Option<WindowState>,
     fatal: Option<RenderError>,
 }
 
-impl ClearApp {
+impl FrameApp {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: RenderError) {
         eprintln!("error: {error}");
         self.fatal = Some(error);
@@ -114,7 +144,7 @@ impl ClearApp {
     }
 }
 
-impl ApplicationHandler for ClearApp {
+impl ApplicationHandler for FrameApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -217,18 +247,18 @@ impl ApplicationHandler for ClearApp {
                         let view = frame
                             .texture
                             .create_view(&wgpu::TextureViewDescriptor::default());
-                        // Debug geometry over the clear color (issue #62). The
-                        // projection is recomputed per frame from the current
+                        // The caller's frame callback draws the scene (demo
+                        // debug geometry in `run_windowed`, the actual
+                        // simulation snapshot in battle mode, issue #63). The
+                        // aspect is recomputed per frame from the current
                         // surface size, so resizing keeps geometry in place.
                         let aspect = state.config.width as f32 / state.config.height.max(1) as f32;
-                        let projection = OrthoProjection::CROSSING_VIEW.for_aspect(aspect);
-                        state.pipeline.render(
+                        (self.frame)(
                             &state.backend.device,
                             &state.backend.queue,
+                            &mut state.pipeline,
                             &view,
-                            self.clear.to_wgpu(),
-                            &projection,
-                            &demo_shapes(),
+                            aspect,
                         );
                         state.backend.queue.present(frame);
                         // Continuously present frames.
