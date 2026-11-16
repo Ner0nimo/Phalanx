@@ -275,7 +275,16 @@ pub struct Simulation<P> {
     rng: RngStreams,
     entities: EntityAllocator,
     pending_commands: BTreeMap<u64, Vec<CommandEnvelope<P>>>,
-    current_tick_commands: Vec<CommandEnvelope<P>>,
+    /// Durable transcript of commands applied at tick boundaries, in
+    /// application order (ascending command ID within each tick). Part of the
+    /// canonical state.
+    applied_commands: Vec<CommandEnvelope<P>>,
+    /// Transient view of the commands being applied on the tick currently
+    /// executing: a range into `applied_commands`. Rebuilt from the pending
+    /// queue at each tick boundary and never part of the canonical encoding,
+    /// so a recorded per-tick checkpoint digest equals the public digest once
+    /// `step_tick` returns (issue #38).
+    current_tick_commands: std::ops::Range<usize>,
     seen_requests: BTreeMap<crate::command::RequestId, CommandId>,
     next_command_id: u64,
 }
@@ -290,7 +299,8 @@ impl<P> Simulation<P> {
             rng: RngStreams::new(rng_seed),
             entities: EntityAllocator::new(),
             pending_commands: BTreeMap::new(),
-            current_tick_commands: Vec::new(),
+            applied_commands: Vec::new(),
+            current_tick_commands: 0..0,
             seen_requests: BTreeMap::new(),
             next_command_id: 0,
         }
@@ -333,7 +343,15 @@ impl<P> Simulation<P> {
     /// the tick boundary and are only visible while that tick runs.
     #[must_use]
     pub fn commands_for_current_tick(&self) -> &[CommandEnvelope<P>] {
-        &self.current_tick_commands
+        &self.applied_commands[self.current_tick_commands.clone()]
+    }
+
+    /// Returns the durable transcript of commands applied at tick boundaries,
+    /// in application order. This is authoritative input history and is part
+    /// of the canonical state.
+    #[must_use]
+    pub fn applied_commands(&self) -> &[CommandEnvelope<P>] {
+        &self.applied_commands
     }
 
     /// Returns the ticks that still have queued commands, in ascending order.
@@ -348,11 +366,15 @@ impl<P> Simulation<P> {
 /// Decision §8, `RtsEngineDoc.md` §13.3, encoding contract in
 /// [`crate::hash`]). Covers the encoding and schema versions, tick, entity
 /// allocator, RNG stream states, the full command bookkeeping (pending queue,
-/// applied commands, accepted requests, command-ID sequence) — the pending
-/// queue is authoritative input state and is hashed from submission. Ordering
-/// is stable and logical (slot index, stream name, tick, command ID) and never
-/// depends on storage layout. Renderer/GPU state and wall-clock data cannot
-/// enter because the authoritative types do not contain them.
+/// durable applied-command transcript, accepted requests, command-ID
+/// sequence) — the pending queue is authoritative input state and is hashed
+/// from submission. The transient current-tick command view is excluded: it
+/// is rebuilt from the pending queue at each tick boundary, so a recorded
+/// per-tick checkpoint digest equals the public digest after the tick
+/// (issue #38). Ordering is stable and logical (slot index, stream name, tick,
+/// command ID) and never depends on storage layout. Renderer/GPU state and
+/// wall-clock data cannot enter because the authoritative types do not
+/// contain them.
 impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u32(CANONICAL_ENCODING_VERSION);
@@ -361,7 +383,7 @@ impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
         self.entities.write_canonical(sink);
         self.rng.write_canonical(sink);
         self.pending_commands.write_canonical(sink);
-        self.current_tick_commands.write_canonical(sink);
+        self.applied_commands.write_canonical(sink);
         self.seen_requests.write_canonical(sink);
         sink.write_u64(self.next_command_id);
     }
@@ -388,7 +410,8 @@ impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
             entities: CanonicalDecode::read_canonical(reader)?,
             rng: CanonicalDecode::read_canonical(reader)?,
             pending_commands: CanonicalDecode::read_canonical(reader)?,
-            current_tick_commands: CanonicalDecode::read_canonical(reader)?,
+            applied_commands: CanonicalDecode::read_canonical(reader)?,
+            current_tick_commands: 0..0,
             seen_requests: CanonicalDecode::read_canonical(reader)?,
             next_command_id: reader.read_u64()?,
         })
@@ -869,9 +892,13 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             .pending_commands
             .remove(&next_tick)
             .unwrap_or_default();
-        // Deterministic same-tick ordering: ascending command ID.
+        // Deterministic same-tick ordering: ascending command ID. The drained
+        // commands join the durable applied transcript; the current-tick view
+        // is just a range into it.
         commands.sort_by_key(|envelope| envelope.command_id());
-        self.simulation.current_tick_commands = commands;
+        let start = self.simulation.applied_commands.len();
+        self.simulation.applied_commands.append(&mut commands);
+        self.simulation.current_tick_commands = start..self.simulation.applied_commands.len();
 
         let SimulationRunner {
             simulation,
@@ -889,12 +916,14 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         }
 
         // Phase 15 (produce state hash): checkpoint digest after all phases
-        // ran, while the tick's applied commands are still visible. It covers
-        // the simulation and every registered system's canonical state.
+        // ran. The transient current-tick command view is not canonical state,
+        // so this digest equals the public checkpoint digest once step_tick
+        // returns, even on ticks that applied commands. It covers the
+        // simulation and every registered system's canonical state.
         if *record_hashes {
             hashes.push(checkpoint_digest(simulation, systems));
         }
-        simulation.current_tick_commands.clear();
+        simulation.current_tick_commands = 0..0;
         Ok(())
     }
 
@@ -914,7 +943,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::command::{ActorId, RequestId};
+    use crate::command::{ActorId, CommandId, RequestId};
 
     type Trace = Rc<RefCell<Vec<(u64, Phase, &'static str)>>>;
     type IngestCounts = Rc<RefCell<Vec<(u64, usize)>>>;
@@ -1504,6 +1533,51 @@ mod tests {
         // The system state is included: the checkpoint digest differs from
         // the simulation-only digest once the system has state.
         assert_ne!(a.canonical_digest(), a.simulation().canonical_digest());
+    }
+
+    #[test]
+    fn recorded_tick_hash_equals_public_checkpoint_digest_on_command_ticks() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner
+            .register_system(Noop {
+                id: "noop",
+                phase: Phase::ApplyCommands,
+                order: 0,
+            })
+            .expect("id");
+        runner.submit_command(request(1, 1, 10)).expect("tick 1");
+        runner.submit_command(request(2, 3, 30)).expect("tick 3");
+        for expected_tick in 1..=3_u64 {
+            runner.step_tick().expect("tick");
+            assert_eq!(runner.simulation().tick(), expected_tick);
+            assert_eq!(
+                runner.tick_hashes().last(),
+                Some(&runner.canonical_digest()),
+                "recorded per-tick digest equals the public checkpoint digest after tick {expected_tick}"
+            );
+        }
+        // The applied-command transcript is durable, explicit canonical state.
+        let applied = runner.simulation().applied_commands();
+        assert_eq!(applied.len(), 2);
+        assert_eq!(applied[0].command_id(), CommandId(0));
+        assert_eq!(applied[0].tick(), 1);
+        assert_eq!(applied[1].command_id(), CommandId(1));
+        assert_eq!(applied[1].tick(), 3);
+    }
+
+    #[test]
+    fn transient_current_tick_view_is_not_part_of_the_canonical_digest() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner.submit_command(request(1, 1, 10)).expect("tick 1");
+        runner.step_tick().expect("tick");
+        let digest = runner.simulation().canonical_digest();
+        // Populating or clearing the transient view must not change the
+        // canonical digest.
+        runner.simulation_mut().current_tick_commands = 0..1;
+        assert_eq!(runner.simulation().commands_for_current_tick().len(), 1);
+        assert_eq!(runner.simulation().canonical_digest(), digest);
+        runner.simulation_mut().current_tick_commands = 0..0;
+        assert_eq!(runner.simulation().canonical_digest(), digest);
     }
 
     #[test]
