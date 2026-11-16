@@ -581,6 +581,8 @@ Rendering must be optional for headless simulation. Renderer initialization fail
 
 **Graphical runtime (issue #61, implemented):** `phalanx_runtime --graphical` opens a native `winit` window and presents continuously rendered wgpu frames (configurable clear color via `--clear RRGGBB`), with surface configuration from advertised capabilities, resize reconfiguration, and Lost/Outdated/Timeout/Occluded handling; adapter name/backend/driver/OS/build are logged at startup. `--graphical --offscreen` renders frames to an offscreen texture and verifies the readback pixels, so the full encode/submit/readback path is CI-verifiable without a display; on GPU-less machines it exits 0 with a structured no-adapter result. `--headless` is unchanged and never initializes graphics. The presentation path lives in `phalanx_render` and never touches authoritative simulation state.
 
+**Debug geometry (issue #62, implemented):** `phalanx_render::geometry` provides a real wgpu render pipeline with WGSL vertex+fragment shaders, a `Vertex { position: vec2, color: vec4 }` format, and `DebugShape::{Triangle, Rect}` drawn in one draw call per frame (multiple differently-colored objects), over a configurable background. `OrthoProjection` maps the 200x200 m battlefield (x right, z down) to clip space and is recomputed per frame from the view aspect, so geometry stays correctly positioned on resize. Offscreen verification renders the demo shapes and checks the readback contains the background plus every shape color — GPU-generated pixels only, no CPU framebuffer blitting.
+
 ---
 
 ## 12. Agent/editor command API

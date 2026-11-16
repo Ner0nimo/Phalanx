@@ -337,6 +337,58 @@ pub fn verify_clear_pixels(
     Ok(())
 }
 
+/// Verifies that every pixel of an RGBA8 readback is either the clear color
+/// or one of the given shape colors (per-channel tolerance 1 for unorm
+/// rounding). Used to prove a frame contains GPU-rendered geometry over the
+/// background and nothing else (issue #62).
+pub fn verify_clear_pixels_background(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    clear: ClearColor,
+    shapes: &[crate::geometry::DebugShape],
+) -> Result<(), PresentError> {
+    let mut allowed: Vec<[f32; 4]> = vec![[
+        clear.0[0] as f32,
+        clear.0[1] as f32,
+        clear.0[2] as f32,
+        clear.0[3] as f32,
+    ]];
+    allowed.extend(shapes.iter().map(|shape| shape.color()));
+    let matches = |pixel: [u8; 4], color: [f32; 4]| {
+        let expected = [
+            (color[0] * 255.0).round() as i32,
+            (color[1] * 255.0).round() as i32,
+            (color[2] * 255.0).round() as i32,
+            255,
+        ];
+        let found = [
+            pixel[0] as i32,
+            pixel[1] as i32,
+            pixel[2] as i32,
+            pixel[3] as i32,
+        ];
+        (0..4).all(|c| (found[c] - expected[c]).abs() <= 1)
+    };
+    for (index, chunk) in pixels.chunks_exact(4).enumerate() {
+        let pixel = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        if !allowed.iter().any(|color| matches(pixel, *color)) {
+            return Err(PresentError::PixelMismatch {
+                pixel: index,
+                expected: [
+                    (clear.0[0] * 255.0).round() as u8,
+                    (clear.0[1] * 255.0).round() as u8,
+                    (clear.0[2] * 255.0).round() as u8,
+                    255,
+                ],
+                found: pixel,
+            });
+        }
+    }
+    let _ = (width, height);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
