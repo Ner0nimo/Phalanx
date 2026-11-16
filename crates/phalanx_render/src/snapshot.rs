@@ -39,6 +39,14 @@ pub struct RenderEntity {
     pub category: EntityCategory,
     /// Collision/render radius in meters.
     pub radius_m: f32,
+    /// Current health (for HUD health bars, issue #92).
+    pub health: u32,
+    /// Maximum health (for HUD health bars, issue #92).
+    pub max_health: u32,
+    /// Whether this entity is currently selected by the player (issue #90).
+    pub selected: bool,
+    /// The entity's current move destination, if any (for order markers, issue #92).
+    pub move_destination: Option<[f32; 2]>,
 }
 
 /// A static obstacle as a rectangle in render world coordinates.
@@ -80,6 +88,84 @@ impl RenderSnapshot {
             half_size: [entity.radius_m.max(0.5), entity.radius_m.max(0.5)],
             color: team_color(entity.team),
         }));
+        shapes
+    }
+
+    /// Converts the snapshot to shapes including HUD elements (issue #92):
+    /// health bars above each unit, selection rings around selected units,
+    /// and order-marker lines toward move destinations.
+    ///
+    /// `view_height_m` is the world-space height of the current camera view;
+    /// it scales HUD element sizes so they stay readable at any zoom level.
+    #[must_use]
+    pub fn shapes_with_hud(&self, view_height_m: f32) -> Vec<DebugShape> {
+        let mut shapes = self.shapes();
+        // HUD scale: health bars and rings sized relative to the visible height.
+        let bar_height = (view_height_m * 0.015).max(0.3);
+        let bar_width = (view_height_m * 0.04).max(1.0);
+        let ring_extra = (view_height_m * 0.008).max(0.2);
+        let line_thickness = (view_height_m * 0.004).max(0.1);
+
+        for entity in &self.entities {
+            let [x, z] = entity.position;
+            let r = entity.radius_m.max(0.5);
+
+            // Health bar: background (dark) + foreground (green/yellow/red).
+            let bar_z = z - r - bar_height;
+            let frac = if entity.max_health > 0 {
+                entity.health as f32 / entity.max_health as f32
+            } else {
+                0.0
+            };
+            let health_color = if frac > 0.5 {
+                [0.2, 0.8, 0.2, 1.0]
+            } else if frac > 0.25 {
+                [0.9, 0.7, 0.1, 1.0]
+            } else {
+                [0.9, 0.2, 0.2, 1.0]
+            };
+            // Background bar (full width, dark).
+            shapes.push(DebugShape::Rect {
+                center: [x, bar_z],
+                half_size: [bar_width * 0.5, bar_height * 0.5],
+                color: [0.1, 0.1, 0.1, 0.8],
+            });
+            // Foreground bar (proportional to health).
+            let fg_width = bar_width * frac;
+            if fg_width > 0.0 {
+                shapes.push(DebugShape::Rect {
+                    center: [x - bar_width * 0.5 + fg_width * 0.5, bar_z],
+                    half_size: [fg_width * 0.5, bar_height * 0.5],
+                    color: health_color,
+                });
+            }
+
+            // Selection ring: a slightly larger rect outline (rendered as a
+            // thin rect ring using two nested rects — outer white, inner team color).
+            if entity.selected {
+                shapes.push(DebugShape::Rect {
+                    center: [x, z],
+                    half_size: [r + ring_extra, r + ring_extra],
+                    color: [1.0, 1.0, 1.0, 0.9],
+                });
+                // Re-draw the unit on top so the ring appears as an outline.
+                shapes.push(DebugShape::Rect {
+                    center: [x, z],
+                    half_size: [r, r],
+                    color: team_color(entity.team),
+                });
+            }
+
+            // Order marker: a line from the unit toward its move destination.
+            if let Some(dest) = entity.move_destination {
+                shapes.push(DebugShape::Line {
+                    from: [x, z],
+                    to: dest,
+                    thickness: line_thickness,
+                    color: [1.0, 1.0, 0.4, 0.6],
+                });
+            }
+        }
         shapes
     }
 }
@@ -134,6 +220,10 @@ mod tests {
                     team: 1,
                     category: EntityCategory::Unit,
                     radius_m: 0.5,
+                    health: 100,
+                    max_health: 100,
+                    selected: false,
+                    move_destination: None,
                 },
                 RenderEntity {
                     entity_index: 6,
@@ -141,6 +231,10 @@ mod tests {
                     team: 2,
                     category: EntityCategory::Unit,
                     radius_m: 0.5,
+                    health: 30,
+                    max_health: 60,
+                    selected: true,
+                    move_destination: Some([100.0, 100.0]),
                 },
             ],
             obstacles: vec![ObstacleShape {
@@ -174,5 +268,70 @@ mod tests {
         }
         // Render space conversion is the documented identity mapping.
         assert_eq!(RenderSpace::from_world(3.0, -4.0), [3.0, -4.0]);
+    }
+
+    #[test]
+    fn shapes_with_hud_adds_health_bars_selection_rings_and_order_markers() {
+        let snapshot = RenderSnapshot {
+            tick: 1,
+            entities: vec![
+                RenderEntity {
+                    entity_index: 0,
+                    position: [50.0, 50.0],
+                    team: 1,
+                    category: EntityCategory::Unit,
+                    radius_m: 0.5,
+                    health: 100,
+                    max_health: 100,
+                    selected: true,
+                    move_destination: Some([100.0, 100.0]),
+                },
+                RenderEntity {
+                    entity_index: 1,
+                    position: [60.0, 60.0],
+                    team: 2,
+                    category: EntityCategory::Unit,
+                    radius_m: 0.5,
+                    health: 15,
+                    max_health: 60,
+                    selected: false,
+                    move_destination: None,
+                },
+            ],
+            obstacles: vec![],
+        };
+        let plain = snapshot.shapes();
+        assert_eq!(plain.len(), 2, "just the two unit rects");
+
+        let hud = snapshot.shapes_with_hud(200.0);
+        // Per selected unit: base rect + ring outer + ring inner + health bg
+        // + health fg + order line = 6. Per unselected unit: base rect +
+        // health bg + health fg = 3. Total = 9.
+        assert_eq!(hud.len(), 9, "HUD shapes added for selected + unselected");
+
+        // The order marker is a Line from the unit toward its destination.
+        let lines: Vec<_> = hud
+            .iter()
+            .filter_map(|s| match s {
+                DebugShape::Line { from, to, .. } => Some((*from, *to)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, [50.0, 50.0]);
+        assert_eq!(lines[0].1, [100.0, 100.0]);
+
+        // Low-health unit gets a red health bar.
+        let red = [0.9, 0.2, 0.2, 1.0];
+        assert!(
+            hud.iter().any(|s| s.color() == red),
+            "low-health unit should have a red health bar"
+        );
+        // Full-health unit gets a green health bar.
+        let green = [0.2, 0.8, 0.2, 1.0];
+        assert!(
+            hud.iter().any(|s| s.color() == green),
+            "full-health unit should have a green health bar"
+        );
     }
 }

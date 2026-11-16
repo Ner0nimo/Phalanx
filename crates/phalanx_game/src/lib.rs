@@ -30,7 +30,7 @@ pub use scenario::{
     UNITS_PER_TEAM, battle_world, crossing_assault_commands, setup_autonomous_battle, setup_battle,
     spawn_team,
 };
-pub use snapshot::extract_snapshot;
+pub use snapshot::{extract_snapshot, extract_snapshot_selected};
 pub use system::{
     BattleCommandSystem, BattleMovementSystem, BattleSystem, SharedBattleWorld,
     register_battle_systems,

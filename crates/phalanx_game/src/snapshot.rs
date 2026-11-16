@@ -17,16 +17,41 @@ use crate::world::BattleWorld;
 ///
 /// Living entities are the units present in the combat state; their
 /// positions come from the movement world. Destroyed units are absent from
-/// both, so they simply do not appear.
+/// both, so they simply do not appear. `selected` marks which entity indices
+/// the player has selected (issues #90/#92 — presentation-only).
 #[must_use]
 pub fn extract_snapshot(world: &BattleWorld, map: &Map, tick: u64) -> RenderSnapshot {
+    extract_snapshot_selected(world, map, tick, &[])
+}
+
+/// Like [`extract_snapshot`] but marks the given entity indices as selected
+/// and includes health/destination for HUD rendering (issues #90/#92).
+#[must_use]
+pub fn extract_snapshot_selected(
+    world: &BattleWorld,
+    map: &Map,
+    tick: u64,
+    selected: &[u32],
+) -> RenderSnapshot {
     let mut entities: Vec<RenderEntity> = Vec::with_capacity(world.combat.len());
     for (id, state) in &world.combat {
         let Some(unit) = world.movement.unit(*id) else {
             continue;
         };
-        let radius_m = world.def_of(*id).map(|def| def.radius_m).unwrap_or(0.5);
-        entities.push(render_entity(*id, unit.position, state.team, radius_m));
+        let def = world.def_of(*id);
+        let radius_m = def.map(|d| d.radius_m).unwrap_or(0.5);
+        let max_health = def.map(|d| d.health).unwrap_or(1);
+        let is_selected = selected.contains(&id.index());
+        entities.push(render_entity(
+            *id,
+            unit.position,
+            state.team,
+            radius_m,
+            state.health,
+            max_health,
+            is_selected,
+            state.move_destination,
+        ));
     }
     entities.sort_by_key(|entity| entity.entity_index);
     let obstacles = map
@@ -50,13 +75,27 @@ pub fn extract_snapshot(world: &BattleWorld, map: &Map, tick: u64) -> RenderSnap
     }
 }
 
-fn render_entity(id: EntityId, position: (f32, f32), team: u64, radius_m: f32) -> RenderEntity {
+#[allow(clippy::too_many_arguments)]
+fn render_entity(
+    id: EntityId,
+    position: (f32, f32),
+    team: u64,
+    radius_m: f32,
+    health: u32,
+    max_health: u32,
+    selected: bool,
+    move_destination: Option<(f32, f32)>,
+) -> RenderEntity {
     RenderEntity {
         entity_index: id.index(),
         position: RenderSpace::from_world(position.0, position.1),
         team,
         category: EntityCategory::Unit,
         radius_m,
+        health,
+        max_health,
+        selected,
+        move_destination: move_destination.map(|(x, z)| RenderSpace::from_world(x, z)),
     }
 }
 

@@ -96,6 +96,19 @@ pub enum DebugShape {
         /// Linear RGBA color.
         color: [f32; 4],
     },
+    /// A thin line segment from `from` to `to` with a world-space `thickness`
+    /// in meters, rendered as a quad. Used for HUD elements (health bars,
+    /// order markers, selection box outline — issues #90/#92).
+    Line {
+        /// Start point in world coordinates.
+        from: [f32; 2],
+        /// End point in world coordinates.
+        to: [f32; 2],
+        /// Line thickness in world meters.
+        thickness: f32,
+        /// Linear RGBA color.
+        color: [f32; 4],
+    },
 }
 
 impl DebugShape {
@@ -103,12 +116,14 @@ impl DebugShape {
     #[must_use]
     pub fn color(&self) -> [f32; 4] {
         match self {
-            Self::Triangle { color, .. } | Self::Rect { color, .. } => *color,
+            Self::Triangle { color, .. } | Self::Rect { color, .. } | Self::Line { color, .. } => {
+                *color
+            }
         }
     }
 
     /// The shape's outline vertices in world coordinates (triangles: 3,
-    /// rectangles: 6 as two triangles).
+    /// rectangles: 6 as two triangles, lines: 6 as a quad).
     #[must_use]
     pub fn world_vertices(&self) -> Vec<[f32; 2]> {
         match *self {
@@ -132,6 +147,31 @@ impl DebugShape {
                     [cx - hx, cz - hz],
                     [cx + hx, cz + hz],
                     [cx - hx, cz + hz],
+                ]
+            }
+            Self::Line {
+                from,
+                to,
+                thickness,
+                ..
+            } => {
+                // Render the line as a quad (two triangles) perpendicular to
+                // its direction. Half-thickness offset in world space.
+                let dx = to[0] - from[0];
+                let dz = to[1] - from[1];
+                let len = (dx * dx + dz * dz).sqrt();
+                let (nx, nz) = if len > 0.0 {
+                    (-dz / len * thickness * 0.5, dx / len * thickness * 0.5)
+                } else {
+                    (thickness * 0.5, 0.0)
+                };
+                vec![
+                    [from[0] - nx, from[1] - nz],
+                    [from[0] + nx, from[1] + nz],
+                    [to[0] + nx, to[1] + nz],
+                    [from[0] - nx, from[1] - nz],
+                    [to[0] + nx, to[1] + nz],
+                    [to[0] - nx, to[1] - nz],
                 ]
             }
         }
@@ -228,6 +268,29 @@ impl OrthoProjection {
         // Flip z: world +z (map down) maps to clip -y (screen down).
         let cy = 1.0 - 2.0 * (z - self.bottom) / (self.top - self.bottom);
         [cx, cy]
+    }
+
+    /// Inverse of [`world_to_clip`]: maps a normalized screen coordinate
+    /// (x right, y down, both in 0..=1 where (0,0) is top-left) back to world
+    /// meters. Used for mouse picking (issues #90/#93).
+    #[must_use]
+    pub fn screen_to_world(&self, sx: f32, sy: f32) -> [f32; 2] {
+        let x = self.left + sx * (self.right - self.left);
+        // sy=0 is top (clip y=+1 maps to world z=bottom), sy=1 is bottom.
+        let z = self.bottom + sy * (self.top - self.bottom);
+        [x, z]
+    }
+
+    /// The world-space width covered by one normalized screen x unit.
+    #[must_use]
+    pub fn world_width(&self) -> f32 {
+        self.right - self.left
+    }
+
+    /// The world-space height covered by one normalized screen y unit.
+    #[must_use]
+    pub fn world_height(&self) -> f32 {
+        self.top - self.bottom
     }
 }
 
@@ -401,6 +464,39 @@ mod tests {
         let wide = OrthoProjection::CROSSING_VIEW.for_aspect(0.5);
         let corner = wide.world_to_clip(0.0, 100.0);
         assert!(corner[1] > -1.0, "world z=100 is no longer the bottom edge");
+    }
+
+    #[test]
+    fn screen_to_world_is_the_inverse_of_world_to_clip() {
+        let p = OrthoProjection::new(10.0, 110.0, 20.0, 220.0);
+        // Round-trip: world → clip → screen → world.
+        for (x, z) in [(10.0, 20.0), (60.0, 120.0), (110.0, 220.0), (35.5, 77.25)] {
+            let clip = p.world_to_clip(x, z);
+            // Convert clip to normalized screen: clip x in [-1,1] → [0,1],
+            // clip y in [-1,1] (up) → screen y in [0,1] (down).
+            let sx = (clip[0] + 1.0) / 2.0;
+            let sy = (1.0 - clip[1]) / 2.0;
+            let [wx, wz] = p.screen_to_world(sx, sy);
+            assert!((wx - x).abs() < 1e-4, "x: {wx} != {x}");
+            assert!((wz - z).abs() < 1e-4, "z: {wz} != {z}");
+        }
+        // Corner mapping: screen (0,0) = top-left = world (left, bottom).
+        assert_eq!(p.screen_to_world(0.0, 0.0), [10.0, 20.0]);
+        assert_eq!(p.screen_to_world(1.0, 1.0), [110.0, 220.0]);
+    }
+
+    #[test]
+    fn line_shape_produces_a_quad() {
+        let line = DebugShape::Line {
+            from: [0.0, 0.0],
+            to: [10.0, 0.0],
+            thickness: 1.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+        };
+        let verts = line.world_vertices();
+        assert_eq!(verts.len(), 6, "line renders as a quad (two triangles)");
+        // The quad spans the line direction with the given thickness.
+        assert_eq!(line.color(), [1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

@@ -74,35 +74,128 @@ impl From<crate::BackendError> for RenderError {
 }
 
 /// A frame callback: renders one frame into `view` (the current surface
-/// texture view), given the device, queue, debug pipeline, and the view
-/// aspect (width/height). The app handles surface acquisition, presentation,
-/// resize, and exit; the callback owns what is drawn.
-pub type FrameCallback =
-    dyn FnMut(&wgpu::Device, &wgpu::Queue, &mut DebugPipeline, &wgpu::TextureView, f32);
+/// texture view), given the device, queue, debug pipeline, the view
+/// aspect (width/height), and the accumulated input state since the last
+/// frame (issues #90/#91/#93).
+pub type FrameCallback = dyn FnMut(
+    &wgpu::Device,
+    &wgpu::Queue,
+    &mut DebugPipeline,
+    &wgpu::TextureView,
+    f32,
+    &mut InputState,
+);
+
+/// Accumulated input state between frames (issues #90/#91/#93). All
+/// positions are normalized screen coordinates (0..=1, origin top-left).
+/// The frame callback drains events each frame via [`InputState::take_events`].
+#[derive(Default)]
+pub struct InputState {
+    /// Current mouse position in normalized screen coordinates.
+    pub mouse_pos: [f32; 2],
+    /// Mouse wheel delta accumulated since the last frame (positive = up/away).
+    pub wheel_delta: f32,
+    /// Events accumulated since the last frame, drained by the callback.
+    events: Vec<InputEvent>,
+    /// Keys currently held down (for continuous camera pan).
+    pub keys_held: std::collections::HashSet<winit::keyboard::KeyCode>,
+}
+
+/// One input event (mouse button, key press).
+#[derive(Clone, Debug, PartialEq)]
+pub enum InputEvent {
+    /// A mouse button was pressed or released at the given normalized position.
+    MouseButton {
+        button: winit::event::MouseButton,
+        pressed: bool,
+        pos: [f32; 2],
+    },
+    /// A keyboard key was pressed or released.
+    Key {
+        key: winit::keyboard::KeyCode,
+        pressed: bool,
+    },
+}
+
+impl InputState {
+    /// Records a mouse motion event, updating the current position.
+    pub fn mouse_moved(&mut self, sx: f32, sy: f32) {
+        self.mouse_pos = [sx, sy];
+    }
+
+    /// Records a mouse button event.
+    pub fn mouse_button(&mut self, button: winit::event::MouseButton, pressed: bool) {
+        self.events.push(InputEvent::MouseButton {
+            button,
+            pressed,
+            pos: self.mouse_pos,
+        });
+    }
+
+    /// Records a mouse wheel event.
+    pub fn mouse_wheel(&mut self, delta: f32) {
+        self.wheel_delta += delta;
+    }
+
+    /// Records a key event, updating the held-keys set.
+    pub fn key(&mut self, key: winit::keyboard::KeyCode, pressed: bool) {
+        if pressed {
+            self.keys_held.insert(key);
+        } else {
+            self.keys_held.remove(&key);
+        }
+        self.events.push(InputEvent::Key { key, pressed });
+    }
+
+    /// Drains all accumulated events (called once per frame by the callback).
+    pub fn take_events(&mut self) -> Vec<InputEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Returns and resets the wheel delta (called once per frame).
+    pub fn take_wheel(&mut self) -> f32 {
+        std::mem::take(&mut self.wheel_delta)
+    }
+
+    /// Whether a key is currently held.
+    pub fn key_held(&self, key: winit::keyboard::KeyCode) -> bool {
+        self.keys_held.contains(&key)
+    }
+}
 
 /// Runs the windowed presentation loop until the window is closed, drawing
 /// the demo debug scene (issue #62) over a clear-color background.
 pub fn run_windowed(clear: ClearColor, title: &str) -> Result<(), RenderError> {
-    run_windowed_with(title, move |device, queue, pipeline, view, aspect| {
-        let projection = OrthoProjection::CROSSING_VIEW.for_aspect(aspect);
-        pipeline.render(
-            device,
-            queue,
-            view,
-            clear.to_wgpu(),
-            &projection,
-            &demo_shapes(),
-        );
-    })
+    run_windowed_with(
+        title,
+        move |device, queue, pipeline, view, aspect, _input| {
+            let projection = OrthoProjection::CROSSING_VIEW.for_aspect(aspect);
+            pipeline.render(
+                device,
+                queue,
+                view,
+                clear.to_wgpu(),
+                &projection,
+                &demo_shapes(),
+            );
+        },
+    )
 }
 
 /// Runs the windowed presentation loop until the window is closed, calling
-/// `frame` for every redraw with the current surface view (issue #63: the
-/// runtime passes a callback that steps the simulation and renders the
-/// extracted snapshot).
+/// `frame` for every redraw with the current surface view and the accumulated
+/// input state (issues #90/#91/#93: input events are collected between frames
+/// and drained by the callback each redraw).
 pub fn run_windowed_with<F>(title: &str, frame: F) -> Result<(), RenderError>
 where
-    F: FnMut(&wgpu::Device, &wgpu::Queue, &mut DebugPipeline, &wgpu::TextureView, f32) + 'static,
+    F: FnMut(
+            &wgpu::Device,
+            &wgpu::Queue,
+            &mut DebugPipeline,
+            &wgpu::TextureView,
+            f32,
+            &mut InputState,
+        ) + 'static,
 {
     let event_loop = EventLoop::new().map_err(|error| RenderError::EventLoop(error.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -110,6 +203,7 @@ where
         title: title.to_owned(),
         frame: Box::new(frame),
         state: None,
+        input: InputState::default(),
         fatal: None,
     };
     event_loop
@@ -133,6 +227,7 @@ struct FrameApp {
     title: String,
     frame: Box<FrameCallback>,
     state: Option<WindowState>,
+    input: InputState,
     fatal: Option<RenderError>,
 }
 
@@ -240,6 +335,37 @@ impl ApplicationHandler for FrameApp {
                 // Clean exit when the window is closed.
                 event_loop.exit();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                // Normalize to 0..=1 (origin top-left).
+                let sx = position.x as f32 / state.config.width.max(1) as f32;
+                let sy = position.y as f32 / state.config.height.max(1) as f32;
+                self.input.mouse_moved(sx, sy);
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                button,
+                state: button_state,
+                ..
+            } => {
+                self.input
+                    .mouse_button(button, button_state == winit::event::ElementState::Pressed);
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta_f = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+                };
+                self.input.mouse_wheel(delta_f);
+                state.window.request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let winit::keyboard::PhysicalKey::Code(key) = event.physical_key {
+                    let pressed = event.state == winit::event::ElementState::Pressed;
+                    self.input.key(key, pressed);
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 match state.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
@@ -259,6 +385,7 @@ impl ApplicationHandler for FrameApp {
                             &mut state.pipeline,
                             &view,
                             aspect,
+                            &mut self.input,
                         );
                         state.backend.queue.present(frame);
                         // Continuously present frames.

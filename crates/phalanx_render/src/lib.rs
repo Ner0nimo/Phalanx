@@ -35,4 +35,11 @@ pub use snapshot::{
     EntityCategory, OBSTACLE_COLOR, ObstacleShape, RenderEntity, RenderSnapshot, RenderSpace,
     team_color,
 };
-pub use window::{FrameCallback, RenderError, run_windowed, run_windowed_with};
+pub use window::{
+    FrameCallback, InputEvent, InputState, RenderError, run_windowed, run_windowed_with,
+};
+
+/// Re-export winit input types so downstream crates (runtime) can match on
+/// them without a direct winit dependency.
+pub use winit::event::MouseButton;
+pub use winit::keyboard::KeyCode;

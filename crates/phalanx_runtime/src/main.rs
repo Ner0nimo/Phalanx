@@ -1,20 +1,22 @@
 use std::process::ExitCode;
 
-use phalanx_core::command::CommandPayload;
+use phalanx_core::command::{ActorId, CommandPayload, CommandRequest, RequestId, SessionId};
+use phalanx_core::entity::EntityId;
 use phalanx_core::hash::Digest;
 use phalanx_core::scenario::{SCENARIO_SEED, scenario_commands, setup_scenario};
 use phalanx_core::simulation::{SimulationRunner, TickRate};
 use phalanx_game::scenario::SCENARIO_SEED as BATTLE_SEED;
 use phalanx_game::{
-    AUTONOMOUS_PAD_A, AUTONOMOUS_PAD_B, SharedBattleWorld, TEAM_A, TEAM_B, extract_snapshot,
-    setup_autonomous_battle, spawn_team,
+    AUTONOMOUS_PAD_A, AUTONOMOUS_PAD_B, SharedBattleWorld, TEAM_A, TEAM_B,
+    extract_snapshot_selected, setup_autonomous_battle, spawn_team,
 };
 use phalanx_navigation::{Map, crossing_map};
 use phalanx_render::{
     BackendError, ClearColor, DEFAULT_CLEAR, DEFAULT_PERF_WINDOW, DebugPipeline, FrameProfiler,
-    FrameTimer, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection, PerfStats, RenderSnapshot,
-    count_color, demo_shapes, init_headless, overlay_projection, overlay_shapes, run_windowed,
-    run_windowed_with, team_color, verify_clear_pixels_background, write_ppm,
+    FrameTimer, InputEvent, KeyCode, MouseButton, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection,
+    PerfStats, RenderSnapshot, count_color, demo_shapes, init_headless, overlay_projection,
+    overlay_shapes, run_windowed, run_windowed_with, team_color, verify_clear_pixels_background,
+    write_ppm,
 };
 
 fn main() -> ExitCode {
@@ -67,6 +69,8 @@ struct BattleDemo {
     runner: SimulationRunner<CommandPayload>,
     world: SharedBattleWorld,
     map: Map,
+    /// Next request ID for player-issued commands (issue #93).
+    next_request_id: u64,
 }
 
 impl BattleDemo {
@@ -79,6 +83,7 @@ impl BattleDemo {
             runner,
             world,
             map: crossing_map(),
+            next_request_id: 1,
         })
     }
 
@@ -98,9 +103,15 @@ impl BattleDemo {
         overlay_projection(self.map.width_m, self.map.depth_m, aspect)
     }
 
+    /// Extracts the render snapshot of the current tick without stepping,
+    /// marking `selected` entity indices (issues #90/#92).
+    fn snapshot_selected(&self, selected: &[u32]) -> RenderSnapshot {
+        extract_snapshot_selected(&self.world.borrow(), &self.map, self.tick(), selected)
+    }
+
     /// Extracts the render snapshot of the current tick without stepping.
     fn snapshot(&self) -> RenderSnapshot {
-        extract_snapshot(&self.world.borrow(), &self.map, self.tick())
+        self.snapshot_selected(&[])
     }
 
     /// Advances up to `n` simulation ticks and returns how many actually ran.
@@ -120,6 +131,88 @@ impl BattleDemo {
     fn match_winner(&self) -> Option<u64> {
         self.world.borrow().match_over
     }
+
+    /// Submits a player command for `subject` at the next tick (issue #93).
+    /// The player is `ActorId(1)` (Team A), session 0.
+    fn submit_player_command(
+        &mut self,
+        subject: EntityId,
+        payload: CommandPayload,
+    ) -> Result<(), String> {
+        let target_tick = self.runner.simulation().tick() + 1;
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.runner
+            .submit_command(CommandRequest {
+                request_id: RequestId(request_id),
+                actor: ActorId(TEAM_A),
+                session: SessionId(0),
+                tick: target_tick,
+                subject: Some(subject),
+                payload,
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+/// The interactive camera (issue #91): center position in world meters and
+/// zoom as the visible world height in meters. Pure presentation state.
+struct Camera {
+    /// Center of the view in world coordinates (x, z).
+    center: [f32; 2],
+    /// Visible world height in meters (zoom: smaller = more zoomed in).
+    view_height_m: f32,
+    /// Map bounds for clamping.
+    map_width_m: f32,
+    map_depth_m: f32,
+}
+
+impl Camera {
+    fn new(map_width_m: f32, map_depth_m: f32) -> Self {
+        Self {
+            center: [map_width_m / 2.0, map_depth_m / 2.0],
+            view_height_m: map_depth_m,
+            map_width_m,
+            map_depth_m,
+        }
+    }
+
+    /// Pans by a screen-space delta (normalized 0..=1) converted to world meters.
+    fn pan_screen(&mut self, dx_screen: f32, dy_screen: f32, aspect: f32) {
+        let world_dx = dx_screen * self.view_height_m * aspect;
+        let world_dy = dy_screen * self.view_height_m;
+        self.center[0] = (self.center[0] + world_dx).clamp(0.0, self.map_width_m);
+        self.center[1] = (self.center[1] + world_dy).clamp(0.0, self.map_depth_m);
+    }
+
+    /// Zooms by a factor (wheel delta): positive zooms in (smaller view).
+    fn zoom(&mut self, wheel_delta: f32) {
+        let factor = 1.0 - wheel_delta * 0.1;
+        self.view_height_m = (self.view_height_m * factor).clamp(20.0, self.map_depth_m);
+    }
+
+    /// Builds the ortho projection for the given aspect.
+    fn projection(&self, aspect: f32) -> OrthoProjection {
+        let half_h = self.view_height_m / 2.0;
+        let half_w = half_h * aspect;
+        OrthoProjection::new(
+            self.center[0] - half_w,
+            self.center[0] + half_w,
+            self.center[1] - half_h,
+            self.center[1] + half_h,
+        )
+    }
+}
+
+/// Player selection state (issue #90): selected entity indices and an
+/// in-progress drag box (normalized screen coordinates).
+#[derive(Default)]
+struct SelectionState {
+    /// Currently selected entity indices.
+    selected: Vec<u32>,
+    /// Drag-box start position (normalized screen), if a left-drag is in progress.
+    drag_start: Option<[f32; 2]>,
 }
 
 /// The default battle tick budget in `--battle` mode (slice spec §8: the
@@ -316,20 +409,243 @@ fn run_battle_graphical(
         // Windowed: wall-clock 20 Hz stepping inside the frame callback; the
         // render rate stays independent of the simulation rate. Issue #88:
         // every frame is timed per stage and aggregated in the profiler.
+        //
+        // Fractional tick accumulator: at 60 FPS each frame is ~16.7 ms,
+        // which is 0.33 ticks at 20 Hz — truncating per-frame would advance
+        // zero ticks, so we accumulate the fractional remainder across frames.
         let mut last = std::time::Instant::now();
+        let mut tick_accumulator = 0.0_f64;
         let mut last_logged = 0_u64;
         let mut announced_match = false;
         let mut step_error: Option<String> = None;
         let mut profiler = FrameProfiler::new(DEFAULT_PERF_WINDOW);
+        let mut camera = Camera::new(demo.map.width_m, demo.map.depth_m);
+        let mut selection = SelectionState::default();
         return run_windowed_with(
             "Phalanx — autonomous battle (graphical)",
-            move |device, queue, pipeline, view, aspect| {
+            move |device, queue, pipeline, view, aspect, input| {
                 let mut timer = profiler.begin_frame();
+
+                // --- Input handling (issues #90/#91/#93) ---
+                let events = input.take_events();
+                let wheel = input.take_wheel();
+                let projection = camera.projection(aspect);
+
+                // Camera zoom via mouse wheel (issue #91).
+                if wheel != 0.0 {
+                    camera.zoom(wheel);
+                }
+                // Camera pan via held keys (WASD / arrows, issue #91).
+                let pan_speed = 0.02; // fraction of view per frame
+                let mut pan_dx = 0.0_f32;
+                let mut pan_dy = 0.0_f32;
+                if input.key_held(KeyCode::KeyA) || input.key_held(KeyCode::ArrowLeft) {
+                    pan_dx -= pan_speed;
+                }
+                if input.key_held(KeyCode::KeyD) || input.key_held(KeyCode::ArrowRight) {
+                    pan_dx += pan_speed;
+                }
+                if input.key_held(KeyCode::KeyW) || input.key_held(KeyCode::ArrowUp) {
+                    pan_dy -= pan_speed;
+                }
+                if input.key_held(KeyCode::KeyS) || input.key_held(KeyCode::ArrowDown) {
+                    pan_dy += pan_speed;
+                }
+                if pan_dx != 0.0 || pan_dy != 0.0 {
+                    camera.pan_screen(pan_dx, pan_dy, aspect);
+                }
+
+                // Process input events for selection and commands.
+                for event in &events {
+                    match event {
+                        InputEvent::MouseButton {
+                            button: MouseButton::Left,
+                            pressed,
+                            pos,
+                        } => {
+                            if *pressed {
+                                selection.drag_start = Some(*pos);
+                            } else if let Some(start) = selection.drag_start.take() {
+                                // Left release: click-select or box-select (issue #90).
+                                let drag_dist = ((pos[0] - start[0]).powi(2)
+                                    + (pos[1] - start[1]).powi(2))
+                                .sqrt();
+                                let world_pos = projection.screen_to_world(pos[0], pos[1]);
+                                let snapshot = demo.snapshot();
+                                if drag_dist < 0.02 {
+                                    // Click: select nearest own unit within threshold.
+                                    let threshold_world = projection.world_height() * 0.02;
+                                    let mut best: Option<(f32, u32, u64)> = None;
+                                    for entity in &snapshot.entities {
+                                        if entity.team != TEAM_A {
+                                            continue;
+                                        }
+                                        let dx = entity.position[0] - world_pos[0];
+                                        let dz = entity.position[1] - world_pos[1];
+                                        let dist = (dx * dx + dz * dz).sqrt();
+                                        if dist <= entity.radius_m.max(threshold_world) {
+                                            match best {
+                                                Some((bd, _, _)) if dist >= bd => {}
+                                                _ => {
+                                                    best = Some((
+                                                        dist,
+                                                        entity.entity_index,
+                                                        entity.team,
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    selection.selected = match best {
+                                        Some((_, idx, _)) => vec![idx],
+                                        None => Vec::new(),
+                                    };
+                                } else {
+                                    // Box select: all own units inside the drag rect.
+                                    let start_world =
+                                        projection.screen_to_world(start[0], start[1]);
+                                    let end_world = projection.screen_to_world(pos[0], pos[1]);
+                                    let min_x = start_world[0].min(end_world[0]);
+                                    let max_x = start_world[0].max(end_world[0]);
+                                    let min_z = start_world[1].min(end_world[1]);
+                                    let max_z = start_world[1].max(end_world[1]);
+                                    selection.selected = snapshot
+                                        .entities
+                                        .iter()
+                                        .filter(|e| {
+                                            e.team == TEAM_A
+                                                && e.position[0] >= min_x
+                                                && e.position[0] <= max_x
+                                                && e.position[1] >= min_z
+                                                && e.position[1] <= max_z
+                                        })
+                                        .map(|e| e.entity_index)
+                                        .collect();
+                                }
+                            }
+                        }
+                        InputEvent::MouseButton {
+                            button: MouseButton::Right,
+                            pressed: true,
+                            pos,
+                        } => {
+                            // Right-click: issue Move/AttackMove/Attack to selected units (issue #93).
+                            // Shift+right-click appends to the command queue (issue #94).
+                            if selection.selected.is_empty() {
+                                continue;
+                            }
+                            let append = input.key_held(KeyCode::ShiftLeft)
+                                || input.key_held(KeyCode::ShiftRight);
+                            let world_pos = projection.screen_to_world(pos[0], pos[1]);
+                            let snapshot = demo.snapshot();
+                            // Check if an enemy unit is near the click point → Attack.
+                            let click_threshold = projection.world_height() * 0.02;
+                            let enemy = snapshot.entities.iter().find(|e| {
+                                if e.team == TEAM_A {
+                                    return false;
+                                }
+                                let dx = e.position[0] - world_pos[0];
+                                let dz = e.position[1] - world_pos[1];
+                                (dx * dx + dz * dz).sqrt() <= e.radius_m.max(click_threshold)
+                            });
+                            let payload = match enemy {
+                                Some(target) => {
+                                    // Attack the clicked enemy: find its EntityId.
+                                    let world = demo.world.borrow();
+                                    let target_id = world
+                                        .combat
+                                        .keys()
+                                        .find(|id| id.index() == target.entity_index)
+                                        .copied();
+                                    drop(world);
+                                    match target_id {
+                                        Some(tid) => CommandPayload::Attack { target: tid },
+                                        None => CommandPayload::AttackMove {
+                                            destination: (world_pos[0], world_pos[1]),
+                                        },
+                                    }
+                                }
+                                None => CommandPayload::AttackMove {
+                                    destination: (world_pos[0], world_pos[1]),
+                                },
+                            };
+                            // Submit the command for each selected unit.
+                            let selected_ids: Vec<EntityId> = {
+                                let world = demo.world.borrow();
+                                selection
+                                    .selected
+                                    .iter()
+                                    .filter_map(|&idx| {
+                                        world.combat.keys().find(|id| id.index() == idx).copied()
+                                    })
+                                    .collect()
+                            };
+                            for id in selected_ids {
+                                if append {
+                                    // Shift+right-click: append to queue (issue #94).
+                                    let cmd = match &payload {
+                                        CommandPayload::Move { destination } => {
+                                            phalanx_game::BattleCommand::Move {
+                                                destination: *destination,
+                                            }
+                                        }
+                                        CommandPayload::AttackMove { destination } => {
+                                            phalanx_game::BattleCommand::AttackMove {
+                                                destination: *destination,
+                                            }
+                                        }
+                                        CommandPayload::Attack { target } => {
+                                            phalanx_game::BattleCommand::Attack { target: *target }
+                                        }
+                                        CommandPayload::Diagnostics { .. } => continue,
+                                    };
+                                    demo.world.borrow_mut().queue_command(id, cmd);
+                                } else {
+                                    let _ = demo.submit_player_command(id, payload.clone());
+                                }
+                            }
+                        }
+                        InputEvent::Key {
+                            key: KeyCode::Escape,
+                            pressed: true,
+                        } => {
+                            selection.selected.clear();
+                        }
+                        InputEvent::Key {
+                            key: KeyCode::Delete,
+                            pressed: true,
+                        }
+                        | InputEvent::Key {
+                            key: KeyCode::Backspace,
+                            pressed: true,
+                        } => {
+                            // Stop key: cancel active commands for selected units (issue #94).
+                            let selected_ids: Vec<EntityId> = {
+                                let world = demo.world.borrow();
+                                selection
+                                    .selected
+                                    .iter()
+                                    .filter_map(|&idx| {
+                                        world.combat.keys().find(|id| id.index() == idx).copied()
+                                    })
+                                    .collect()
+                            };
+                            for id in selected_ids {
+                                demo.world.borrow_mut().cancel_commands(id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // --- Simulation stepping (issue #95 fix: fractional accumulator) ---
                 let now = std::time::Instant::now();
                 let elapsed = now.saturating_duration_since(last);
                 last = now;
                 let tps = f64::from(TickRate::DEFAULT.ticks_per_second());
-                let due = (elapsed.as_secs_f64() * tps).min(100.0) as u64;
+                tick_accumulator += (elapsed.as_secs_f64() * tps).min(100.0);
+                let due = tick_accumulator as u64;
+                tick_accumulator -= due as f64;
                 let mut steps_done = 0_u64;
                 if due > 0 && step_error.is_none() {
                     match demo.advance(due) {
@@ -341,14 +657,15 @@ fn run_battle_graphical(
                     }
                 }
                 timer.mark_simulation(steps_done.min(u64::from(u32::MAX)) as u32);
-                let snapshot = demo.snapshot();
+                let snapshot = demo.snapshot_selected(&selection.selected);
                 timer.mark_snapshot();
                 if snapshot.tick != last_logged && snapshot.tick % 20 == 0 {
                     last_logged = snapshot.tick;
                     println!(
-                        "TICK tick={} entities={}",
+                        "TICK tick={} entities={} selected={}",
                         snapshot.tick,
-                        snapshot.entities.len()
+                        snapshot.entities.len(),
+                        selection.selected.len()
                     );
                 }
                 if let Some(winner) = demo.match_winner() {
@@ -360,9 +677,34 @@ fn run_battle_graphical(
                 let projection = if perf_overlay {
                     demo.overlay_view(aspect)
                 } else {
-                    demo.view(aspect)
+                    camera.projection(aspect)
                 };
-                let mut shapes = snapshot.shapes();
+                let mut shapes = if perf_overlay {
+                    snapshot.shapes()
+                } else {
+                    snapshot.shapes_with_hud(projection.world_height())
+                };
+                // Draw drag-box outline (issue #90).
+                if let Some(start) = selection.drag_start {
+                    let pos = input.mouse_pos;
+                    let sw = projection.screen_to_world(start[0], start[1]);
+                    let ew = projection.screen_to_world(pos[0], pos[1]);
+                    let min_x = sw[0].min(ew[0]);
+                    let max_x = sw[0].max(ew[0]);
+                    let min_z = sw[1].min(ew[1]);
+                    let max_z = sw[1].max(ew[1]);
+                    let cx = (min_x + max_x) / 2.0;
+                    let cz = (min_z + max_z) / 2.0;
+                    let hx = (max_x - min_x) / 2.0;
+                    let hz = (max_z - min_z) / 2.0;
+                    if hx > 0.1 && hz > 0.1 {
+                        shapes.push(phalanx_render::geometry::DebugShape::Rect {
+                            center: [cx, cz],
+                            half_size: [hx, hz],
+                            color: [1.0, 1.0, 1.0, 0.3],
+                        });
+                    }
+                }
                 if perf_overlay {
                     shapes.extend(overlay_shapes(&profiler.stats(), demo.map.width_m));
                 }

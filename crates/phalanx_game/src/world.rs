@@ -86,6 +86,9 @@ pub struct CombatState {
     pub cooldown_remaining: u32,
     /// The unit's current command.
     pub command: Option<BattleCommand>,
+    /// Queued follow-up commands (issue #94): when the current command's
+    /// movement order completes or fails, the next queued command activates.
+    pub command_queue: Vec<BattleCommand>,
     /// The current target (validated every tick).
     pub target: Option<EntityId>,
     /// The last movement destination issued to the movement world.
@@ -99,6 +102,7 @@ impl CanonicalSerialize for CombatState {
         sink.write_u32(self.health);
         sink.write_u32(self.cooldown_remaining);
         self.command.write_canonical(sink);
+        self.command_queue.write_canonical(sink);
         self.target.write_canonical(sink);
         self.move_destination.write_canonical(sink);
     }
@@ -112,6 +116,7 @@ impl CanonicalDecode for CombatState {
             health: reader.read_u32()?,
             cooldown_remaining: reader.read_u32()?,
             command: CanonicalDecode::read_canonical(reader)?,
+            command_queue: CanonicalDecode::read_canonical(reader)?,
             target: CanonicalDecode::read_canonical(reader)?,
             move_destination: CanonicalDecode::read_canonical(reader)?,
         })
@@ -222,6 +227,7 @@ impl BattleWorld {
                 health: def.health,
                 cooldown_remaining: 0,
                 command: None,
+                command_queue: Vec::new(),
                 target: None,
                 move_destination: None,
             },
@@ -330,10 +336,23 @@ impl BattleWorld {
     }
 
     /// Steps movement (called in `Phase::ResolveMovement`): combat-driven
-    /// destinations, then the movement layer.
+    /// destinations, then the movement layer. When the current command's
+    /// order completes or fails, the next queued command activates (issue #94).
     pub fn step_movement(&mut self) {
         let ids: Vec<EntityId> = self.combat.keys().copied().collect();
         for id in ids {
+            // Command queue advancement (issue #94): if the movement order
+            // for the current command is done, pop the next queued command.
+            if let Some(status) = self.movement.order_status(id) {
+                let done = matches!(
+                    status,
+                    phalanx_navigation::OrderStatus::Completed
+                        | phalanx_navigation::OrderStatus::Failed(_)
+                );
+                if done && self.command_queue_nonempty(id) {
+                    self.advance_command_queue(id);
+                }
+            }
             let Some(state) = self.combat.get(&id) else {
                 continue;
             };
@@ -354,6 +373,56 @@ impl BattleWorld {
             }
         }
         self.movement.step();
+    }
+
+    /// Whether the unit has queued commands (issue #94).
+    fn command_queue_nonempty(&self, id: EntityId) -> bool {
+        self.combat
+            .get(&id)
+            .is_some_and(|s| !s.command_queue.is_empty())
+    }
+
+    /// Pops the next queued command into the active slot (issue #94).
+    pub fn advance_command_queue(&mut self, id: EntityId) {
+        let Some(state) = self.combat.get_mut(&id) else {
+            return;
+        };
+        if let Some(next) = state.command_queue.first().cloned() {
+            state.command_queue.remove(0);
+            state.command = Some(next.clone());
+            match &next {
+                BattleCommand::Move { destination } => {
+                    state.move_destination = Some(*destination);
+                    let _ = self.movement.order_move(id, *destination);
+                }
+                BattleCommand::AttackMove { destination } => {
+                    state.move_destination = Some(*destination);
+                    let _ = self.movement.order_move(id, *destination);
+                }
+                BattleCommand::Attack { target } => {
+                    state.target = Some(*target);
+                }
+            }
+        }
+    }
+
+    /// Appends a command to the unit's queue instead of replacing the
+    /// current one (issue #94, shift+right-click).
+    pub fn queue_command(&mut self, id: EntityId, command: BattleCommand) {
+        if let Some(state) = self.combat.get_mut(&id) {
+            state.command_queue.push(command);
+        }
+    }
+
+    /// Cancels the unit's active command and clears the queue (issue #94, stop key).
+    pub fn cancel_commands(&mut self, id: EntityId) {
+        if let Some(state) = self.combat.get_mut(&id) {
+            state.command = None;
+            state.command_queue.clear();
+            state.target = None;
+            state.move_destination = None;
+        }
+        self.movement.cancel_order(id);
     }
 
     /// The movement destination implied by the unit's command and target:
