@@ -9,6 +9,7 @@ description = "Game rules and authoritative systems: first CPU-authoritative com
 [dependencies]
 phalanx_core = { path = "../phalanx_core" }
 phalanx_navigation = { path = "../phalanx_navigation" }
+phalanx_render = { path = "../phalanx_render" }
 
 [lints]
 workspace = true

@@ -19,15 +19,17 @@
 pub mod defs;
 pub mod events;
 pub mod scenario;
+pub mod snapshot;
 pub mod system;
 pub mod world;
 
 pub use defs::{Roster, UnitDef, WeaponDef, slice_roster};
 pub use events::{BattleEvent, CommandFailReason};
 pub use scenario::{
-    SCENARIO_SEED, TEAM_A, TEAM_B, UNITS_PER_TEAM, battle_world, crossing_assault_commands,
-    setup_battle, spawn_team,
+    SCENARIO_SEED, SPAWN_PAD_A, SPAWN_PAD_B, TEAM_A, TEAM_B, UNITS_PER_TEAM, battle_world,
+    crossing_assault_commands, setup_battle, spawn_team,
 };
+pub use snapshot::extract_snapshot;
 pub use system::{
     BattleCommandSystem, BattleMovementSystem, BattleSystem, SharedBattleWorld,
     register_battle_systems,

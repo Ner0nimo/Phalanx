@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 phalanx_core = { path = "../phalanx_core" }
+phalanx_game = { path = "../phalanx_game" }
+phalanx_navigation = { path = "../phalanx_navigation" }
 phalanx_render = { path = "../phalanx_render" }
 
 [lints]

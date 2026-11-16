@@ -17,6 +17,7 @@
 pub mod backend;
 pub mod geometry;
 pub mod present;
+pub mod snapshot;
 pub mod window;
 
 pub use backend::{AdapterReport, BackendError, GpuBackend, init_headless};
@@ -25,4 +26,8 @@ pub use present::{
     ClearColor, DEFAULT_CLEAR, OffscreenTarget, choose_surface_config, render_clear_to_view,
     verify_clear_pixels, verify_clear_pixels_background,
 };
-pub use window::{RenderError, run_windowed};
+pub use snapshot::{
+    EntityCategory, OBSTACLE_COLOR, ObstacleShape, RenderEntity, RenderSnapshot, RenderSpace,
+    team_color,
+};
+pub use window::{FrameCallback, RenderError, run_windowed, run_windowed_with};
