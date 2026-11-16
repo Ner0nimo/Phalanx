@@ -64,6 +64,12 @@ GPU-dependent measurements (frame time for 10k instanced markers, compute dispat
 - **CI gate distinction:** the `graphics-spike` CI job is a *headless initialization gate* required on every platform (both binaries must exit 0 with structured results). A *GPU integration test* that verifies an actual compute result on GPU-equipped hardware is a separate future gate (see Revisit criteria), not a shared-runner gate.
 - **Dependency cost:** the ~149 vs 3 crate difference is a build-time/audit-surface observation for now, not a long-term architectural cost by itself; runtime overhead, upgrade frequency, and vulnerability surface are the meaningful long-term metrics (tracked via the audit job and M3 measurements).
 
+## Hardware validation status (issue #33)
+
+- **Current evidence is headless only**: the required CI gate on hosted runners (ubuntu + windows, software/virtualized GPU stacks) proves native initialization, WGSL validation, device creation with validation enabled, and — on machines with an adapter — a verified compute pass. No discrete-GPU run has happened yet in this environment.
+- **Procedure for a real-hardware run**: trigger the manual `gpu-validation` workflow (`workflow_dispatch`) on a self-hosted runner labeled `[self-hosted, gpu]`. It builds the wgpu spike in release, runs it on the GPU, and uploads `wgpu-gpu-validation-report` — a structured `REPORT` line recording adapter name/vendor/device/type/backend, driver + driver info, OS, arch, build profile, validation setting, init vs workload timing (captured separately), workload parameters, and compute verification. Record the artifact contents here (adapter, driver, OS, build mode, validation, workload) when the first run lands.
+- **No performance or backend-win claim is made**: the ash spike is initialization/resource-lifetime only (no compute, by design), so the spike comparison is asymmetric and is not a benchmark; any future backend comparison must run equivalent work on both sides (ADR-0004 revisit criteria). The renderer choice stays provisional until the first in-engine rendering path is exercised (issues #61–#64).
+
 ## Revisit criteria
 
 Revisit (replacement ADR with migration impact) when any of the following occurs:

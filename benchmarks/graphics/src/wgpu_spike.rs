@@ -37,6 +37,7 @@ fn print_planned_workload() {
 }
 
 fn main() {
+    let init_start = Instant::now();
     println!("INIT candidate=wgpu version=30.0.1 backends=all validation=on unsafe_blocks=0");
 
     // Validate the WGSL up front (no device needed) so a shader bug fails this
@@ -68,8 +69,8 @@ fn main() {
 
     let info = adapter.get_info();
     println!(
-        "ADAPTER candidate=wgpu found=true name=\"{}\" vendor={:#x} device={:#x} type={:?}",
-        info.name, info.vendor, info.device, info.device_type
+        "ADAPTER candidate=wgpu found=true name=\"{}\" vendor={:#x} device={:#x} type={:?} backend={:?} driver=\"{}\" driver_info=\"{}\"",
+        info.name, info.vendor, info.device, info.device_type, info.backend, info.driver, info.driver_info
     );
 
     let (device, queue) =
@@ -226,10 +227,26 @@ fn main() {
     } else {
         false
     };
+    let compute_ms = elapsed.as_secs_f64() * 1000.0;
     println!(
         "COMPUTE candidate=wgpu dispatched=true workgroups=64 buffer_bytes={COMPUTE_BUFFER_BYTES} verified={verified} \
-         time_ms={:.3} timing=\"cpu encode+submit+wait (end-to-end latency, not pure GPU time)\"",
-        elapsed.as_secs_f64() * 1000.0
+         time_ms={compute_ms:.3} timing=\"cpu encode+submit+wait (end-to-end latency, not pure GPU time)\""
+    );
+
+    // Structured hardware-validation report (issue #33): one REPORT line with
+    // everything a real-GPU run must record — adapter, driver, OS, build mode,
+    // validation settings, workload, and separately captured init vs workload
+    // behavior. Collected as a CI artifact by the gpu-validation job.
+    println!(
+        "REPORT candidate=wgpu wgpu=30.0.1 os={} arch={} profile={} validation=on \
+         adapter=\"{}\" vendor={:#x} device={:#x} type={:?} backend={:?} driver=\"{}\" driver_info=\"{}\" \
+         init_ms={:.3} compute_ms={compute_ms:.3} verified={verified} \
+         workload=\"instanced_markers={INSTANCED_MARKERS} draw_calls_planned=1 compute_buffer_bytes={COMPUTE_BUFFER_BYTES} workgroups=64\"",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        info.name, info.vendor, info.device, info.device_type, info.backend, info.driver, info.driver_info,
+        init_start.elapsed().as_secs_f64() * 1000.0,
     );
 
     print_planned_workload();
