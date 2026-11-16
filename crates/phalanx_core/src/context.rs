@@ -10,8 +10,8 @@
 //!   [`SystemOutput`], which the runner applies deterministically right after
 //!   the hook: events land in the canonical system-event transcript of the
 //!   [`crate::simulation::Simulation`], and intents go through the standard
-//!   command ingress (explicit target tick, ascending command-ID ordering at
-//!   application) — never through a bespoke mutation path.
+//!   command ingress (explicit target tick, stable arbitration-key ordering at
+//!   application, issue #42) — never through a bespoke mutation path.
 //! - Failures are structured [`SystemError`]s with documented semantics: a
 //!   non-fatal `Event` failure is recorded as a canonical transcript entry and
 //!   the tick continues; a `Fatal` failure terminates the run deterministically
@@ -94,9 +94,8 @@ pub enum SystemIntent<P> {
     /// Emit a command through the standard command ingress. The target tick
     /// is `request.tick` and must be strictly greater than the current tick
     /// (the same rule as external ingress); within the target tick, commands
-    /// apply in ascending command-ID order, i.e. submission order, which is
-    /// fully deterministic because the runner is single-threaded and phases
-    /// execute in schedule order.
+    /// apply in the stable arbitration-key order (issue #42), which is fully
+    /// deterministic and independent of producer arrival order.
     Command(CommandRequest<P>),
 }
 

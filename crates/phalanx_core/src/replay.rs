@@ -542,7 +542,9 @@ impl std::error::Error for ReplayError {}
 
 /// Validates the recording's structure before any playback (issue #51):
 /// envelope versions, unique request identities, the ascending command-ID
-/// sequence from 0 in submission order, target ticks in the future, and
+/// sequence from 0 in submission order (the recording keeps the
+/// submission-order stream; application order within a tick is the stable
+/// arbitration key, issue #42), target ticks in the future, and
 /// per-tick hash coverage of the whole requested interval. Malformed or
 /// incomplete recordings are rejected as invalid input, never silently
 /// normalized.
@@ -1373,5 +1375,63 @@ mod tests {
             recorder.step_tick(),
             Err(ReplayError::RunTerminated { tick: 2 })
         );
+    }
+    // ---- issue #42: recordings keep the submission-order stream; replay
+    // reproduces the identical arbitration result ----
+
+    #[test]
+    fn recording_keeps_submission_order_and_replay_reproduces_arbitration() {
+        let mut recorder = ReplayRecorder::<CommandPayload>::new(TickRate::DEFAULT, 0x5150);
+        setup_scenario(recorder.runner_mut());
+        // Scrambled multi-producer arrival order, all targeting tick 2.
+        let from = |actor: u64, request_id: u64, value: u64| CommandRequest {
+            request_id: RequestId(request_id),
+            actor: ActorId(actor),
+            session: SessionId(0),
+            tick: 2,
+            subject: None,
+            payload: CommandPayload::Diagnostics { value },
+        };
+        // Scrambled cross-producer arrival; each actor's request IDs stay
+        // monotonic within its session.
+        for request in [
+            from(2, 1, 21),
+            from(1, 1, 11),
+            from(1, 2, 12),
+            from(2, 2, 22),
+        ] {
+            recorder.submit_command(request).expect("submit");
+        }
+        recorder.advance_ticks(2).expect("two ticks");
+        let recording = recorder.finish();
+        // The recording keeps the submission-order stream with the assigned
+        // command IDs 0..n-1.
+        assert_eq!(
+            recording
+                .commands()
+                .iter()
+                .map(|envelope| envelope.command_id())
+                .collect::<Vec<_>>(),
+            vec![CommandId(0), CommandId(1), CommandId(2), CommandId(3)]
+        );
+        assert_eq!(
+            recording
+                .commands()
+                .iter()
+                .map(|envelope| (envelope.actor(), envelope.request_id()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ActorId(2), RequestId(1)),
+                (ActorId(1), RequestId(1)),
+                (ActorId(1), RequestId(2)),
+                (ActorId(2), RequestId(2)),
+            ]
+        );
+        // Replay submits in recorded order, so the per-tick command sets and
+        // therefore the arbitration result are reproduced exactly.
+        let report = replay_recording(&recording, 2, &BTreeMap::new(), setup_scenario)
+            .expect("replay verifies");
+        assert_eq!(report.first_divergent_tick(), None);
+        assert_eq!(report.tick_hashes(), recording.tick_hashes());
     }
 }
