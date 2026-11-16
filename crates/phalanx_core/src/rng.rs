@@ -96,6 +96,9 @@ impl CanonicalDecode for RngStream {
 pub enum RngError {
     /// The snapshot names a stream that is not registered.
     UnknownStream { name: String },
+    /// The snapshot omits a registered stream; exact restore (issue #46)
+    /// requires the full stream-name set.
+    MissingStream { name: String },
     /// A stream with this name is already registered; re-registering must
     /// not silently overwrite it.
     DuplicateStream { name: String },
@@ -105,6 +108,12 @@ impl std::fmt::Display for RngError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownStream { name } => write!(formatter, "unknown RNG stream: {name}"),
+            Self::MissingStream { name } => {
+                write!(
+                    formatter,
+                    "snapshot is missing registered RNG stream: {name}"
+                )
+            }
             Self::DuplicateStream { name } => {
                 write!(formatter, "RNG stream already registered: {name}")
             }
@@ -210,14 +219,41 @@ impl RngStreams {
             .collect()
     }
 
-    /// Restores stream states from a snapshot. Every snapshot entry must name
-    /// a registered stream; unknown names are an explicit error.
+    /// Restores stream states from a snapshot exactly and transactionally
+    /// (issue #46). The snapshot must name exactly the registered streams —
+    /// no unknown and no missing names — and the full snapshot is validated
+    /// before any stream state changes, so a failed restore leaves every
+    /// stream unchanged.
     pub fn restore(&mut self, snapshot: &BTreeMap<String, u64>) -> Result<(), RngError> {
+        for name in snapshot.keys() {
+            if !self.streams.contains_key(name) {
+                return Err(RngError::UnknownStream { name: name.clone() });
+            }
+        }
+        for name in self.streams.keys() {
+            if !snapshot.contains_key(name) {
+                return Err(RngError::MissingStream { name: name.clone() });
+            }
+        }
         for (name, state) in snapshot {
-            let stream = self
-                .streams
-                .get_mut(name)
-                .ok_or_else(|| RngError::UnknownStream { name: name.clone() })?;
+            let stream = self.streams.get_mut(name).expect("validated above");
+            *stream = RngStream::from_state(*state);
+        }
+        Ok(())
+    }
+
+    /// Partial, transactional update: applies only the named streams (all of
+    /// which must be registered) and leaves the others untouched. Prefer
+    /// [`RngStreams::restore`] for authoritative save/load, which requires
+    /// the exact stream set.
+    pub fn restore_partial(&mut self, snapshot: &BTreeMap<String, u64>) -> Result<(), RngError> {
+        for name in snapshot.keys() {
+            if !self.streams.contains_key(name) {
+                return Err(RngError::UnknownStream { name: name.clone() });
+            }
+        }
+        for (name, state) in snapshot {
+            let stream = self.streams.get_mut(name).expect("validated above");
             *stream = RngStream::from_state(*state);
         }
         Ok(())
@@ -394,5 +430,92 @@ mod tests {
         // Registering the same name again must not silently overwrite.
         assert!(streams.register("combat", 6).is_err());
         assert_eq!(streams.get("combat").map(RngStream::state), Some(5));
+    }
+
+    #[test]
+    fn exact_restore_reproduces_all_future_draws() {
+        let mut source = RngStreams::new(0x5EED);
+        source.register("combat", 1).expect("register");
+        source.register("ai", 2).expect("register");
+        for _ in 0..10 {
+            source.stream("combat").next_u64();
+            source.stream("ai").next_bool();
+        }
+        let snapshot = source.snapshot();
+
+        let mut target = RngStreams::new(0x5EED);
+        target.register("combat", 999).expect("register");
+        target.register("ai", 888).expect("register");
+        for _ in 0..5 {
+            target.stream("combat").next_u64();
+        }
+        target.restore(&snapshot).expect("exact restore");
+        for _ in 0..100 {
+            assert_eq!(
+                source.stream("combat").next_u64(),
+                target.stream("combat").next_u64()
+            );
+            assert_eq!(
+                source.stream("ai").next_u64(),
+                target.stream("ai").next_u64()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_restore_leaves_every_stream_unchanged() {
+        let mut rng = RngStreams::new(42);
+        rng.register("combat", 1).expect("register");
+        rng.register("ai", 2).expect("register");
+        rng.stream("combat").next_u64();
+        let before = rng.snapshot();
+
+        // Unknown name in the snapshot.
+        let mut bad = before.clone();
+        bad.insert("typo".to_owned(), 123);
+        assert_eq!(
+            rng.restore(&bad),
+            Err(RngError::UnknownStream {
+                name: "typo".to_owned()
+            })
+        );
+        // Partial snapshot (missing name) is rejected by exact restore.
+        let mut partial = before.clone();
+        partial.remove("ai");
+        assert_eq!(
+            rng.restore(&partial),
+            Err(RngError::MissingStream {
+                name: "ai".to_owned()
+            })
+        );
+
+        assert_eq!(rng.snapshot(), before, "no stream state changed");
+        // Future draws are identical to a reference that never attempted the
+        // failed restores.
+        let mut reference = RngStreams::new(42);
+        reference.register("combat", 1).expect("register");
+        reference.register("ai", 2).expect("register");
+        reference.stream("combat").next_u64();
+        for _ in 0..50 {
+            assert_eq!(
+                rng.stream("combat").next_u64(),
+                reference.stream("combat").next_u64()
+            );
+            assert_eq!(
+                rng.stream("ai").next_u64(),
+                reference.stream("ai").next_u64()
+            );
+        }
+
+        // The explicitly named partial update applies known names only.
+        let mut partial_ok = BTreeMap::new();
+        partial_ok.insert("combat".to_owned(), 777);
+        rng.restore_partial(&partial_ok).expect("partial update");
+        assert_eq!(rng.get("combat").map(RngStream::state), Some(777));
+        assert_eq!(
+            rng.get("ai").map(RngStream::state),
+            reference.get("ai").map(RngStream::state),
+            "the partial update left the other stream untouched"
+        );
     }
 }
