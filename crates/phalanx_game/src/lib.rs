@@ -26,8 +26,9 @@ pub mod world;
 pub use defs::{Roster, UnitDef, WeaponDef, slice_roster};
 pub use events::{BattleEvent, CommandFailReason};
 pub use scenario::{
-    SCENARIO_SEED, SPAWN_PAD_A, SPAWN_PAD_B, TEAM_A, TEAM_B, UNITS_PER_TEAM, battle_world,
-    crossing_assault_commands, setup_battle, spawn_team,
+    AUTONOMOUS_PAD_A, AUTONOMOUS_PAD_B, SCENARIO_SEED, SPAWN_PAD_A, SPAWN_PAD_B, TEAM_A, TEAM_B,
+    UNITS_PER_TEAM, battle_world, crossing_assault_commands, setup_autonomous_battle, setup_battle,
+    spawn_team,
 };
 pub use snapshot::extract_snapshot;
 pub use system::{
