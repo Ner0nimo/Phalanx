@@ -165,6 +165,7 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
             request.request_id,
             command_id,
             request.actor,
+            request.session,
             request.tick,
             request.subject,
             request.payload,
@@ -366,6 +367,7 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
         let request = CommandRequest {
             request_id: envelope.request_id(),
             actor: envelope.actor(),
+            session: envelope.session(),
             tick: envelope.tick(),
             subject: envelope.subject(),
             payload: envelope.payload().clone(),
@@ -410,9 +412,11 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{ActorId, CommandPayload, RequestId};
+    use crate::command::{ActorId, CommandPayload, CommandVerdict, RequestId, SessionId};
     use crate::scenario::{SCENARIO_TICKS, record_scenario, setup_scenario};
-    use crate::simulation::TickRate;
+    use crate::simulation::{
+        Phase, Simulation, SimulationRunner, SimulationSystem, SystemId, TickRate,
+    };
 
     #[test]
     fn same_build_replay_reproduces_per_tick_hashes() {
@@ -478,6 +482,74 @@ mod tests {
         assert_eq!(report.tick_hashes(), recording.tick_hashes());
     }
 
+    struct RejectingValidator;
+
+    impl SimulationSystem<CommandPayload> for RejectingValidator {
+        fn id(&self) -> SystemId {
+            SystemId("rejecting-validator")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::ApplyCommands
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "rejecting-validator"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn validate_command(
+            &mut self,
+            _simulation: &Simulation<CommandPayload>,
+            envelope: &CommandEnvelope<CommandPayload>,
+        ) -> CommandVerdict {
+            match envelope.payload() {
+                CommandPayload::Diagnostics { value: 42 } => CommandVerdict::Reject { reason: 7 },
+                _ => CommandVerdict::Accept,
+            }
+        }
+
+        fn run(&mut self, _simulation: &mut Simulation<CommandPayload>, _phase: Phase) {}
+    }
+
+    #[test]
+    fn replay_reproduces_both_applied_and_rejected_commands() {
+        let setup = |runner: &mut SimulationRunner<CommandPayload>| {
+            runner.register_system(RejectingValidator).expect("id");
+        };
+        let mut recorder = ReplayRecorder::new(TickRate::DEFAULT, 0x5EED);
+        setup(recorder.runner_mut());
+        for (request_id, value) in [(1_u64, 1_u64), (2, 42), (3, 3)] {
+            recorder
+                .submit_command(CommandRequest {
+                    request_id: RequestId(request_id),
+                    actor: ActorId(0),
+                    session: SessionId(0),
+                    tick: 2,
+                    subject: None,
+                    payload: CommandPayload::Diagnostics { value },
+                })
+                .expect("structurally valid");
+        }
+        recorder.advance_ticks(3).expect("ticks");
+        let recording = recorder.finish();
+
+        let report = replay_recording(&recording, 3, setup).expect("replay should succeed");
+        assert!(!report.diverged(), "rejected commands replay identically");
+        assert_eq!(report.tick_hashes(), recording.tick_hashes());
+    }
+
     #[test]
     fn altered_command_identifies_the_first_divergent_tick() {
         let mut recording = record_scenario(SCENARIO_TICKS);
@@ -490,6 +562,7 @@ mod tests {
             envelope.request_id(),
             envelope.command_id(),
             envelope.actor(),
+            envelope.session(),
             envelope.tick(),
             envelope.subject(),
             CommandPayload::Diagnostics { value: 999_999 },

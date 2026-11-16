@@ -6,10 +6,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use phalanx_core::command::CommandPayload;
+use phalanx_core::command::{CommandEnvelope, CommandPayload, CommandVerdict};
 use phalanx_core::hash::{CanonicalError, CanonicalReader, CanonicalSink};
 use phalanx_core::simulation::{Phase, Simulation, SimulationRunner, SimulationSystem, SystemId};
 
+use crate::events::CommandFailReason;
 use crate::world::BattleWorld;
 
 /// Shared battle world handle.
@@ -54,6 +55,38 @@ impl SimulationSystem<CommandPayload> for BattleCommandSystem {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn validate_command(
+        &mut self,
+        _simulation: &Simulation<CommandPayload>,
+        envelope: &CommandEnvelope<CommandPayload>,
+    ) -> CommandVerdict {
+        // Application-time validation (lifecycle stage 3, issue #43) against
+        // the authoritative world at the command's target tick: unknown
+        // subjects and invalid attack targets are rejected here, with typed
+        // reason codes, before any command is applied this tick.
+        let Some(subject) = envelope.subject() else {
+            return CommandVerdict::Accept;
+        };
+        let world = self.world.borrow();
+        let Some(state) = world.combat.get(&subject) else {
+            return CommandVerdict::Reject {
+                reason: CommandFailReason::UnknownSubject.code(),
+            };
+        };
+        if let CommandPayload::Attack { target } = envelope.payload() {
+            let valid = world
+                .combat
+                .get(target)
+                .is_some_and(|other| other.team != state.team);
+            if !valid {
+                return CommandVerdict::Reject {
+                    reason: CommandFailReason::InvalidTarget.code(),
+                };
+            }
+        }
+        CommandVerdict::Accept
     }
 
     fn run(&mut self, simulation: &mut Simulation<CommandPayload>, _phase: Phase) {

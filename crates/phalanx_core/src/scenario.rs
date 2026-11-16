@@ -6,7 +6,7 @@
 //! every tick's canonical state hash depends on the commands and the seed.
 //! It is infrastructure validation, not gameplay.
 
-use crate::command::{ActorId, CommandPayload, CommandRequest, RequestId};
+use crate::command::{ActorId, CommandPayload, CommandRequest, RequestId, SessionId};
 use crate::replay::ReplayRecorder;
 use crate::simulation::{
     Phase, Simulation, SimulationRunner, SimulationSystem, SystemId, TickRate,
@@ -26,6 +26,7 @@ pub fn scenario_commands() -> Vec<CommandRequest<CommandPayload>> {
         .map(|index| CommandRequest {
             request_id: RequestId(index + 1),
             actor: ActorId(0),
+            session: SessionId(0),
             tick: 2 * (index + 1),
             subject: None,
             payload: CommandPayload::Diagnostics { value: 100 + index },

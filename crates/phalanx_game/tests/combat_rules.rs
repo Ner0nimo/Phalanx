@@ -75,6 +75,7 @@ fn submit(
         .submit_command(CommandRequest {
             request_id: RequestId(request_id),
             actor: ActorId(actor),
+            session: phalanx_core::command::SessionId(0),
             tick,
             subject,
             payload,
@@ -490,5 +491,68 @@ fn simultaneous_fire_applies_damage_in_ascending_entity_id_order() {
             BattleEvent::MatchOver { winner: 1, tick: 1 },
         ],
         "same-tick volley applies in ascending EntityId order (15 -> 5 -> 0)"
+    );
+}
+
+#[test]
+fn target_invalid_at_application_time_is_rejected_not_applied() {
+    let roster = roster_with_extra(vec![def("unit.glass", 10, 0, 10.0, 10, 20)]);
+    let (mut runner, world) = world_for(roster);
+    let a = spawn(&mut runner, &world, (10.0, 10.0), "unit.striker", 1);
+    let b = spawn(&mut runner, &world, (15.0, 10.0), "unit.glass", 2);
+    // b dies at tick 1 to the attack-move...
+    submit(
+        &mut runner,
+        1,
+        1,
+        1,
+        Some(a),
+        CommandPayload::AttackMove {
+            destination: (10.0, 10.0),
+        },
+    );
+    // ...while an Attack on b is queued for tick 5: structurally valid at
+    // ingress, rejected at application time because b is dead by then.
+    submit(
+        &mut runner,
+        2,
+        1,
+        5,
+        Some(a),
+        CommandPayload::Attack { target: b },
+    );
+    runner.advance_ticks(5).expect("5 ticks");
+
+    {
+        let world = world.borrow();
+        assert!(
+            world
+                .events
+                .contains(&BattleEvent::UnitDestroyed { unit: b, tick: 1 })
+        );
+        assert!(
+            world.events.contains(&BattleEvent::CommandFailed {
+                unit: a,
+                reason: CommandFailReason::InvalidTarget,
+                tick: 5,
+            }),
+            "the tick-5 Attack was rejected at application time"
+        );
+        assert_eq!(
+            world.combat[&a].command,
+            Some(BattleCommand::AttackMove {
+                destination: (10.0, 10.0)
+            }),
+            "the rejected Attack did not replace the current command"
+        );
+    }
+    let outcomes = runner.simulation().applied_outcomes();
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        outcomes.iter().any(|(_, outcome)| *outcome
+            == phalanx_core::command::CommandOutcome::Rejected {
+                reason: CommandFailReason::InvalidTarget.code()
+            }),
+        "the rejection is recorded in the canonical transcript"
     );
 }

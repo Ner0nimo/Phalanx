@@ -162,6 +162,7 @@ fn an_altered_command_diverges_at_its_target_tick() {
         envelope.request_id(),
         envelope.command_id(),
         envelope.actor(),
+        envelope.session(),
         envelope.tick(),
         envelope.subject(),
         CommandPayload::AttackMove {

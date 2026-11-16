@@ -4,12 +4,35 @@
 //! Commands are the only way external actors (players, AI, agents, replay
 //! tools) change authoritative simulation state. An envelope carries a
 //! request ID (for duplicate detection), a command ID (assigned by the
-//! simulation in submission order), the target tick, the actor/source, and a
-//! typed payload. Commands are applied only at their target tick's boundary,
-//! and same-tick commands run in ascending command-ID order, so command
-//! application is tick-indexed and order-stable. Invalid, late, and duplicate
-//! commands are rejected with structured errors; they are never silently
-//! retargeted.
+//! simulation in submission order), the target tick, the actor/source and
+//! session, and a typed payload. Commands are applied only at their target
+//! tick's boundary, and same-tick commands run in ascending command-ID
+//! order, so command application is tick-indexed and order-stable. Invalid,
+//! late, and duplicate commands are rejected with structured errors; they
+//! are never silently retargeted.
+//!
+//! Request identity is scoped to `(ActorId, SessionId, RequestId)` (issue
+//! #41): producers generate local monotonic request IDs per session, so
+//! independent actors — or the same actor in a new session — may reuse the
+//! same local IDs without collision, while a retry within the same
+//! actor+session is always rejected as a duplicate. The envelope schema
+//! version (currently 2, which added the session field) and the simulation
+//! schema version make the identity semantics explicit and versioned for
+//! replay compatibility.
+//!
+//! The command lifecycle has explicit, ordered stages (issue #43):
+//! 1. **Ingress** (`SimulationRunner::submit_command`): envelope schema,
+//!    request identity/dedup, look-ahead and queue limits — structural errors
+//!    are rejected before queue insertion.
+//! 2. **Authorization and state-independent validation**: validator systems
+//!    may reject on policy alone (e.g. actor vs. subject ownership).
+//! 3. **Application-time validation** (`SimulationSystem::validate_command`):
+//!    checked against the authoritative world at the command's target tick,
+//!    in deterministic system execution order; the first rejection wins.
+//! 4. **Deterministic result**: every queued command gets a canonical
+//!    [`CommandOutcome`] (`Applied` or `Rejected { reason }`) recorded in the
+//!    durable transcript, so replays reproduce accepted and rejected commands
+//!    alike.
 
 use crate::entity::EntityId;
 use crate::hash::{
@@ -17,8 +40,10 @@ use crate::hash::{
 };
 
 /// The current command envelope schema version. Replays and savegames record
-/// it so older envelopes can be rejected or migrated explicitly.
-pub const ENVELOPE_VERSION: u32 = 1;
+/// it so older envelopes can be rejected or migrated explicitly. Version 2
+/// added the session field to the request identity (issue #41); version 1
+/// envelopes are rejected as unsupported.
+pub const ENVELOPE_VERSION: u32 = 2;
 
 /// Identifies a client request. Retrying the same request ID is detected as a
 /// duplicate instead of being applied twice.
@@ -35,6 +60,13 @@ pub struct CommandId(pub u64);
 /// or replay tool).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ActorId(pub u64);
+
+/// Identifies the producer session. Request identity is
+/// `(ActorId, SessionId, RequestId)` (issue #41): the same actor starting a
+/// new session (reconnect, new match, replay tool) may reuse local request
+/// IDs, while retries within one actor+session are duplicates.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionId(pub u64);
 
 /// The initial command payload set (`docs/vertical-slice-scenario.md` §4).
 /// Coordinates are `f32` meters, encoded as IEEE-754 LE bits (deterministic;
@@ -56,10 +88,13 @@ pub enum CommandPayload {
 /// assignment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest<P> {
-    /// Client request ID, used for duplicate detection.
+    /// Client request ID, used for duplicate detection within the
+    /// (actor, session) scope.
     pub request_id: RequestId,
     /// Actor/source issuing the command.
     pub actor: ActorId,
+    /// Producer session; request IDs are monotonic per (actor, session).
+    pub session: SessionId,
     /// The tick at whose boundary the command must be applied.
     pub tick: u64,
     /// The unit/entity the command applies to, when the payload is per-unit
@@ -76,6 +111,7 @@ pub struct CommandEnvelope<P> {
     request_id: RequestId,
     command_id: CommandId,
     actor: ActorId,
+    session: SessionId,
     tick: u64,
     subject: Option<EntityId>,
     payload: P,
@@ -83,11 +119,13 @@ pub struct CommandEnvelope<P> {
 
 impl<P> CommandEnvelope<P> {
     /// Creates an envelope, rejecting unsupported schema versions.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         version: u32,
         request_id: RequestId,
         command_id: CommandId,
         actor: ActorId,
+        session: SessionId,
         tick: u64,
         subject: Option<EntityId>,
         payload: P,
@@ -103,6 +141,7 @@ impl<P> CommandEnvelope<P> {
             request_id,
             command_id,
             actor,
+            session,
             tick,
             subject,
             payload,
@@ -131,6 +170,12 @@ impl<P> CommandEnvelope<P> {
     #[must_use]
     pub const fn actor(&self) -> ActorId {
         self.actor
+    }
+
+    /// Returns the producer session of the request.
+    #[must_use]
+    pub const fn session(&self) -> SessionId {
+        self.session
     }
 
     /// Returns the tick at whose boundary the command is applied.
@@ -222,6 +267,54 @@ impl std::fmt::Display for CommandSubmitError {
 }
 
 impl std::error::Error for CommandSubmitError {}
+
+/// A validator's verdict on one queued command at application time
+/// (lifecycle stage 3, issue #43).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandVerdict {
+    /// Accept; the command is applied by a system during
+    /// `Phase::ApplyCommands`.
+    Accept,
+    /// Reject with a validator-defined reason code (the validator documents
+    /// its code space); recorded canonically as [`CommandOutcome::Rejected`].
+    Reject { reason: u64 },
+}
+
+/// The deterministic outcome of a queued command, decided at its target
+/// tick's boundary (lifecycle stage 4, issue #43). Recorded in the durable
+/// canonical transcript, so replays reproduce accepted and rejected commands
+/// alike.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandOutcome {
+    /// No validator rejected it; applied by a system.
+    Applied,
+    /// Rejected at application time with a validator-defined reason code.
+    Rejected { reason: u64 },
+}
+
+impl CanonicalSerialize for CommandOutcome {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        match self {
+            Self::Applied => sink.write_u32(0),
+            Self::Rejected { reason } => {
+                sink.write_u32(1);
+                sink.write_u64(*reason);
+            }
+        }
+    }
+}
+
+impl CanonicalDecode for CommandOutcome {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        match reader.read_u32()? {
+            0 => Ok(Self::Applied),
+            1 => Ok(Self::Rejected {
+                reason: reader.read_u64()?,
+            }),
+            other => Err(CanonicalError::UnknownTag(other)),
+        }
+    }
+}
 
 /// Validated limits for command ingress (issue #39): maximum target-tick
 /// look-ahead, pending-queue saturation per actor and in total, and the
@@ -405,6 +498,18 @@ impl CanonicalDecode for ActorId {
     }
 }
 
+impl CanonicalSerialize for SessionId {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u64(self.0);
+    }
+}
+
+impl CanonicalDecode for SessionId {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        Ok(Self(reader.read_u64()?))
+    }
+}
+
 impl CanonicalSerialize for CommandPayload {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         match self {
@@ -454,6 +559,7 @@ impl<P: CanonicalSerialize> CanonicalSerialize for CommandEnvelope<P> {
         self.request_id.write_canonical(sink);
         self.command_id.write_canonical(sink);
         self.actor.write_canonical(sink);
+        self.session.write_canonical(sink);
         sink.write_u64(self.tick);
         self.subject.write_canonical(sink);
         self.payload.write_canonical(sink);
@@ -472,6 +578,7 @@ impl<P: CanonicalDecode> CanonicalDecode for CommandEnvelope<P> {
         let request_id = RequestId::read_canonical(reader)?;
         let command_id = CommandId::read_canonical(reader)?;
         let actor = ActorId::read_canonical(reader)?;
+        let session = SessionId::read_canonical(reader)?;
         let tick = reader.read_u64()?;
         let subject = CanonicalDecode::read_canonical(reader)?;
         let payload = P::read_canonical(reader)?;
@@ -480,6 +587,7 @@ impl<P: CanonicalDecode> CanonicalDecode for CommandEnvelope<P> {
             request_id,
             command_id,
             actor,
+            session,
             tick,
             subject,
             payload,
@@ -498,6 +606,7 @@ mod tests {
             RequestId(1),
             CommandId(2),
             ActorId(3),
+            SessionId(9),
             4,
             None,
             CommandPayload::Diagnostics { value: 5 },
@@ -508,6 +617,7 @@ mod tests {
         assert_eq!(envelope.request_id(), RequestId(1));
         assert_eq!(envelope.command_id(), CommandId(2));
         assert_eq!(envelope.actor(), ActorId(3));
+        assert_eq!(envelope.session(), SessionId(9));
         assert_eq!(envelope.tick(), 4);
         assert_eq!(
             envelope.payload(),
@@ -518,7 +628,16 @@ mod tests {
     #[test]
     fn unsupported_envelope_version_is_rejected() {
         assert_eq!(
-            CommandEnvelope::new(0, RequestId(1), CommandId(1), ActorId(0), 1, None, ()),
+            CommandEnvelope::new(
+                0,
+                RequestId(1),
+                CommandId(1),
+                ActorId(0),
+                SessionId(0),
+                1,
+                None,
+                ()
+            ),
             Err(CommandSubmitError::UnsupportedVersion {
                 found: 0,
                 expected: ENVELOPE_VERSION
@@ -530,6 +649,7 @@ mod tests {
                 RequestId(1),
                 CommandId(1),
                 ActorId(0),
+                SessionId(0),
                 1,
                 None,
                 ()
