@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use phalanx_core::command::{CommandEnvelope, CommandPayload, CommandVerdict};
+use phalanx_core::context::{SystemError, SystemOutput, TickContext};
 use phalanx_core::hash::{CanonicalError, CanonicalReader, CanonicalSink};
 use phalanx_core::simulation::{Phase, Simulation, SimulationRunner, SimulationSystem, SystemId};
 
@@ -59,6 +60,7 @@ impl SimulationSystem<CommandPayload> for BattleCommandSystem {
 
     fn validate_command(
         &mut self,
+        _ctx: &TickContext,
         _simulation: &Simulation<CommandPayload>,
         envelope: &CommandEnvelope<CommandPayload>,
     ) -> CommandVerdict {
@@ -89,8 +91,14 @@ impl SimulationSystem<CommandPayload> for BattleCommandSystem {
         CommandVerdict::Accept
     }
 
-    fn run(&mut self, simulation: &mut Simulation<CommandPayload>, _phase: Phase) {
+    fn run(
+        &mut self,
+        _ctx: &TickContext,
+        simulation: &mut Simulation<CommandPayload>,
+        _phase: Phase,
+    ) -> Result<SystemOutput<CommandPayload>, SystemError> {
         self.world.borrow_mut().apply_commands(simulation);
+        Ok(SystemOutput::default())
     }
 }
 
@@ -119,8 +127,14 @@ impl SimulationSystem<CommandPayload> for BattleMovementSystem {
         self
     }
 
-    fn run(&mut self, _simulation: &mut Simulation<CommandPayload>, _phase: Phase) {
+    fn run(
+        &mut self,
+        _ctx: &TickContext,
+        _simulation: &mut Simulation<CommandPayload>,
+        _phase: Phase,
+    ) -> Result<SystemOutput<CommandPayload>, SystemError> {
         self.world.borrow_mut().step_movement();
+        Ok(SystemOutput::default())
     }
 }
 
@@ -160,8 +174,14 @@ impl SimulationSystem<CommandPayload> for BattleSystem {
         self.world.borrow_mut().restore_state(reader)
     }
 
-    fn run(&mut self, simulation: &mut Simulation<CommandPayload>, _phase: Phase) {
+    fn run(
+        &mut self,
+        _ctx: &TickContext,
+        simulation: &mut Simulation<CommandPayload>,
+        _phase: Phase,
+    ) -> Result<SystemOutput<CommandPayload>, SystemError> {
         self.world.borrow_mut().step_combat(simulation);
+        Ok(SystemOutput::default())
     }
 }
 

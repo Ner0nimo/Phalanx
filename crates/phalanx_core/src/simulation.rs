@@ -13,12 +13,22 @@
 //! ([`crate::rng`]), and the tick-indexed command buffer
 //! ([`crate::command`]). The phase hooks are placeholders: they define *when*
 //! systems run, not gameplay behavior. No gameplay systems exist yet.
+//!
+//! Every system hook receives the single authoritative [`TickContext`] and
+//! returns a structured [`SystemOutput`] / [`SystemError`] (issue #37,
+//! [`crate::context`]): systems read tick/time/configuration from one context,
+//! emit typed events and intents through a deterministic observable path, and
+//! report failures as structured errors instead of panicking.
 
 use std::collections::BTreeMap;
 
 use crate::command::{
     ActorId, CommandEnvelope, CommandId, CommandLimits, CommandLimitsError, CommandOutcome,
     CommandRequest, CommandSubmitError, CommandVerdict, ENVELOPE_VERSION, RequestId, SessionId,
+};
+use crate::context::{
+    MAX_EVENT_TRANSCRIPT, SYSTEM_ERROR_INTENT_REJECTED, SystemError, SystemEvent, SystemIntent,
+    SystemOutput, SystemTermination, TickContext,
 };
 use crate::entity::EntityAllocator;
 use crate::hash::{
@@ -41,9 +51,11 @@ pub const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 /// layout changes incompatibly (schema 2: bounded command bookkeeping, issue
 /// #39; schema 3: request identity scoped to (actor, session), issue #41;
 /// schema 4: canonical per-command application outcomes, issue #43; schema 5:
-/// RNG registry finalization flag, issue #47).
+/// RNG registry finalization flag, issue #47; schema 6: versioned simulation
+/// config plus the canonical system-event transcript and termination record,
+/// issue #37).
 /// Older-schema replays are rejected at the boundary (issue #30).
-pub const SIMULATION_SCHEMA_VERSION: u32 = 5;
+pub const SIMULATION_SCHEMA_VERSION: u32 = 6;
 
 /// The fixed simulation rate. This configures simulation time, not wall-clock
 /// scheduling: the runner itself never reads the clock.
@@ -91,6 +103,64 @@ impl std::fmt::Display for InvalidTickRate {
 }
 
 impl std::error::Error for InvalidTickRate {}
+
+/// The version of the gameplay-affecting simulation configuration layout
+/// (issue #37). Bumped when the set or meaning of configuration fields changes
+/// incompatibly; written into the canonical simulation state and recorded in
+/// replay compatibility data, and rejected on mismatch at the boundary.
+pub const SIMULATION_CONFIG_VERSION: u32 = 1;
+
+/// Gameplay-affecting simulation configuration (issue #37).
+///
+/// This is the single authoritative configuration object: it lives in
+/// [`Simulation`] (so it is part of the canonical state and of checkpoint
+/// digests), is exposed to systems through [`TickContext`], and is recorded in
+/// replay compatibility data. The tick rate configures simulation time only;
+/// the runner never reads the wall clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SimulationConfig {
+    tick_rate: TickRate,
+}
+
+impl SimulationConfig {
+    /// The default configuration: 20 ticks per second.
+    pub const DEFAULT: Self = Self {
+        tick_rate: TickRate::DEFAULT,
+    };
+
+    /// Creates a configuration with the given fixed tick rate.
+    #[must_use]
+    pub const fn new(tick_rate: TickRate) -> Self {
+        Self { tick_rate }
+    }
+
+    /// The configured fixed tick rate.
+    #[must_use]
+    pub const fn tick_rate(&self) -> TickRate {
+        self.tick_rate
+    }
+
+    /// The configuration layout version (see [`SIMULATION_CONFIG_VERSION`]).
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        SIMULATION_CONFIG_VERSION
+    }
+}
+
+impl CanonicalSerialize for SimulationConfig {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u32(self.tick_rate.ticks_per_second());
+    }
+}
+
+impl CanonicalDecode for SimulationConfig {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        let ticks_per_second = reader.read_u32()?;
+        let tick_rate = TickRate::new(ticks_per_second)
+            .map_err(|_| CanonicalError::InvalidState("tick rate of zero"))?;
+        Ok(Self { tick_rate })
+    }
+}
 
 /// The explicit, versioned simulation phase schedule (`RtsEngineDoc.md` §6.1,
 /// ADR-0001 Decision §3).
@@ -274,10 +344,15 @@ impl CanonicalSerialize for SystemManifest {
 /// Authoritative simulation state owned by the CPU simulation (ADR-0001
 /// Decision §1).
 ///
-/// The state is the simulation tick, the entity allocator, the deterministic
-/// RNG streams, and the tick-indexed command bookkeeping. Gameplay world state
+/// The state is the versioned gameplay-affecting configuration (issue #37),
+/// the simulation tick, the entity allocator, the deterministic RNG streams,
+/// the tick-indexed command bookkeeping, and the canonical system-event
+/// transcript with its termination record (issue #37). Gameplay world state
 /// lands in later milestones; nothing here pretends gameplay systems exist.
-pub struct Simulation<P> {
+///
+/// `E` is the typed system-event payload; it defaults to `()` for
+/// event-less runs.
+pub struct Simulation<P, E = ()> {
     tick: u64,
     rng: RngStreams,
     entities: EntityAllocator,
@@ -309,13 +384,35 @@ pub struct Simulation<P> {
     /// starts a fresh local request-ID sequence.
     last_request_id_per_session: BTreeMap<(ActorId, SessionId), RequestId>,
     next_command_id: u64,
+    /// Gameplay-affecting configuration (issue #37). Part of the canonical
+    /// state; versioned via [`SIMULATION_CONFIG_VERSION`] and recorded in
+    /// replay compatibility data.
+    config: SimulationConfig,
+    /// Canonical transcript of system-emitted events and failures, in
+    /// emission order (issue #37). Bounded to [`MAX_EVENT_TRANSCRIPT`]
+    /// entries; `emitted_event_count` preserves the full total.
+    events: Vec<SystemEvent<E>>,
+    /// Total number of system events emitted since tick 0 (the transcript
+    /// keeps only a bounded window of the most recent ones).
+    emitted_event_count: u64,
+    /// Set when a fatal system error terminated the run (issue #37).
+    /// Canonical: snapshots and replays reproduce the termination.
+    terminated: Option<SystemTermination>,
 }
 
-impl<P> Simulation<P> {
+impl<P, E> Simulation<P, E> {
     /// Creates the initial authoritative state at tick 0 with the given
-    /// explicit master RNG seed.
+    /// explicit master RNG seed and the default configuration.
     #[must_use]
     pub fn new(rng_seed: u64) -> Self {
+        Self::with_config(SimulationConfig::DEFAULT, rng_seed)
+    }
+
+    /// Creates the initial authoritative state at tick 0 with the given
+    /// explicit master RNG seed and the given gameplay-affecting
+    /// configuration (issue #37).
+    #[must_use]
+    pub fn with_config(config: SimulationConfig, rng_seed: u64) -> Self {
         Self {
             tick: 0,
             rng: RngStreams::new(rng_seed),
@@ -327,6 +424,10 @@ impl<P> Simulation<P> {
             current_tick_commands: 0..0,
             last_request_id_per_session: BTreeMap::new(),
             next_command_id: 0,
+            config,
+            events: Vec::new(),
+            emitted_event_count: 0,
+            terminated: None,
         }
     }
 
@@ -409,11 +510,181 @@ impl<P> Simulation<P> {
     ) -> std::collections::btree_map::Keys<'_, u64, Vec<CommandEnvelope<P>>> {
         self.pending_commands.keys()
     }
+
+    /// Returns the gameplay-affecting configuration (issue #37). Also
+    /// exposed to systems through [`TickContext`].
+    #[must_use]
+    pub const fn config(&self) -> SimulationConfig {
+        self.config
+    }
+
+    /// Returns the canonical system-event transcript (bounded window), in
+    /// emission order (issue #37).
+    #[must_use]
+    pub fn events(&self) -> &[SystemEvent<E>] {
+        &self.events
+    }
+
+    /// Returns the total number of system events emitted since tick 0 (the
+    /// transcript keeps only a bounded window of the most recent ones).
+    #[must_use]
+    pub const fn emitted_event_count(&self) -> u64 {
+        self.emitted_event_count
+    }
+
+    /// Returns the fatal termination record, if a fatal system error
+    /// terminated the run (issue #37).
+    #[must_use]
+    pub const fn terminated(&self) -> Option<SystemTermination> {
+        self.terminated
+    }
+
+    /// Records typed events emitted by the system at `system_index` (its
+    /// position in the runner's execution-ordered system list) during `tick`
+    /// into the canonical transcript (issue #37).
+    pub fn record_events(&mut self, tick: u64, system_index: u32, events: Vec<E>) {
+        self.emitted_event_count = self.emitted_event_count.saturating_add(events.len() as u64);
+        for event in events {
+            self.events
+                .push(SystemEvent::output(tick, system_index, event));
+        }
+        self.trim_events();
+    }
+
+    /// Records a system failure (non-fatal, or the fatal terminating one) in
+    /// the canonical transcript (issue #37).
+    pub fn record_failure(&mut self, tick: u64, system_index: u32, code: u32) {
+        self.emitted_event_count = self.emitted_event_count.saturating_add(1);
+        self.events
+            .push(SystemEvent::failure(tick, system_index, code));
+        self.trim_events();
+    }
+
+    /// Records a fatal failure and marks the run terminated (issue #37).
+    pub fn terminate(&mut self, tick: u64, system_index: u32, code: u32) {
+        self.record_failure(tick, system_index, code);
+        self.terminated = Some(SystemTermination::new(tick, system_index, code));
+    }
+
+    /// Keeps only the most recent [`MAX_EVENT_TRANSCRIPT`] transcript entries.
+    fn trim_events(&mut self) {
+        if self.events.len() > MAX_EVENT_TRANSCRIPT {
+            let drop = self.events.len() - MAX_EVENT_TRANSCRIPT;
+            self.events.drain(..drop);
+        }
+    }
+
+    /// Validates that every transcript entry references a system index below
+    /// `system_count`. Called by the runner after decoding a snapshot
+    /// (issue #37).
+    pub fn validate_system_indices(&self, system_count: usize) -> Result<(), CanonicalError> {
+        let count = u32::try_from(system_count)
+            .map_err(|_| CanonicalError::InvalidLength(system_count as u64))?;
+        let valid = self.events.iter().all(|event| event.system_index() < count)
+            && self.terminated.is_none_or(|t| t.system_index() < count);
+        if valid {
+            Ok(())
+        } else {
+            Err(CanonicalError::InvalidState(
+                "system event transcript references an unknown system index",
+            ))
+        }
+    }
+
+    /// The standard command ingress, shared by external submissions and
+    /// system-emitted intents (issue #37). See
+    /// [`SimulationRunner::submit_command`] for the contract.
+    ///
+    /// Returns the assigned [`CommandId`]. Commands targeting the current or a
+    /// past tick, commands beyond the given look-ahead limit, duplicate
+    /// request IDs (at or below the (actor, session) high-water mark),
+    /// saturated pending queues, and unsupported envelope versions are
+    /// rejected with structured errors; commands are never silently
+    /// retargeted.
+    pub fn submit_command_with(
+        &mut self,
+        limits: &CommandLimits,
+        request: CommandRequest<P>,
+    ) -> Result<CommandId, CommandSubmitError> {
+        if request.tick <= self.tick {
+            return Err(CommandSubmitError::LateTick {
+                requested: request.tick,
+                current: self.tick,
+            });
+        }
+        let max_target = self.tick.saturating_add(limits.max_lookahead_ticks);
+        if request.tick > max_target {
+            return Err(CommandSubmitError::LookAheadExceeded {
+                requested: request.tick,
+                current: self.tick,
+                max_lookahead_ticks: limits.max_lookahead_ticks,
+            });
+        }
+        // Per-(actor, session) monotonic high-water mark (issues #39/#41): a
+        // request ID at or below the accepted mark of the same actor+session
+        // is a retry and rejected, so an old retry can never be applied twice,
+        // while the dedup state stays bounded to one entry per actor+session.
+        let identity = (request.actor, request.session);
+        if let Some(&last) = self.last_request_id_per_session.get(&identity) {
+            if request.request_id <= last {
+                return Err(CommandSubmitError::DuplicateRequest {
+                    request_id: request.request_id,
+                });
+            }
+        }
+        // Pending queue limits (issue #39). The queue is already bounded by
+        // max_pending_total, so counting it is O(limit).
+        let pending_total = self.pending_commands.values().map(Vec::len).sum::<usize>();
+        let pending_actor = self
+            .pending_commands
+            .values()
+            .flatten()
+            .filter(|envelope| envelope.actor() == request.actor)
+            .count();
+        let to_u32 = |count: usize| u32::try_from(count).unwrap_or(u32::MAX);
+        if pending_actor >= limits.max_pending_per_actor as usize {
+            return Err(CommandSubmitError::ActorPendingFull {
+                actor: request.actor,
+                count: to_u32(pending_actor),
+                limit: limits.max_pending_per_actor,
+            });
+        }
+        if pending_total >= limits.max_pending_total as usize {
+            return Err(CommandSubmitError::PendingQueueFull {
+                count: to_u32(pending_total),
+                limit: limits.max_pending_total,
+            });
+        }
+        let raw_id = self.next_command_id;
+        self.next_command_id = raw_id
+            .checked_add(1)
+            .ok_or(CommandSubmitError::IdSpaceExhausted)?;
+        let command_id = CommandId(raw_id);
+
+        let envelope = CommandEnvelope::new(
+            ENVELOPE_VERSION,
+            request.request_id,
+            command_id,
+            request.actor,
+            request.session,
+            request.tick,
+            request.subject,
+            request.payload,
+        )?;
+        self.last_request_id_per_session
+            .insert(identity, request.request_id);
+        self.pending_commands
+            .entry(request.tick)
+            .or_default()
+            .push(envelope);
+        Ok(command_id)
+    }
 }
 
 /// Canonical encoding of the authoritative simulation state (ADR-0001
 /// Decision §8, `RtsEngineDoc.md` §13.3, encoding contract in
-/// [`crate::hash`]). Covers the encoding and schema versions, tick, entity
+/// [`crate::hash`]). Covers the encoding, schema, and configuration versions,
+/// the simulation config, tick, entity
 /// allocator, RNG stream states, the command bookkeeping (pending queue,
 /// applied-command count and bounded transcript, per-actor request
 /// high-water marks, command-ID sequence) — the pending queue is
@@ -425,11 +696,15 @@ impl<P> Simulation<P> {
 /// tick (issue #38). Ordering is stable and logical (slot index, stream
 /// name, tick, command ID) and never depends on storage layout.
 /// Renderer/GPU state and wall-clock data cannot enter because the
-/// authoritative types do not contain them.
-impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
+/// authoritative types do not contain them. The canonical system-event
+/// transcript and termination record (issue #37) are covered too, so event
+/// and failure ordering is checkpointed like every other state.
+impl<P: CanonicalSerialize, E: CanonicalSerialize> CanonicalSerialize for Simulation<P, E> {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u32(CANONICAL_ENCODING_VERSION);
         sink.write_u32(SIMULATION_SCHEMA_VERSION);
+        sink.write_u32(SIMULATION_CONFIG_VERSION);
+        self.config.write_canonical(sink);
         sink.write_u64(self.tick);
         self.entities.write_canonical(sink);
         self.rng.write_canonical(sink);
@@ -439,10 +714,13 @@ impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
         self.applied_outcomes.write_canonical(sink);
         self.last_request_id_per_session.write_canonical(sink);
         sink.write_u64(self.next_command_id);
+        sink.write_u64(self.emitted_event_count);
+        self.events.write_canonical(sink);
+        self.terminated.write_canonical(sink);
     }
 }
 
-impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
+impl<P: CanonicalDecode, E: CanonicalDecode> CanonicalDecode for Simulation<P, E> {
     fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
         let encoding_version = reader.read_u32()?;
         if encoding_version != CANONICAL_ENCODING_VERSION {
@@ -458,7 +736,16 @@ impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
                 expected: SIMULATION_SCHEMA_VERSION,
             });
         }
+        let config_version = reader.read_u32()?;
+        if config_version != SIMULATION_CONFIG_VERSION {
+            return Err(CanonicalError::UnsupportedVersion {
+                found: config_version,
+                expected: SIMULATION_CONFIG_VERSION,
+            });
+        }
+        let config = SimulationConfig::read_canonical(reader)?;
         Ok(Self {
+            config,
             tick: reader.read_u64()?,
             entities: CanonicalDecode::read_canonical(reader)?,
             rng: CanonicalDecode::read_canonical(reader)?,
@@ -469,11 +756,14 @@ impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
             current_tick_commands: 0..0,
             last_request_id_per_session: CanonicalDecode::read_canonical(reader)?,
             next_command_id: reader.read_u64()?,
+            emitted_event_count: reader.read_u64()?,
+            events: CanonicalDecode::read_canonical(reader)?,
+            terminated: CanonicalDecode::read_canonical(reader)?,
         })
     }
 }
 
-impl<P: CanonicalSerialize> Simulation<P> {
+impl<P: CanonicalSerialize, E: CanonicalSerialize> Simulation<P, E> {
     /// Produces the canonical state digest of the authoritative simulation
     /// state (ADR-0001 Decision §8). The concrete algorithm is hidden behind
     /// [`Digest`]; see [`crate::hash`] for the versioned encoding contract.
@@ -520,7 +810,7 @@ impl CanonicalSerialize for SystemId {
 /// runner executes phases in [`Phase::SCHEDULE`] order; registration order
 /// only breaks exact (phase, order) ties (by [`SystemId`]) and is therefore
 /// never what defines the schedule.
-pub trait SimulationSystem<P> {
+pub trait SimulationSystem<P, E = ()> {
     /// The stable, unique identity of this system.
     fn id(&self) -> SystemId;
 
@@ -563,17 +853,33 @@ pub trait SimulationSystem<P> {
     /// before that phase runs — i.e. against the authoritative world state at
     /// application time. The first [`CommandVerdict::Reject`] wins and becomes
     /// the command's canonical [`CommandOutcome`]. The default accepts.
+    ///
+    /// The hook also receives the authoritative [`TickContext`] (issue #37).
     fn validate_command(
         &mut self,
-        _simulation: &Simulation<P>,
+        _ctx: &TickContext,
+        _simulation: &Simulation<P, E>,
         _envelope: &CommandEnvelope<P>,
     ) -> CommandVerdict {
         CommandVerdict::Accept
     }
 
-    /// Executes the system for the current tick. Placeholder hooks must not
-    /// pretend gameplay systems exist.
-    fn run(&mut self, simulation: &mut Simulation<P>, phase: Phase);
+    /// Executes the system for the current tick with the authoritative
+    /// [`TickContext`] (issue #37): tick, tick rate, and time step come from
+    /// the single context, never from values captured by the system itself.
+    ///
+    /// The hook returns a structured [`SystemOutput`] (typed events and
+    /// internal intents, which the runner applies deterministically right
+    /// after the hook) or a structured [`SystemError`]. A non-fatal
+    /// [`SystemError::Event`] is recorded in the canonical system-event
+    /// transcript and the tick continues; [`SystemError::Fatal`] terminates
+    /// the run deterministically. Panics are not the normal error path.
+    fn run(
+        &mut self,
+        ctx: &TickContext,
+        simulation: &mut Simulation<P, E>,
+        phase: Phase,
+    ) -> Result<SystemOutput<P, E>, SystemError>;
 }
 
 /// Structured reasons system registration is rejected.
@@ -639,11 +945,48 @@ impl std::fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+/// Errors returned when advancing the simulation by one tick (issue #37).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StepError {
+    /// The authoritative tick counter cannot represent another tick.
+    TickOverflow(TickOverflow),
+    /// A fatal system error terminated the run. The termination is recorded
+    /// in canonical state, so snapshots and replays reproduce it; further
+    /// ticks are refused.
+    Terminated {
+        /// The canonical termination record.
+        termination: SystemTermination,
+    },
+}
+
+impl From<TickOverflow> for StepError {
+    fn from(error: TickOverflow) -> Self {
+        Self::TickOverflow(error)
+    }
+}
+
+impl std::fmt::Display for StepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TickOverflow(error) => write!(formatter, "{error}"),
+            Self::Terminated { termination } => write!(
+                formatter,
+                "run terminated by fatal system error at tick {} (system index {}, code {})",
+                termination.tick(),
+                termination.system_index(),
+                termination.code()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StepError {}
+
 /// The canonical checkpoint digest over the simulation and every registered
 /// system's canonical state, keyed by system ID in execution order.
-fn checkpoint_digest<P: CanonicalSerialize>(
-    simulation: &Simulation<P>,
-    systems: &[RegisteredSystem<P>],
+fn checkpoint_digest<P: CanonicalSerialize, E: CanonicalSerialize>(
+    simulation: &Simulation<P, E>,
+    systems: &[RegisteredSystem<P, E>],
 ) -> Digest {
     let mut sink = HashSink::new(DigestAlgorithm::current());
     simulation.write_canonical(&mut sink);
@@ -657,11 +1000,11 @@ fn checkpoint_digest<P: CanonicalSerialize>(
     sink.finish()
 }
 
-struct RegisteredSystem<P> {
+struct RegisteredSystem<P, E> {
     id: SystemId,
     phase: Phase,
     order: u64,
-    system: Box<dyn SimulationSystem<P>>,
+    system: Box<dyn SimulationSystem<P, E>>,
 }
 
 /// The fixed-tick, CPU-only, deterministic simulation loop.
@@ -670,25 +1013,30 @@ struct RegisteredSystem<P> {
 /// callers step exactly one tick with [`SimulationRunner::step_tick`] or an
 /// exact count with [`SimulationRunner::advance_ticks`]. No sleeping, window,
 /// or wall-clock read is involved.
-pub struct SimulationRunner<P> {
-    simulation: Simulation<P>,
-    tick_rate: TickRate,
-    systems: Vec<RegisteredSystem<P>>,
+///
+/// The gameplay-affecting configuration (tick rate) lives in the
+/// [`Simulation`]'s canonical [`SimulationConfig`] (issue #37), so it is part
+/// of every checkpoint digest and is exposed to systems through
+/// [`TickContext`]. `E` is the typed system-event payload (`()` for
+/// event-less runs).
+pub struct SimulationRunner<P, E = ()> {
+    simulation: Simulation<P, E>,
+    systems: Vec<RegisteredSystem<P, E>>,
     manifest: Option<SystemManifest>,
     hashes: Vec<Digest>,
     record_hashes: bool,
     command_limits: CommandLimits,
 }
 
-impl<P: CanonicalSerialize> SimulationRunner<P> {
+impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
     /// Creates a runner at the given fixed tick rate with the given explicit
-    /// master RNG seed and no systems registered. Per-tick state hash
-    /// recording is enabled by default.
+    /// master RNG seed and no systems registered. The tick rate becomes part
+    /// of the simulation's canonical configuration (issue #37). Per-tick
+    /// state hash recording is enabled by default.
     #[must_use]
     pub fn new(tick_rate: TickRate, rng_seed: u64) -> Self {
         Self {
-            simulation: Simulation::new(rng_seed),
-            tick_rate,
+            simulation: Simulation::with_config(SimulationConfig::new(tick_rate), rng_seed),
             systems: Vec::new(),
             manifest: None,
             hashes: Vec::new(),
@@ -736,28 +1084,29 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         self.record_hashes = enabled;
     }
 
-    /// Returns the configured fixed tick rate.
+    /// Returns the configured fixed tick rate, from the simulation's canonical
+    /// configuration (issue #37).
     #[must_use]
-    pub const fn tick_rate(&self) -> TickRate {
-        self.tick_rate
+    pub fn tick_rate(&self) -> TickRate {
+        self.simulation.config().tick_rate()
     }
 
     /// Returns the authoritative simulation state.
     #[must_use]
-    pub const fn simulation(&self) -> &Simulation<P> {
+    pub const fn simulation(&self) -> &Simulation<P, E> {
         &self.simulation
     }
 
     /// Returns mutable access to the authoritative simulation state, for
     /// setup (world construction, spawning) outside system hooks.
     #[must_use]
-    pub fn simulation_mut(&mut self) -> &mut Simulation<P> {
+    pub fn simulation_mut(&mut self) -> &mut Simulation<P, E> {
         &mut self.simulation
     }
 
     /// Returns the registered system with the given ID, for inspection and
     /// downcast access (via [`SimulationSystem::as_any`]).
-    pub fn system_mut(&mut self, id: SystemId) -> Option<&mut dyn SimulationSystem<P>> {
+    pub fn system_mut(&mut self, id: SystemId) -> Option<&mut dyn SimulationSystem<P, E>> {
         for registered in &mut self.systems {
             if registered.id == id {
                 return Some(&mut *registered.system);
@@ -772,7 +1121,7 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     /// checkpoints and snapshots.
     pub fn register_system<S>(&mut self, system: S) -> Result<&mut Self, SystemRegistrationError>
     where
-        S: SimulationSystem<P> + 'static,
+        S: SimulationSystem<P, E> + 'static,
     {
         if self.manifest.is_some() || self.simulation.tick > 0 {
             return Err(SystemRegistrationError::RegistryFrozen);
@@ -840,7 +1189,7 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     }
 
     /// The registered systems in deterministic execution order.
-    fn ordered_systems(&self) -> &[RegisteredSystem<P>] {
+    fn ordered_systems(&self) -> &[RegisteredSystem<P, E>] {
         &self.systems
     }
 
@@ -879,10 +1228,16 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     pub fn restore_snapshot(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>
     where
         P: CanonicalDecode,
+        E: CanonicalDecode,
     {
         let mut reader = CanonicalReader::new(bytes);
         self.simulation =
             Simulation::read_canonical(&mut reader).map_err(SnapshotError::Canonical)?;
+        // The system-event transcript references systems by execution index
+        // (issue #37): validate the indices against this runner's registry.
+        self.simulation
+            .validate_system_indices(self.systems.len())
+            .map_err(SnapshotError::Canonical)?;
         // Recorded per-tick digests beyond the restored tick are stale.
         self.hashes
             .truncate(usize::try_from(self.simulation.tick).unwrap_or(usize::MAX));
@@ -924,109 +1279,52 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     /// request IDs (at or below the actor's high-water mark), saturated
     /// pending queues, and unsupported envelope versions are rejected with
     /// structured errors; commands are never silently retargeted.
+    ///
+    /// This is the standard ingress: system-emitted intents
+    /// ([`SystemIntent::Command`], issue #37) go through the exact same path,
+    /// with the same explicit target-tick and ascending command-ID ordering
+    /// semantics.
     pub fn submit_command(
         &mut self,
         request: CommandRequest<P>,
     ) -> Result<CommandId, CommandSubmitError> {
-        if request.tick <= self.simulation.tick {
-            return Err(CommandSubmitError::LateTick {
-                requested: request.tick,
-                current: self.simulation.tick,
-            });
-        }
-        let max_target = self
-            .simulation
-            .tick
-            .saturating_add(self.command_limits.max_lookahead_ticks);
-        if request.tick > max_target {
-            return Err(CommandSubmitError::LookAheadExceeded {
-                requested: request.tick,
-                current: self.simulation.tick,
-                max_lookahead_ticks: self.command_limits.max_lookahead_ticks,
-            });
-        }
-        // Per-(actor, session) monotonic high-water mark (issues #39/#41): a
-        // request ID at or below the accepted mark of the same actor+session
-        // is a retry and rejected, so an old retry can never be applied twice,
-        // while the dedup state stays bounded to one entry per actor+session.
-        // Different actors — or the same actor in a new session — may reuse
-        // local request IDs.
-        let identity = (request.actor, request.session);
-        if let Some(&last) = self.simulation.last_request_id_per_session.get(&identity) {
-            if request.request_id <= last {
-                return Err(CommandSubmitError::DuplicateRequest {
-                    request_id: request.request_id,
-                });
-            }
-        }
-        // Pending queue limits (issue #39). The queue is already bounded by
-        // max_pending_total, so counting it is O(limit).
-        let pending_total = self
-            .simulation
-            .pending_commands
-            .values()
-            .map(Vec::len)
-            .sum::<usize>();
-        let pending_actor = self
-            .simulation
-            .pending_commands
-            .values()
-            .flatten()
-            .filter(|envelope| envelope.actor() == request.actor)
-            .count();
-        let to_u32 = |count: usize| u32::try_from(count).unwrap_or(u32::MAX);
-        if pending_actor >= self.command_limits.max_pending_per_actor as usize {
-            return Err(CommandSubmitError::ActorPendingFull {
-                actor: request.actor,
-                count: to_u32(pending_actor),
-                limit: self.command_limits.max_pending_per_actor,
-            });
-        }
-        if pending_total >= self.command_limits.max_pending_total as usize {
-            return Err(CommandSubmitError::PendingQueueFull {
-                count: to_u32(pending_total),
-                limit: self.command_limits.max_pending_total,
-            });
-        }
-        let raw_id = self.simulation.next_command_id;
-        self.simulation.next_command_id = raw_id
-            .checked_add(1)
-            .ok_or(CommandSubmitError::IdSpaceExhausted)?;
-        let command_id = CommandId(raw_id);
-
-        let envelope = CommandEnvelope::new(
-            ENVELOPE_VERSION,
-            request.request_id,
-            command_id,
-            request.actor,
-            request.session,
-            request.tick,
-            request.subject,
-            request.payload,
-        )?;
         self.simulation
-            .last_request_id_per_session
-            .insert(identity, request.request_id);
-        self.simulation
-            .pending_commands
-            .entry(request.tick)
-            .or_default()
-            .push(envelope);
-        Ok(command_id)
+            .submit_command_with(&self.command_limits, request)
     }
 
     /// Advances the simulation by exactly one tick: increments the
     /// authoritative tick counter, drains the commands assigned to that tick
     /// in ascending command-ID order, then executes every phase in
-    /// [`Phase::SCHEDULE`] order. Never reads wall-clock time.
-    pub fn step_tick(&mut self) -> Result<(), TickOverflow> {
+    /// [`Phase::SCHEDULE`] order. Every hook receives the single authoritative
+    /// [`TickContext`] for this tick (issue #37). Never reads wall-clock time.
+    ///
+    /// System outputs are applied deterministically right after each hook:
+    /// events land in the canonical system-event transcript, intents go
+    /// through the standard command ingress. A non-fatal
+    /// [`SystemError::Event`] is recorded as a transcript failure and the tick
+    /// continues; a [`SystemError::Fatal`] terminates the run (recorded
+    /// canonically) and this returns [`StepError::Terminated`]. The
+    /// terminating tick's checkpoint digest is still recorded, so replays
+    /// compare it like any other tick.
+    pub fn step_tick(&mut self) -> Result<(), StepError> {
+        if let Some(termination) = self.simulation.terminated {
+            return Err(StepError::Terminated { termination });
+        }
         // One-way lifecycle: the first tick implicitly finalizes the system
         // registry and the RNG stream registry (issue #47), so neither can
         // change mid-run.
         self.finalize_registry();
         self.simulation.rng.finalize();
-        let next_tick = self.simulation.tick.checked_add(1).ok_or(TickOverflow)?;
+        let next_tick = self
+            .simulation
+            .tick
+            .checked_add(1)
+            .ok_or(StepError::TickOverflow(TickOverflow))?;
         self.simulation.tick = next_tick;
+        // The single authoritative context handed to every system hook this
+        // tick (issue #37): tick + time-step configuration from the canonical
+        // simulation config.
+        let ctx = TickContext::new(next_tick, self.simulation.config().tick_rate());
         let mut commands = self
             .simulation
             .pending_commands
@@ -1045,9 +1343,10 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             let mut outcome = CommandOutcome::Applied;
             for registered in &mut self.systems {
                 if registered.phase == Phase::ApplyCommands {
-                    if let CommandVerdict::Reject { reason } = registered
-                        .system
-                        .validate_command(&self.simulation, envelope)
+                    if let CommandVerdict::Reject { reason } =
+                        registered
+                            .system
+                            .validate_command(&ctx, &self.simulation, envelope)
                     {
                         outcome = CommandOutcome::Rejected { reason };
                         break;
@@ -1071,10 +1370,56 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             command_limits,
             ..
         } = self;
-        for phase in Phase::SCHEDULE {
-            for registered in systems.iter_mut() {
-                if registered.phase == phase {
-                    registered.system.run(simulation, phase);
+        let mut termination: Option<SystemTermination> = None;
+        'phases: for phase in Phase::SCHEDULE {
+            for (system_index, registered) in systems.iter_mut().enumerate() {
+                if registered.phase != phase {
+                    continue;
+                }
+                let system_index = u32::try_from(system_index).unwrap_or(u32::MAX);
+                match registered.system.run(&ctx, simulation, phase) {
+                    Ok(output) => {
+                        // Structured outputs are applied right after the hook,
+                        // in emission order (issue #37): events into the
+                        // canonical transcript, intents through the standard
+                        // ingress.
+                        let (events, intents) = output.into_parts();
+                        if !events.is_empty() {
+                            simulation.record_events(ctx.tick(), system_index, events);
+                        }
+                        for intent in intents {
+                            let SystemIntent::Command(request) = intent;
+                            if simulation
+                                .submit_command_with(command_limits, request)
+                                .is_err()
+                            {
+                                // An intent that ingress rejects violates
+                                // the ingress contract (e.g. a target tick
+                                // at or before the current tick):
+                                // terminate deterministically instead of
+                                // silently dropping the intent.
+                                simulation.terminate(
+                                    ctx.tick(),
+                                    system_index,
+                                    SYSTEM_ERROR_INTENT_REJECTED,
+                                );
+                                termination = simulation.terminated;
+                                break 'phases;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        simulation.record_failure(ctx.tick(), system_index, error.code());
+                        if error.is_fatal() {
+                            simulation.terminated = Some(SystemTermination::new(
+                                ctx.tick(),
+                                system_index,
+                                error.code(),
+                            ));
+                            termination = simulation.terminated;
+                            break 'phases;
+                        }
+                    }
                 }
             }
         }
@@ -1091,19 +1436,24 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         // Bound the in-state applied transcript (issue #39): keep only the
         // most recent `max_applied_history` entries; the total count keeps
         // the full number. This keeps canonical hash cost independent of
-        // match duration.
+        // match duration. The system-event transcript is bounded the same way
+        // (issue #37).
         let cap = usize::try_from(command_limits.max_applied_history).unwrap_or(usize::MAX);
         if simulation.applied_commands.len() > cap {
             let drop = simulation.applied_commands.len() - cap;
             simulation.applied_commands.drain(..drop);
             simulation.applied_outcomes.drain(..drop);
         }
+        simulation.trim_events();
+        if let Some(termination) = termination {
+            return Err(StepError::Terminated { termination });
+        }
         Ok(())
     }
 
     /// Advances the simulation by exactly `count` ticks. This is the
     /// deterministic stepping API used by tests and replay tools.
-    pub fn advance_ticks(&mut self, count: u64) -> Result<(), TickOverflow> {
+    pub fn advance_ticks(&mut self, count: u64) -> Result<(), StepError> {
         for _ in 0..count {
             self.step_tick()?;
         }
@@ -1121,6 +1471,7 @@ mod tests {
         ActorId, CommandId, CommandLimits, CommandLimitsError, CommandOutcome, CommandVerdict,
         InvalidCommandLimits, RequestId, SessionId,
     };
+    use crate::context::SystemEventKind;
     use crate::hash::canonical_encode;
 
     type Trace = Rc<RefCell<Vec<(u64, Phase, &'static str)>>>;
@@ -1163,7 +1514,12 @@ mod tests {
             self
         }
 
-        fn run(&mut self, simulation: &mut Simulation<P>, phase: Phase) {
+        fn run(
+            &mut self,
+            _ctx: &TickContext,
+            simulation: &mut Simulation<P>,
+            phase: Phase,
+        ) -> Result<SystemOutput<P>, SystemError> {
             self.trace
                 .borrow_mut()
                 .push((simulation.tick(), phase, self.name));
@@ -1173,6 +1529,7 @@ mod tests {
                     .borrow_mut()
                     .push((simulation.tick(), count));
             }
+            Ok(SystemOutput::default())
         }
     }
 
@@ -1397,7 +1754,12 @@ mod tests {
                 self
             }
 
-            fn run(&mut self, simulation: &mut Simulation<u32>, _phase: Phase) {
+            fn run(
+                &mut self,
+                _ctx: &TickContext,
+                simulation: &mut Simulation<u32>,
+                _phase: Phase,
+            ) -> Result<SystemOutput<u32>, SystemError> {
                 self.log.borrow_mut().push((
                     simulation.tick(),
                     simulation
@@ -1407,6 +1769,7 @@ mod tests {
                         .copied()
                         .collect(),
                 ));
+                Ok(SystemOutput::default())
             }
         }
 
@@ -1521,7 +1884,10 @@ mod tests {
         let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
         runner.simulation.tick = u64::MAX;
 
-        assert_eq!(runner.step_tick(), Err(TickOverflow));
+        assert_eq!(
+            runner.step_tick(),
+            Err(StepError::TickOverflow(TickOverflow))
+        );
         assert_eq!(runner.simulation().tick(), u64::MAX);
     }
 
@@ -1583,7 +1949,12 @@ mod tests {
                 self
             }
 
-            fn run(&mut self, simulation: &mut Simulation<()>, _phase: Phase) {
+            fn run(
+                &mut self,
+                _ctx: &TickContext,
+                simulation: &mut Simulation<()>,
+                _phase: Phase,
+            ) -> Result<SystemOutput<()>, SystemError> {
                 let entity = simulation
                     .entities_mut()
                     .allocate()
@@ -1599,6 +1970,7 @@ mod tests {
                     entity.generation(),
                     draw,
                 ));
+                Ok(SystemOutput::default())
             }
         }
 
@@ -1698,8 +2070,14 @@ mod tests {
             reader.finish()
         }
 
-        fn run(&mut self, simulation: &mut Simulation<u32>, _phase: Phase) {
+        fn run(
+            &mut self,
+            _ctx: &TickContext,
+            simulation: &mut Simulation<u32>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32>, SystemError> {
             self.count += simulation.commands_for_current_tick().len() as u64 + 1;
+            Ok(SystemOutput::default())
         }
     }
 
@@ -2005,6 +2383,7 @@ mod tests {
 
         fn validate_command(
             &mut self,
+            _ctx: &TickContext,
             _simulation: &Simulation<u32>,
             envelope: &CommandEnvelope<u32>,
         ) -> CommandVerdict {
@@ -2015,7 +2394,14 @@ mod tests {
             }
         }
 
-        fn run(&mut self, _simulation: &mut Simulation<u32>, _phase: Phase) {}
+        fn run(
+            &mut self,
+            _ctx: &TickContext,
+            _simulation: &mut Simulation<u32>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32>, SystemError> {
+            Ok(SystemOutput::default())
+        }
     }
 
     #[test]
@@ -2167,7 +2553,14 @@ mod tests {
             fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
                 self
             }
-            fn run(&mut self, _simulation: &mut Simulation<u32>, _phase: Phase) {}
+            fn run(
+                &mut self,
+                _ctx: &TickContext,
+                _simulation: &mut Simulation<u32>,
+                _phase: Phase,
+            ) -> Result<SystemOutput<u32>, SystemError> {
+                Ok(SystemOutput::default())
+            }
         }
 
         let mut a: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
@@ -2280,7 +2673,14 @@ mod tests {
             self
         }
 
-        fn run(&mut self, _simulation: &mut Simulation<P>, _phase: Phase) {}
+        fn run(
+            &mut self,
+            _ctx: &TickContext,
+            _simulation: &mut Simulation<P>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<P>, SystemError> {
+            Ok(SystemOutput::default())
+        }
     }
 
     fn noop(id: &'static str, phase: Phase, order: u64) -> Noop {
@@ -2371,6 +2771,424 @@ mod tests {
                 .register_system(noop("late", Phase::EmitEvents, 0))
                 .map(|_| ()),
             Err(SystemRegistrationError::RegistryFrozen)
+        );
+    }
+    // ---- issue #37: deterministic tick context and structured outputs ----
+
+    struct ContextProbe {
+        log: Rc<RefCell<Vec<(u64, u32, f32)>>>,
+    }
+
+    impl SimulationSystem<u32, u64> for ContextProbe {
+        fn id(&self) -> SystemId {
+            SystemId("context-probe")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::UpdateEconomy
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "context-probe"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            ctx: &TickContext,
+            _simulation: &mut Simulation<u32, u64>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32, u64>, SystemError> {
+            self.log.borrow_mut().push((
+                ctx.tick(),
+                ctx.tick_rate().ticks_per_second(),
+                ctx.dt_seconds(),
+            ));
+            Ok(SystemOutput::default())
+        }
+    }
+
+    #[test]
+    fn systems_obtain_tick_and_config_from_the_single_authoritative_context() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let rate = TickRate::new(30).expect("valid rate");
+        let mut runner: SimulationRunner<u32, u64> = SimulationRunner::new(rate, SEED);
+        runner
+            .register_system(ContextProbe { log: log.clone() })
+            .expect("id");
+        // The config is part of the simulation API and of canonical state.
+        assert_eq!(runner.simulation().config().tick_rate(), rate);
+        assert_eq!(runner.tick_rate(), rate);
+        assert_eq!(
+            runner.simulation().config().version(),
+            SIMULATION_CONFIG_VERSION
+        );
+        runner.advance_ticks(3).expect("advance");
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                (1, 30, 1.0 / 30.0),
+                (2, 30, 1.0 / 30.0),
+                (3, 30, 1.0 / 30.0)
+            ]
+        );
+        // A different tick rate changes the context AND the canonical state.
+        let mut other: SimulationRunner<u32, u64> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        other
+            .register_system(ContextProbe {
+                log: Rc::new(RefCell::new(Vec::new())),
+            })
+            .expect("id");
+        other.advance_ticks(1).expect("advance");
+        assert_ne!(
+            runner.simulation().canonical_digest(),
+            other.simulation().canonical_digest(),
+            "the config is part of the canonical state"
+        );
+    }
+
+    struct Emitter {
+        events_per_tick: u64,
+        intent_at_tick: Option<u64>,
+    }
+
+    impl SimulationSystem<u32, u64> for Emitter {
+        fn id(&self) -> SystemId {
+            SystemId("emitter")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::UpdateEconomy
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "emitter"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            ctx: &TickContext,
+            _simulation: &mut Simulation<u32, u64>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32, u64>, SystemError> {
+            let mut output = SystemOutput::default();
+            for i in 0..self.events_per_tick {
+                output.emit_event(ctx.tick() * 100 + i);
+            }
+            if Some(ctx.tick()) == self.intent_at_tick {
+                output.emit_intent(SystemIntent::Command(CommandRequest {
+                    request_id: RequestId(1),
+                    actor: ActorId(9),
+                    session: SessionId(0),
+                    tick: ctx.tick() + 1,
+                    subject: None,
+                    payload: 777,
+                }));
+            }
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn system_events_and_intents_are_recorded_deterministically_in_order() {
+        let build = || {
+            let mut runner: SimulationRunner<u32, u64> =
+                SimulationRunner::new(TickRate::DEFAULT, SEED);
+            runner
+                .register_system(Emitter {
+                    events_per_tick: 2,
+                    intent_at_tick: Some(1),
+                })
+                .expect("id");
+            // An external command for tick 2, submitted before the run starts.
+            runner.submit_command(request(1, 2, 5)).expect("submit");
+            runner
+        };
+        let mut a = build();
+        let mut b = build();
+        a.advance_ticks(3).expect("advance");
+        b.advance_ticks(3).expect("advance");
+
+        // Events: two per tick for ticks 1..=3, in emission order, attributed
+        // to the emitter (the only system, so execution index 0).
+        let events = a.simulation().events();
+        assert_eq!(events.len(), 6);
+        assert_eq!(a.simulation().emitted_event_count(), 6);
+        let expected: Vec<(u64, u64)> = (1..=3_u64)
+            .flat_map(|tick| [(tick * 100, tick), (tick * 100 + 1, tick)])
+            .collect();
+        for (event, (value, tick)) in events.iter().zip(expected) {
+            assert_eq!(event.tick(), tick);
+            assert_eq!(event.system_index(), 0);
+            assert_eq!(event.kind(), &SystemEventKind::Output(value));
+        }
+        // The intent emitted at tick 1 targeted tick 2 and went through the
+        // standard ingress: it got command ID 1 (after the external command
+        // with ID 0) and both applied at tick 2 in ascending command-ID order.
+        let applied = a.simulation().applied_commands();
+        assert_eq!(applied.len(), 2);
+        assert_eq!(applied[0].command_id(), CommandId(0));
+        assert_eq!(applied[0].payload(), &5);
+        assert_eq!(applied[1].command_id(), CommandId(1));
+        assert_eq!(applied[1].payload(), &777);
+        assert_eq!(applied[1].actor(), ActorId(9));
+        assert_eq!(applied[1].tick(), 2);
+        // Identical runs: identical transcripts, digests, and tick hashes.
+        assert_eq!(a.simulation().events(), b.simulation().events());
+        assert_eq!(a.canonical_digest(), b.canonical_digest());
+        assert_eq!(a.tick_hashes(), b.tick_hashes());
+    }
+
+    struct RecoverableFailure {
+        code: u32,
+    }
+
+    impl SimulationSystem<u32, u64> for RecoverableFailure {
+        fn id(&self) -> SystemId {
+            SystemId("recoverable")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::UpdateEconomy
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "recoverable"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            _ctx: &TickContext,
+            _simulation: &mut Simulation<u32, u64>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32, u64>, SystemError> {
+            Err(SystemError::Event {
+                system: self.id(),
+                code: self.code,
+                message: "recoverable probe failure",
+            })
+        }
+    }
+
+    #[test]
+    fn non_fatal_system_error_becomes_a_canonical_event_and_the_tick_continues() {
+        let build = || {
+            let mut runner: SimulationRunner<u32, u64> =
+                SimulationRunner::new(TickRate::DEFAULT, SEED);
+            runner
+                .register_system(RecoverableFailure { code: 7 })
+                .expect("id");
+            runner
+        };
+        let mut a = build();
+        let mut b = build();
+        a.advance_ticks(3)
+            .expect("the tick continues after a non-fatal error");
+        b.advance_ticks(3).expect("advance");
+        let events = a.simulation().events();
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|e| e.system_index() == 0 && e.kind() == &SystemEventKind::Failure { code: 7 })
+        );
+        assert_eq!(a.simulation().terminated(), None);
+        assert_eq!(a.simulation().tick(), 3);
+        // Identical runs record identical failures and digests.
+        assert_eq!(a.simulation().events(), b.simulation().events());
+        assert_eq!(a.canonical_digest(), b.canonical_digest());
+        assert_eq!(a.tick_hashes(), b.tick_hashes());
+    }
+
+    struct FatalAt {
+        tick: u64,
+        code: u32,
+    }
+
+    impl SimulationSystem<u32, u64> for FatalAt {
+        fn id(&self) -> SystemId {
+            SystemId("fatal-at")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::UpdateEconomy
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "fatal-at"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            ctx: &TickContext,
+            _simulation: &mut Simulation<u32, u64>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32, u64>, SystemError> {
+            if ctx.tick() == self.tick {
+                Err(SystemError::Fatal {
+                    system: self.id(),
+                    code: self.code,
+                    message: "fatal probe failure",
+                })
+            } else {
+                Ok(SystemOutput::default())
+            }
+        }
+    }
+
+    #[test]
+    fn fatal_system_error_terminates_the_run_deterministically() {
+        let build = || {
+            let mut runner: SimulationRunner<u32, u64> =
+                SimulationRunner::new(TickRate::DEFAULT, SEED);
+            runner
+                .register_system(FatalAt { tick: 2, code: 9 })
+                .expect("id");
+            runner
+        };
+        let termination = SystemTermination::new(2, 0, 9);
+        let mut a = build();
+        let mut b = build();
+        a.step_tick().expect("tick 1");
+        assert_eq!(a.step_tick(), Err(StepError::Terminated { termination }));
+        // Further ticks are refused.
+        assert_eq!(a.step_tick(), Err(StepError::Terminated { termination }));
+        // The termination and the failure event are canonical state.
+        assert_eq!(a.simulation().terminated(), Some(termination));
+        assert_eq!(a.simulation().events().len(), 1);
+        assert_eq!(
+            a.simulation().events()[0].kind(),
+            &SystemEventKind::Failure { code: 9 }
+        );
+        assert_eq!(a.simulation().events()[0].tick(), 2);
+        // The terminating tick's checkpoint digest was still recorded.
+        assert_eq!(a.tick_hashes().len(), 2);
+        // Identical runs terminate identically.
+        b.step_tick().expect("tick 1");
+        assert_eq!(b.step_tick(), Err(StepError::Terminated { termination }));
+        assert_eq!(a.canonical_digest(), b.canonical_digest());
+        assert_eq!(a.tick_hashes(), b.tick_hashes());
+        // Snapshot/restore preserves the termination and the transcript.
+        let mut c = build();
+        c.restore_snapshot(&a.snapshot()).expect("restore");
+        assert_eq!(c.simulation().terminated(), Some(termination));
+        assert_eq!(c.simulation().events(), a.simulation().events());
+        assert_eq!(c.canonical_digest(), a.canonical_digest());
+    }
+
+    struct BadIntent;
+
+    impl SimulationSystem<u32, u64> for BadIntent {
+        fn id(&self) -> SystemId {
+            SystemId("bad-intent")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::UpdateEconomy
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "bad-intent"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            ctx: &TickContext,
+            _simulation: &mut Simulation<u32, u64>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<u32, u64>, SystemError> {
+            let mut output = SystemOutput::default();
+            // Illegal: the target tick is the current tick, which ingress
+            // rejects as LateTick.
+            output.emit_intent(SystemIntent::Command(CommandRequest {
+                request_id: RequestId(1),
+                actor: ActorId(9),
+                session: SessionId(0),
+                tick: ctx.tick(),
+                subject: None,
+                payload: 1,
+            }));
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn intent_rejected_by_ingress_terminates_instead_of_being_dropped() {
+        let mut runner: SimulationRunner<u32, u64> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner.register_system(BadIntent).expect("id");
+        let termination = SystemTermination::new(1, 0, SYSTEM_ERROR_INTENT_REJECTED);
+        assert_eq!(
+            runner.step_tick(),
+            Err(StepError::Terminated { termination })
+        );
+        assert_eq!(
+            runner.simulation().events()[0].kind(),
+            &SystemEventKind::Failure {
+                code: SYSTEM_ERROR_INTENT_REJECTED
+            }
+        );
+        assert!(
+            runner.simulation().pending_command_ticks().next().is_none(),
+            "the rejected intent was not queued"
         );
     }
 }

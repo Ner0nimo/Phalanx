@@ -21,21 +21,26 @@ use crate::command::{
     ActorId, CommandEnvelope, CommandId, CommandLimits, CommandLimitsError, CommandRequest,
     CommandSubmitError, ENVELOPE_VERSION, RequestId, SessionId,
 };
-use crate::hash::{CanonicalSerialize, Digest, DigestAlgorithm};
+use crate::hash::{CanonicalDecode, CanonicalSerialize, Digest, DigestAlgorithm};
 use crate::rng::SEED_DERIVATION_VERSION;
-use crate::simulation::{SIMULATION_SCHEMA_VERSION, SimulationRunner, SystemManifest, TickRate};
+use crate::simulation::{
+    SIMULATION_CONFIG_VERSION, SIMULATION_SCHEMA_VERSION, SimulationRunner, StepError,
+    SystemManifest, TickRate,
+};
 
 /// The replay container format version. Recorded in every replay; bump on
 /// incompatible format changes. Version 2 added the RNG seed-derivation
 /// version (issue #47); version 3 added the explicit end tick, the recorded
-/// command limits, and named content digests (issue #52).
-pub const REPLAY_FORMAT_VERSION: u32 = 3;
+/// command limits, and named content digests (issue #52); version 4 added the
+/// simulation configuration version (issue #37).
+pub const REPLAY_FORMAT_VERSION: u32 = 4;
 
 /// An immutable record of one deterministic simulation run.
 #[derive(Clone, Debug)]
 pub struct ReplayRecording<P> {
     format_version: u32,
     simulation_version: u32,
+    config_version: u32,
     rng_derivation_version: u32,
     digest_algorithm: DigestAlgorithm,
     system_manifest: SystemManifest,
@@ -57,6 +62,7 @@ impl<P> ReplayRecording<P> {
         Self {
             format_version: REPLAY_FORMAT_VERSION,
             simulation_version: SIMULATION_SCHEMA_VERSION,
+            config_version: SIMULATION_CONFIG_VERSION,
             rng_derivation_version: SEED_DERIVATION_VERSION,
             digest_algorithm: DigestAlgorithm::current(),
             system_manifest: SystemManifest::default(),
@@ -80,6 +86,14 @@ impl<P> ReplayRecording<P> {
     #[must_use]
     pub const fn simulation_version(&self) -> u32 {
         self.simulation_version
+    }
+
+    /// Returns the simulation configuration version the recording was made
+    /// with (issue #37). Replays reject recordings whose gameplay-affecting
+    /// configuration layout differs.
+    #[must_use]
+    pub const fn config_version(&self) -> u32 {
+        self.config_version
     }
 
     /// Returns the RNG seed-derivation algorithm version the recording was
@@ -179,12 +193,12 @@ impl<P> ReplayRecording<P> {
 
 /// Records a deterministic run: wraps a [`SimulationRunner`], capturing every
 /// accepted command envelope and every per-tick state hash.
-pub struct ReplayRecorder<P> {
-    runner: SimulationRunner<P>,
+pub struct ReplayRecorder<P, E = ()> {
+    runner: SimulationRunner<P, E>,
     recording: ReplayRecording<P>,
 }
 
-impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
+impl<P: CanonicalSerialize + Clone, E: CanonicalSerialize> ReplayRecorder<P, E> {
     /// Creates a recorder with the given tick rate and explicit master RNG
     /// seed.
     #[must_use]
@@ -197,13 +211,13 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
 
     /// Returns the wrapped runner.
     #[must_use]
-    pub const fn runner(&self) -> &SimulationRunner<P> {
+    pub const fn runner(&self) -> &SimulationRunner<P, E> {
         &self.runner
     }
 
     /// Returns mutable access to the wrapped runner, for registering systems.
     #[must_use]
-    pub const fn runner_mut(&mut self) -> &mut SimulationRunner<P> {
+    pub const fn runner_mut(&mut self) -> &mut SimulationRunner<P, E> {
         &mut self.runner
     }
 
@@ -240,10 +254,22 @@ impl<P: CanonicalSerialize + Clone> ReplayRecorder<P> {
     /// recording was disabled on the runner; a stale previous digest is never
     /// recorded silently.
     pub fn step_tick(&mut self) -> Result<(), ReplayError> {
+        // Stepping an already-terminated run is an explicit error, not a
+        // silent no-op (issue #37).
+        if let Some(termination) = self.runner.simulation().terminated() {
+            return Err(ReplayError::RunTerminated {
+                tick: termination.tick(),
+            });
+        }
         let recorded_before = self.runner.tick_hashes().len();
-        self.runner
-            .step_tick()
-            .map_err(|_| ReplayError::TickOverflow)?;
+        match self.runner.step_tick() {
+            Ok(()) => {}
+            Err(StepError::TickOverflow(_)) => return Err(ReplayError::TickOverflow),
+            // A fatal system error terminates the run (issue #37), but the
+            // terminating tick still recorded its checkpoint digest, so it is
+            // recorded like any other tick and the run simply ends.
+            Err(StepError::Terminated { .. }) => {}
+        }
         let digest = self
             .runner
             .tick_hashes()
@@ -390,6 +416,13 @@ pub enum ReplayError {
         tick: u64,
         end_tick: u64,
     },
+    /// The simulation configuration version of the recording is not supported
+    /// by this build (issue #37): gameplay-affecting configuration is
+    /// replay compatibility data.
+    IncompatibleConfigVersion { found: u32, expected: u32 },
+    /// The replay run was terminated by a fatal system error (issue #37) and
+    /// stepping was requested again after the termination.
+    RunTerminated { tick: u64 },
     /// The replay ran out of representable ticks.
     TickOverflow,
     /// Per-tick digest recording is disabled, so no fresh state digest exists
@@ -490,6 +523,13 @@ impl std::fmt::Display for ReplayError {
                 formatter,
                 "recorded command {index} targets tick {tick}, beyond the recorded end tick {end_tick}"
             ),
+            Self::IncompatibleConfigVersion { found, expected } => write!(
+                formatter,
+                "incompatible simulation config version {found} (expected {expected})"
+            ),
+            Self::RunTerminated { tick } => {
+                write!(formatter, "replay run already terminated at tick {tick}")
+            }
             Self::TickOverflow => formatter.write_str("replay tick counter overflowed"),
             Self::HashRecordingDisabled => {
                 formatter.write_str("per-tick state hash recording is disabled")
@@ -599,11 +639,14 @@ fn validate_recording_structure<P>(
 /// look-ahead limit relaxed to the maximum because replay submits all
 /// recorded commands at tick 0.
 #[allow(clippy::missing_panics_doc)]
-pub fn replay_recording<P: CanonicalSerialize + Clone>(
+pub fn replay_recording<
+    P: CanonicalSerialize + Clone + CanonicalDecode,
+    E: CanonicalSerialize + CanonicalDecode,
+>(
     recording: &ReplayRecording<P>,
     ticks: u64,
     content: &BTreeMap<String, Digest>,
-    setup: impl FnOnce(&mut SimulationRunner<P>),
+    setup: impl FnOnce(&mut SimulationRunner<P, E>),
 ) -> Result<ReplayReport, ReplayError> {
     if recording.format_version() != REPLAY_FORMAT_VERSION {
         return Err(ReplayError::UnsupportedFormatVersion {
@@ -615,6 +658,12 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
         return Err(ReplayError::UnsupportedSimulationVersion {
             found: recording.simulation_version(),
             expected: SIMULATION_SCHEMA_VERSION,
+        });
+    }
+    if recording.config_version() != SIMULATION_CONFIG_VERSION {
+        return Err(ReplayError::IncompatibleConfigVersion {
+            found: recording.config_version(),
+            expected: SIMULATION_CONFIG_VERSION,
         });
     }
     if recording.rng_derivation_version() != SEED_DERIVATION_VERSION {
@@ -640,7 +689,8 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
             })?;
     }
 
-    let mut runner = SimulationRunner::new(recording.tick_rate(), recording.rng_seed());
+    let mut runner: SimulationRunner<P, E> =
+        SimulationRunner::new(recording.tick_rate(), recording.rng_seed());
     let mut limits = *recording.command_limits();
     limits.max_lookahead_ticks = CommandLimits::MAX_LOOKAHEAD_TICKS;
     runner
@@ -680,7 +730,21 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
     let mut tick_hashes = Vec::new();
     for _ in 0..ticks {
         let recorded_before = runner.tick_hashes().len();
-        runner.step_tick().map_err(|_| ReplayError::TickOverflow)?;
+        match runner.step_tick() {
+            Ok(()) => {}
+            Err(StepError::TickOverflow(_)) => return Err(ReplayError::TickOverflow),
+            // A fatal system error terminated the replay run (issue #37).
+            // The terminating tick still produced a checkpoint digest, which
+            // is compared below like any other tick, then playback stops: the
+            // termination is canonical state, so a replay that terminates at
+            // a different tick than the recording diverges exactly there.
+            Err(StepError::Terminated { .. }) => {
+                if let Some(digest) = runner.tick_hashes().get(recorded_before) {
+                    tick_hashes.push(digest.clone());
+                }
+                break;
+            }
+        }
         let digest = runner
             .tick_hashes()
             .get(recorded_before)
@@ -701,7 +765,7 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
         .find_map(|(index, (actual, expected))| (actual != expected).then_some(index as u64 + 1));
 
     Ok(ReplayReport {
-        ticks_executed: ticks,
+        ticks_executed: tick_hashes.len() as u64,
         tick_hashes,
         first_divergent_tick,
     })
@@ -711,9 +775,11 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
 mod tests {
     use super::*;
     use crate::command::{ActorId, CommandPayload, CommandVerdict, RequestId, SessionId};
+    use crate::context::{SystemError, SystemOutput, TickContext};
     use crate::scenario::{SCENARIO_TICKS, record_scenario, setup_scenario};
     use crate::simulation::{
-        Phase, Simulation, SimulationRunner, SimulationSystem, SystemId, TickRate,
+        Phase, SIMULATION_CONFIG_VERSION, Simulation, SimulationRunner, SimulationSystem, SystemId,
+        TickRate,
     };
 
     #[test]
@@ -762,9 +828,14 @@ mod tests {
         recording.simulation_version = SIMULATION_SCHEMA_VERSION + 1;
         // The rejection must happen before the replay runner is even
         // constructed: the setup closure panics if it is ever called.
-        let result = replay_recording(&recording, 4, &BTreeMap::new(), |_| {
-            panic!("unsupported simulation version must be rejected before setup")
-        });
+        let result = replay_recording(
+            &recording,
+            4,
+            &BTreeMap::new(),
+            |_: &mut SimulationRunner<CommandPayload>| {
+                panic!("unsupported simulation version must be rejected before setup")
+            },
+        );
         assert_eq!(
             result,
             Err(ReplayError::UnsupportedSimulationVersion {
@@ -809,6 +880,7 @@ mod tests {
 
         fn validate_command(
             &mut self,
+            _ctx: &TickContext,
             _simulation: &Simulation<CommandPayload>,
             envelope: &CommandEnvelope<CommandPayload>,
         ) -> CommandVerdict {
@@ -818,7 +890,14 @@ mod tests {
             }
         }
 
-        fn run(&mut self, _simulation: &mut Simulation<CommandPayload>, _phase: Phase) {}
+        fn run(
+            &mut self,
+            _ctx: &TickContext,
+            _simulation: &mut Simulation<CommandPayload>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<CommandPayload>, SystemError> {
+            Ok(SystemOutput::default())
+        }
     }
 
     #[test]
@@ -1155,7 +1234,12 @@ mod tests {
         assert!(!recording.system_manifest().is_empty());
         // Replaying with a different (empty) system set must be rejected
         // explicitly, not silently replayed against different behavior.
-        let result = replay_recording(&recording, 4, &BTreeMap::new(), |_| {});
+        let result = replay_recording(
+            &recording,
+            4,
+            &BTreeMap::new(),
+            |_: &mut SimulationRunner<CommandPayload>| {},
+        );
         assert!(matches!(
             result,
             Err(ReplayError::IncompatibleSystemManifest { .. })
@@ -1185,6 +1269,109 @@ mod tests {
         assert_eq!(
             report.tick_hashes(),
             &recording.tick_hashes()[..SCENARIO_TICKS as usize / 2]
+        );
+    }
+    // ---- issue #37: config version in replay compatibility data; fatal
+    // termination is canonical and replays reproduce it ----
+
+    #[test]
+    fn replay_rejects_incompatible_config_version() {
+        let mut recording = record_scenario(SCENARIO_TICKS);
+        recording.config_version = 0;
+        assert_eq!(
+            replay_recording(&recording, SCENARIO_TICKS, &BTreeMap::new(), setup_scenario),
+            Err(ReplayError::IncompatibleConfigVersion {
+                found: 0,
+                expected: SIMULATION_CONFIG_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn recordings_carry_the_current_config_version() {
+        let recording = record_scenario(SCENARIO_TICKS);
+        assert_eq!(recording.config_version(), SIMULATION_CONFIG_VERSION);
+    }
+
+    struct FatalAtTick2;
+
+    impl SimulationSystem<CommandPayload> for FatalAtTick2 {
+        fn id(&self) -> SystemId {
+            SystemId("fatal-at-2")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::UpdateEconomy
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn name(&self) -> &'static str {
+            "fatal-at-2"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            ctx: &TickContext,
+            _simulation: &mut Simulation<CommandPayload>,
+            _phase: Phase,
+        ) -> Result<SystemOutput<CommandPayload>, SystemError> {
+            if ctx.tick() == 2 {
+                Err(SystemError::Fatal {
+                    system: self.id(),
+                    code: 9,
+                    message: "fatal probe failure",
+                })
+            } else {
+                Ok(SystemOutput::default())
+            }
+        }
+    }
+
+    #[test]
+    fn replay_reproduces_a_fatal_termination_without_divergence() {
+        let setup = |runner: &mut SimulationRunner<CommandPayload>| {
+            runner.register_system(FatalAtTick2).expect("id");
+        };
+        let mut recorder = ReplayRecorder::<CommandPayload>::new(TickRate::DEFAULT, 0xABCD);
+        setup(recorder.runner_mut());
+        // Tick 1 runs; tick 2 terminates fatally but still records its
+        // checkpoint digest, so the recording covers both ticks.
+        recorder.advance_ticks(2).expect("record two ticks");
+        let recording = recorder.finish();
+        assert_eq!(recording.tick_hashes().len(), 2);
+        assert_eq!(recording.end_tick(), 2);
+
+        let report =
+            replay_recording(&recording, 2, &BTreeMap::new(), setup).expect("replay verifies");
+        assert_eq!(report.ticks_executed(), 2);
+        assert_eq!(report.first_divergent_tick(), None);
+        assert_eq!(report.tick_hashes(), recording.tick_hashes());
+    }
+
+    #[test]
+    fn stepping_a_terminated_recording_is_an_explicit_error() {
+        let setup = |runner: &mut SimulationRunner<CommandPayload>| {
+            runner.register_system(FatalAtTick2).expect("id");
+        };
+        let mut recorder = ReplayRecorder::<CommandPayload>::new(TickRate::DEFAULT, 0xABCD);
+        setup(recorder.runner_mut());
+        recorder.advance_ticks(2).expect("record two ticks");
+        // The run terminated at tick 2; stepping again is an explicit error,
+        // not a silent no-op.
+        assert_eq!(
+            recorder.step_tick(),
+            Err(ReplayError::RunTerminated { tick: 2 })
         );
     }
 }

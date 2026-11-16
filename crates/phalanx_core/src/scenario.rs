@@ -9,6 +9,7 @@
 use crate::command::{
     ActorId, CommandEnvelope, CommandPayload, CommandRequest, CommandVerdict, RequestId, SessionId,
 };
+use crate::context::{SystemError, SystemOutput, TickContext};
 use crate::replay::ReplayRecorder;
 use crate::simulation::{
     Phase, Simulation, SimulationRunner, SimulationSystem, SystemId, TickRate,
@@ -74,6 +75,7 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
 
     fn validate_command(
         &mut self,
+        _ctx: &TickContext,
         _simulation: &Simulation<CommandPayload>,
         envelope: &CommandEnvelope<CommandPayload>,
     ) -> CommandVerdict {
@@ -88,7 +90,12 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
         CommandVerdict::Accept
     }
 
-    fn run(&mut self, simulation: &mut Simulation<CommandPayload>, _phase: Phase) {
+    fn run(
+        &mut self,
+        _ctx: &TickContext,
+        simulation: &mut Simulation<CommandPayload>,
+        _phase: Phase,
+    ) -> Result<SystemOutput<CommandPayload>, SystemError> {
         let _ambient = simulation
             .rng_mut()
             .stream("ambient")
@@ -118,6 +125,7 @@ impl SimulationSystem<CommandPayload> for ScenarioSystem {
                 None => stream.next_u64(),
             };
         }
+        Ok(SystemOutput::default())
     }
 }
 
