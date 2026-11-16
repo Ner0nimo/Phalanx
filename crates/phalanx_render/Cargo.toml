@@ -1,0 +1,17 @@
+[package]
+name = "phalanx_render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "wgpu presentation path: headless-capable GPU backend, surface/offscreen presenters, and the windowed frame loop (issue #61). Safe Rust only (workspace forbids unsafe)."
+
+[dependencies]
+# Pinned to the exact version the graphics spike (benchmarks/graphics) is
+# locked to, so both use the same verified wgpu 30.0.1 API surface.
+wgpu = "=30.0.1"
+winit = "0.30"
+pollster = "1"
+
+[lints]
+workspace = true
