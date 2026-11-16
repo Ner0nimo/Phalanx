@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
-use phalanx_core::HeadlessSmokeScenario;
+use phalanx_core::hash::Digest;
+use phalanx_core::scenario::{SCENARIO_SEED, scenario_commands, setup_scenario};
+use phalanx_core::simulation::{SimulationRunner, TickRate};
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1)) {
@@ -12,10 +14,50 @@ fn main() -> ExitCode {
     }
 }
 
+/// The result of one headless run: the final tick, the checkpoint digest of
+/// the full authoritative state, and how many commands were applied.
+struct HeadlessResult {
+    tick: u64,
+    digest: Digest,
+    applied_commands: u64,
+}
+
+/// Runs the deterministic CI scenario through a real `SimulationRunner`
+/// (issue #54): registers the scenario system, submits the scenario command
+/// stream (exercising command ingress), advances exactly `ticks` ticks, and
+/// reports the canonical checkpoint digest. No window, graphics API, or GPU
+/// is involved.
+fn headless_run(seed: u64, ticks: u64) -> Result<HeadlessResult, String> {
+    let mut runner = SimulationRunner::new(TickRate::DEFAULT, seed);
+    setup_scenario(&mut runner);
+    for request in scenario_commands() {
+        runner
+            .submit_command(request)
+            .map_err(|error| error.to_string())?;
+    }
+    runner
+        .advance_ticks(ticks)
+        .map_err(|error| error.to_string())?;
+    Ok(HeadlessResult {
+        tick: runner.simulation().tick(),
+        digest: runner.canonical_digest(),
+        applied_commands: runner.simulation().applied_command_count(),
+    })
+}
+
+fn parse_u64(value: &str) -> Result<u64, String> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).map_err(|_| format!("invalid seed: {value}"))
+    } else {
+        value.parse().map_err(|_| format!("invalid seed: {value}"))
+    }
+}
+
 fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let arguments: Vec<String> = args.collect();
     let mut headless = false;
     let mut ticks = 8_u64;
+    let mut seed = SCENARIO_SEED;
     let mut index = 0;
 
     while index < arguments.len() {
@@ -30,9 +72,16 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("invalid tick count: {value}"))?;
             }
+            "--seed" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or("--seed requires an unsigned integer")?;
+                seed = parse_u64(value)?;
+            }
             "--help" | "-h" => {
                 println!(
-                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT]\n\nRuns the deterministic CPU-only infrastructure smoke scenario."
+                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT] [--seed SEED]\n\nRuns the deterministic CPU-only scenario through SimulationRunner (no graphics initialization)."
                 );
                 return Ok(());
             }
@@ -45,15 +94,16 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         return Err("this bootstrap runtime currently supports only --headless".to_owned());
     }
 
-    let mut scenario = HeadlessSmokeScenario::new();
-    for _ in 0..ticks {
-        scenario.advance_tick().map_err(|error| error.to_string())?;
-    }
-
+    let result = headless_run(seed, ticks)?;
+    let hex: String = result
+        .digest
+        .value()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     println!(
-        "Phalanx headless smoke run: ticks={}, digest=0x{:016x}",
-        scenario.tick(),
-        scenario.digest()
+        "Phalanx headless run: ticks={}, seed=0x{seed:016x}, digest=0x{hex}, applied_commands={}",
+        result.tick, result.applied_commands
     );
     Ok(())
 }
@@ -85,5 +135,23 @@ mod tests {
             .map(str::to_owned))
         .expect_err("invalid tick count must be rejected");
         assert!(error.contains("invalid tick count"));
+    }
+
+    #[test]
+    fn headless_run_uses_the_real_runner_and_is_deterministic() {
+        use super::{SCENARIO_SEED, headless_run, scenario_commands};
+
+        // 16 ticks: all 8 scenario commands (target ticks 2..=16) are applied.
+        let first = headless_run(SCENARIO_SEED, 16).expect("headless run");
+        let second = headless_run(SCENARIO_SEED, 16).expect("headless run");
+        assert_eq!(first.tick, 16);
+        assert_eq!(first.digest, second.digest, "identical seed and inputs");
+        assert_eq!(
+            first.applied_commands,
+            scenario_commands().len() as u64,
+            "the scenario command stream went through command ingress"
+        );
+        let other = headless_run(SCENARIO_SEED + 1, 16).expect("headless run");
+        assert_ne!(first.digest, other.digest, "a different seed diverges");
     }
 }
