@@ -129,6 +129,8 @@ pub fn record_scenario(ticks: u64) -> crate::replay::ReplayRecording<CommandPayl
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::replay::{REPLAY_FORMAT_VERSION, replay_recording};
 
@@ -164,7 +166,7 @@ mod tests {
     #[test]
     fn scenario_replays_without_divergence() {
         let recording = record_scenario(SCENARIO_TICKS);
-        let report = replay_recording(&recording, SCENARIO_TICKS, setup_scenario)
+        let report = replay_recording(&recording, SCENARIO_TICKS, &BTreeMap::new(), setup_scenario)
             .expect("replay should succeed");
         assert_eq!(report.first_divergent_tick(), None);
     }
