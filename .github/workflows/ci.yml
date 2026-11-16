@@ -75,7 +75,9 @@ jobs:
       # exits 0 with a structured no-adapter result after the CPU-only
       # simulation probe.
       - name: Run offscreen autonomous battle probe
-        run: cargo run -p phalanx_runtime -- --graphical --offscreen --battle --frames 8
+        # --perf-overlay (issue #88) additionally emits structured PERF lines
+        # with the per-stage frametime breakdown (sim/snapshot/graphics/total).
+        run: cargo run -p phalanx_runtime -- --graphical --offscreen --battle --frames 8 --perf-overlay
 
   audit:
     name: Dependency audit (cargo audit)

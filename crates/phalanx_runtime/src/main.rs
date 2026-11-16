@@ -11,8 +11,9 @@ use phalanx_game::{
 };
 use phalanx_navigation::{Map, crossing_map};
 use phalanx_render::{
-    BackendError, ClearColor, DEFAULT_CLEAR, DebugPipeline, OBSTACLE_COLOR, OffscreenTarget,
-    OrthoProjection, RenderSnapshot, count_color, demo_shapes, init_headless, run_windowed,
+    BackendError, ClearColor, DEFAULT_CLEAR, DEFAULT_PERF_WINDOW, DebugPipeline, FrameProfiler,
+    FrameTimer, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection, PerfStats, RenderSnapshot,
+    count_color, demo_shapes, init_headless, overlay_projection, overlay_shapes, run_windowed,
     run_windowed_with, team_color, verify_clear_pixels_background, write_ppm,
 };
 
@@ -92,20 +93,27 @@ impl BattleDemo {
         OrthoProjection::new(0.0, self.map.width_m, 0.0, self.map.depth_m).for_aspect(aspect)
     }
 
+    /// The battle view with the perf-overlay strip above the map (issue #88).
+    fn overlay_view(&self, aspect: f32) -> OrthoProjection {
+        overlay_projection(self.map.width_m, self.map.depth_m, aspect)
+    }
+
     /// Extracts the render snapshot of the current tick without stepping.
     fn snapshot(&self) -> RenderSnapshot {
         extract_snapshot(&self.world.borrow(), &self.map, self.tick())
     }
 
-    /// Advances up to `n` simulation ticks. Once the match is over the
-    /// authoritative state is terminal, so no further ticks are stepped.
-    fn advance(&mut self, n: u64) -> Result<(), String> {
+    /// Advances up to `n` simulation ticks and returns how many actually ran.
+    /// Once the match is over the authoritative state is terminal, so no
+    /// further ticks are stepped (returns 0).
+    fn advance(&mut self, n: u64) -> Result<u64, String> {
         if n > 0 && self.world.borrow().match_over.is_none() {
             self.runner
                 .advance_ticks(n)
                 .map_err(|error| error.to_string())?;
+            return Ok(n);
         }
-        Ok(())
+        Ok(0)
     }
 
     /// The winning team once the match is over.
@@ -125,6 +133,18 @@ const OFFSCREEN_SIZE: u32 = 64;
 /// rectangles rasterize to several pixels on the 200 m map.
 const BATTLE_OFFSCREEN_SIZE: u32 = 512;
 
+/// Parsed graphical-mode options (issue #61, extended by #63/#64/#88).
+struct GraphicalOptions {
+    offscreen: bool,
+    frames: u64,
+    ticks: u64,
+    clear: ClearColor,
+    battle: bool,
+    seed: u64,
+    screenshot: Option<String>,
+    perf_overlay: bool,
+}
+
 /// Runs graphical mode (issue #61). `--offscreen` renders `frames` clear
 /// frames to an offscreen texture and verifies the readback pixels, so the
 /// presentation path is exercised and verifiable without a display; without
@@ -135,15 +155,17 @@ const BATTLE_OFFSCREEN_SIZE: u32 = 512;
 /// the autonomous battle runs through a real `SimulationRunner` up to
 /// `ticks` ticks (until `MatchOver`) and each frame is drawn from the
 /// extracted [`RenderSnapshot`].
-fn run_graphical(
-    offscreen: bool,
-    frames: u64,
-    ticks: u64,
-    clear: ClearColor,
-    battle: bool,
-    seed: u64,
-    screenshot: Option<String>,
-) -> Result<(), String> {
+fn run_graphical(options: GraphicalOptions) -> Result<(), String> {
+    let GraphicalOptions {
+        offscreen,
+        frames,
+        ticks,
+        clear,
+        battle,
+        seed,
+        screenshot,
+        perf_overlay,
+    } = options;
     if battle {
         if frames == 0 {
             return Err("--frames must be at least 1 in --battle mode".to_owned());
@@ -151,7 +173,15 @@ fn run_graphical(
         if screenshot.is_some() && !offscreen {
             return Err("--screenshot requires --offscreen in --battle mode".to_owned());
         }
-        return run_battle_graphical(offscreen, frames, ticks, clear, seed, screenshot);
+        return run_battle_graphical(
+            offscreen,
+            frames,
+            ticks,
+            clear,
+            seed,
+            screenshot,
+            perf_overlay,
+        );
     }
     if !offscreen {
         return run_windowed(clear, "Phalanx graphical mode").map_err(|error| error.to_string());
@@ -213,7 +243,8 @@ fn run_battle_to_end(
     demo: &mut BattleDemo,
     max_ticks: u64,
     chunk: u64,
-    mut on_frame: impl FnMut(&RenderSnapshot),
+    profiler: &mut FrameProfiler,
+    mut on_frame: impl FnMut(&RenderSnapshot, &mut FrameTimer, &PerfStats),
 ) -> Result<RenderSnapshot, String> {
     let mut frames = 0_u64;
     loop {
@@ -227,15 +258,30 @@ fn run_battle_to_end(
             ));
         }
         let steps = chunk.min(max_ticks - demo.tick());
-        demo.advance(steps)?;
-        frames += 1;
+        // Issue #88: per-stage frame timing (simulation / snapshot stages here,
+        // graphics stage inside on_frame around the render call).
+        let mut timer = profiler.begin_frame();
+        let steps_done = demo.advance(steps)?;
+        timer.mark_simulation(steps_done.min(u64::from(u32::MAX)) as u32);
         let snapshot = demo.snapshot();
+        timer.mark_snapshot();
+        frames += 1;
         println!(
             "TICK frame={frames} tick={} entities={}",
             snapshot.tick,
             snapshot.entities.len()
         );
-        on_frame(&snapshot);
+        let stats = profiler.stats();
+        on_frame(&snapshot, &mut timer, &stats);
+        profiler.record(timer.finish());
+        if profiler.perf_line_due() {
+            println!("{}", profiler.perf_line());
+        }
+    }
+    // Always emit a final PERF line at the terminal state, so short runs
+    // (few frames) still produce structured output for CI.
+    if profiler.frame() > 0 {
+        println!("{}", profiler.perf_line());
     }
     Ok(demo.snapshot())
 }
@@ -263,30 +309,40 @@ fn run_battle_graphical(
     clear: ClearColor,
     seed: u64,
     screenshot: Option<String>,
+    perf_overlay: bool,
 ) -> Result<(), String> {
     let mut demo = BattleDemo::new(seed)?;
     if !offscreen {
         // Windowed: wall-clock 20 Hz stepping inside the frame callback; the
-        // render rate stays independent of the simulation rate.
+        // render rate stays independent of the simulation rate. Issue #88:
+        // every frame is timed per stage and aggregated in the profiler.
         let mut last = std::time::Instant::now();
         let mut last_logged = 0_u64;
         let mut announced_match = false;
         let mut step_error: Option<String> = None;
+        let mut profiler = FrameProfiler::new(DEFAULT_PERF_WINDOW);
         return run_windowed_with(
             "Phalanx — autonomous battle (graphical)",
             move |device, queue, pipeline, view, aspect| {
+                let mut timer = profiler.begin_frame();
                 let now = std::time::Instant::now();
                 let elapsed = now.saturating_duration_since(last);
                 last = now;
                 let tps = f64::from(TickRate::DEFAULT.ticks_per_second());
                 let due = (elapsed.as_secs_f64() * tps).min(100.0) as u64;
+                let mut steps_done = 0_u64;
                 if due > 0 && step_error.is_none() {
-                    if let Err(error) = demo.advance(due) {
-                        step_error = Some(error.clone());
-                        eprintln!("error: battle step failed: {error}");
+                    match demo.advance(due) {
+                        Ok(done) => steps_done = done,
+                        Err(error) => {
+                            step_error = Some(error.clone());
+                            eprintln!("error: battle step failed: {error}");
+                        }
                     }
                 }
+                timer.mark_simulation(steps_done.min(u64::from(u32::MAX)) as u32);
                 let snapshot = demo.snapshot();
+                timer.mark_snapshot();
                 if snapshot.tick != last_logged && snapshot.tick % 20 == 0 {
                     last_logged = snapshot.tick;
                     println!(
@@ -301,15 +357,23 @@ fn run_battle_graphical(
                         println!("MATCH winner={winner} tick={}", snapshot.tick);
                     }
                 }
-                let projection = demo.view(aspect);
-                pipeline.render(
-                    device,
-                    queue,
-                    view,
-                    clear.to_wgpu(),
-                    &projection,
-                    &snapshot.shapes(),
-                );
+                let projection = if perf_overlay {
+                    demo.overlay_view(aspect)
+                } else {
+                    demo.view(aspect)
+                };
+                let mut shapes = snapshot.shapes();
+                if perf_overlay {
+                    shapes.extend(overlay_shapes(&profiler.stats(), demo.map.width_m));
+                }
+                pipeline.render(device, queue, view, clear.to_wgpu(), &projection, &shapes);
+                timer.mark_graphics_cpu();
+                profiler.record(timer.finish());
+                // Windowed: PERF lines only with the overlay flag; offscreen
+                // (run_battle_to_end) always emits them for CI.
+                if perf_overlay && profiler.perf_line_due() {
+                    println!("{}", profiler.perf_line());
+                }
             },
         )
         .map_err(|error| error.to_string());
@@ -321,7 +385,8 @@ fn run_battle_graphical(
             // GPU-less probe: still run the actual simulation to its terminal
             // state, so CI verifies the autonomous battle end-to-end without a
             // GPU (pixels are verified on GPU machines below).
-            run_battle_to_end(&mut demo, ticks, 100, |_| {})?;
+            let mut profiler = FrameProfiler::new(DEFAULT_PERF_WINDOW);
+            run_battle_to_end(&mut demo, ticks, 100, &mut profiler, |_, _, _| {})?;
             println!("FRAME offscreen battle skipped: no GPU adapter (simulation probe result)");
             Ok(())
         }
@@ -335,24 +400,44 @@ fn run_battle_graphical(
             )
             .map_err(|error| error.to_string())?;
             let mut pipeline = DebugPipeline::new(&backend.device, OffscreenTarget::FORMAT);
-            let projection = demo.view(1.0);
+            let map_width_m = demo.map.width_m;
+            let projection = if perf_overlay {
+                overlay_projection(map_width_m, demo.map.depth_m, 1.0)
+            } else {
+                demo.view(1.0)
+            };
             let clear_wgpu = clear.to_wgpu();
-            let snapshot = run_battle_to_end(&mut demo, ticks, chunk, |snapshot| {
-                pipeline.render(
-                    &backend.device,
-                    &backend.queue,
-                    &target.view,
-                    clear_wgpu,
-                    &projection,
-                    &snapshot.shapes(),
-                );
-            })?;
+            let mut profiler = FrameProfiler::new(DEFAULT_PERF_WINDOW);
+            let snapshot = run_battle_to_end(
+                &mut demo,
+                ticks,
+                chunk,
+                &mut profiler,
+                |snapshot, timer, stats| {
+                    let mut shapes = snapshot.shapes();
+                    if perf_overlay {
+                        shapes.extend(overlay_shapes(stats, map_width_m));
+                    }
+                    pipeline.render(
+                        &backend.device,
+                        &backend.queue,
+                        &target.view,
+                        clear_wgpu,
+                        &projection,
+                        &shapes,
+                    );
+                    timer.mark_graphics_cpu();
+                },
+            )?;
             let winner = demo.match_winner().ok_or("battle ended without a winner")?;
             let loser = if winner == TEAM_A { TEAM_B } else { TEAM_A };
             let pixels = target
                 .read_back(&backend.device, &backend.queue)
                 .map_err(|error| error.to_string())?;
-            let shapes = snapshot.shapes();
+            let mut shapes = snapshot.shapes();
+            if perf_overlay {
+                shapes.extend(overlay_shapes(&profiler.stats(), map_width_m));
+            }
             verify_clear_pixels_background(&pixels, target.width, target.height, clear, &shapes)
                 .map_err(|error| format!("offscreen battle frame verification failed: {error}"))?;
             if count_color(&pixels, OBSTACLE_COLOR) == 0 {
@@ -416,6 +501,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut graphical = false;
     let mut offscreen = false;
     let mut battle = false;
+    let mut perf_overlay = false;
     let mut frames = 3_u64;
     let mut clear = DEFAULT_CLEAR;
     let mut ticks: Option<u64> = None;
@@ -429,6 +515,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             "--graphical" => graphical = true,
             "--offscreen" => offscreen = true,
             "--battle" => battle = true,
+            "--perf-overlay" => perf_overlay = true,
             "--frames" => {
                 index += 1;
                 let value = arguments
@@ -472,7 +559,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT] [--seed SEED]\n    phalanx_runtime --graphical [--battle] [--clear RRGGBB] [--seed SEED]\n    phalanx_runtime --graphical --offscreen [--battle] [--frames N] [--ticks N] [--clear RRGGBB] [--seed SEED] [--screenshot PATH]\n\n--headless runs the deterministic CPU-only scenario through SimulationRunner (no graphics initialization). --graphical presents wgpu frames in a native window (phalanx_render); on headless machines use --graphical --offscreen, which renders frames to an offscreen texture and verifies the pixels. --battle (graphical only, issue #64) runs the first autonomous battle: two teams spawn on the Crossing map with no unit commands and fight to MatchOver through the real SimulationRunner; windowed steps the sim at its fixed 20 Hz wall-clock rate per rendered frame, offscreen runs to the terminal state (default --ticks 2000) and verifies the final frame pixels (background, obstacles, winner color present, loser color absent); --screenshot writes the final offscreen frame as a PPM image."
+                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT] [--seed SEED]\n    phalanx_runtime --graphical --battle [--perf-overlay] [--clear RRGGBB] [--seed SEED]\n    phalanx_runtime --graphical --offscreen --battle [--perf-overlay] [--frames N] [--ticks N] [--clear RRGGBB] [--seed SEED] [--screenshot PATH]\n\n--headless runs the deterministic CPU-only scenario through SimulationRunner (no graphics initialization). --graphical presents wgpu frames in a native window (phalanx_render); on headless machines use --graphical --offscreen, which renders frames to an offscreen texture and verifies the pixels. --battle (graphical only, issue #64) runs the first autonomous battle: two teams spawn on the Crossing map with no unit commands and fight to MatchOver through the real SimulationRunner; windowed steps the sim at its fixed 20 Hz wall-clock rate per rendered frame, offscreen runs to the terminal state (default --ticks 2000) and verifies the final frame pixels (background, obstacles, winner color present, loser color absent); --screenshot writes the final offscreen frame as a PPM image. --perf-overlay (battle mode) shows the in-game FPS/frametime overlay: per-stage bars (simulation, snapshot, graphics, total) drawn over the battlefield plus a structured PERF line every 20 frames (issue #88)."
                 );
                 return Ok(());
             }
@@ -482,15 +569,32 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     }
 
     if graphical {
+        if perf_overlay && !battle {
+            return Err(
+                "--perf-overlay requires --battle in graphical mode (see --help)".to_owned(),
+            );
+        }
         // Battle mode defaults to the slice scenario seed and the 2000-tick
         // battle budget; headless defaults to the core scenario seed and 8
         // ticks. Explicit --seed/--ticks win in both modes.
         let seed = seed.unwrap_or(if battle { BATTLE_SEED } else { SCENARIO_SEED });
         let ticks = ticks.unwrap_or(if battle { BATTLE_MAX_TICKS } else { 8 });
-        return run_graphical(offscreen, frames, ticks, clear, battle, seed, screenshot);
+        return run_graphical(GraphicalOptions {
+            offscreen,
+            frames,
+            ticks,
+            clear,
+            battle,
+            seed,
+            screenshot,
+            perf_overlay,
+        });
     }
     if battle {
         return Err("--battle requires --graphical (see --help)".to_owned());
+    }
+    if perf_overlay {
+        return Err("--perf-overlay requires --graphical --battle (see --help)".to_owned());
     }
     if screenshot.is_some() {
         return Err(
@@ -606,6 +710,89 @@ mod tests {
     }
 
     #[test]
+    fn perf_overlay_requires_graphical_battle_mode() {
+        let error = run(["--headless", "--perf-overlay"]
+            .into_iter()
+            .map(str::to_owned))
+        .expect_err("--perf-overlay without --graphical must be rejected");
+        assert!(error.contains("--perf-overlay"));
+        let error = run(["--graphical", "--offscreen", "--perf-overlay"]
+            .into_iter()
+            .map(str::to_owned))
+        .expect_err("--perf-overlay without --battle must be rejected");
+        assert!(error.contains("--battle"));
+    }
+
+    #[test]
+    fn graphical_offscreen_battle_with_perf_overlay_runs_without_a_display() {
+        // With a GPU adapter this runs the battle to MatchOver with the
+        // overlay bars rendered and verified; without one the CPU-only probe
+        // still runs the sim and emits structured PERF lines (sim/snapshot
+        // stages; graphics_ms=0 since nothing is rendered). Both exit 0.
+        assert!(
+            run([
+                "--graphical",
+                "--offscreen",
+                "--battle",
+                "--perf-overlay",
+                "--frames",
+                "4"
+            ]
+            .into_iter()
+            .map(str::to_owned))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn battle_profiler_records_per_stage_timings_and_emits_perf_lines() {
+        use super::{BATTLE_MAX_TICKS, BATTLE_SEED, BattleDemo, FrameProfiler};
+        use phalanx_render::PERF_LOG_EVERY;
+
+        let mut demo = BattleDemo::new(BATTLE_SEED).expect("battle setup");
+        let mut profiler = FrameProfiler::new(super::DEFAULT_PERF_WINDOW);
+        // Run enough frames to cross the PERF log interval; the on_frame
+        // callback marks the (empty) graphics stage like the no-GPU probe.
+        let final_snapshot = super::run_battle_to_end(
+            &mut demo,
+            BATTLE_MAX_TICKS,
+            25,
+            &mut profiler,
+            |_, timer, _| timer.mark_graphics_cpu(),
+        )
+        .expect("terminal");
+        assert!(profiler.frame() >= PERF_LOG_EVERY, "frames recorded");
+        let stats = profiler.stats();
+        assert!(stats.frames > 0);
+        assert!(stats.avg_fps > 0.0);
+        assert!(stats.worst_total >= stats.avg_total, "worst >= avg total");
+        assert!(
+            stats.avg_simulation + stats.avg_snapshot + stats.avg_graphics_cpu <= stats.avg_total,
+            "stage averages must not exceed the total"
+        );
+        let line = profiler.perf_line();
+        assert!(line.starts_with("PERF frame="), "line: {line}");
+        assert!(
+            !line.contains("graphics_ms="),
+            "ambiguous name must not appear"
+        );
+        for field in [
+            "fps=",
+            "worst_ms=",
+            "total_ms=",
+            "sim_ms=",
+            "snapshot_ms=",
+            "graphics_cpu_ms=",
+            "sim_steps=",
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
+        // The battle still reached its terminal state through the profiler path.
+        assert!(demo.match_winner().is_some());
+        assert!(!final_snapshot.entities.is_empty());
+    }
+
+    #[test]
     fn screenshot_requires_battle_offscreen_graphical() {
         let error = run(["--headless", "--screenshot", "out.ppm"]
             .into_iter()
@@ -660,8 +847,15 @@ mod tests {
         use super::{BATTLE_MAX_TICKS, BATTLE_SEED, BattleDemo, TEAM_A, TEAM_B};
 
         let mut demo = BattleDemo::new(BATTLE_SEED).expect("battle setup");
-        let final_snapshot =
-            super::run_battle_to_end(&mut demo, BATTLE_MAX_TICKS, 100, |_| {}).expect("terminal");
+        let mut profiler = super::FrameProfiler::new(super::DEFAULT_PERF_WINDOW);
+        let final_snapshot = super::run_battle_to_end(
+            &mut demo,
+            BATTLE_MAX_TICKS,
+            100,
+            &mut profiler,
+            |_, _, _| {},
+        )
+        .expect("terminal");
         let winner = demo.match_winner().expect("battle reaches MatchOver");
         assert!(winner == TEAM_A || winner == TEAM_B);
         // Only the winner's units remain, and the snapshot shows exactly them.
@@ -676,7 +870,15 @@ mod tests {
         assert!(final_snapshot.entities.len() < 12, "units were destroyed");
         // Deterministic outcome for a fixed seed.
         let mut twin = BattleDemo::new(BATTLE_SEED).expect("battle setup");
-        super::run_battle_to_end(&mut twin, BATTLE_MAX_TICKS, 100, |_| {}).expect("terminal");
+        let mut twin_profiler = super::FrameProfiler::new(super::DEFAULT_PERF_WINDOW);
+        super::run_battle_to_end(
+            &mut twin,
+            BATTLE_MAX_TICKS,
+            100,
+            &mut twin_profiler,
+            |_, _, _| {},
+        )
+        .expect("terminal");
         assert_eq!(
             demo.runner.canonical_digest(),
             twin.runner.canonical_digest()
