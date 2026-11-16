@@ -16,12 +16,17 @@
 
 pub mod backend;
 pub mod geometry;
+pub mod perf;
 pub mod present;
 pub mod snapshot;
 pub mod window;
 
 pub use backend::{AdapterReport, BackendError, GpuBackend, init_headless};
 pub use geometry::{DebugPipeline, DebugShape, OrthoProjection, Vertex, count_color, demo_shapes};
+pub use perf::{
+    DEFAULT_PERF_WINDOW, FrameProfiler, FrameTimer, FrameTimings, OVERLAY_STRIP_M, PERF_LOG_EVERY,
+    PerfStats, overlay_projection, overlay_shapes,
+};
 pub use present::{
     ClearColor, DEFAULT_CLEAR, OffscreenTarget, PresentError, choose_surface_config,
     render_clear_to_view, verify_clear_pixels, verify_clear_pixels_background, write_ppm,
