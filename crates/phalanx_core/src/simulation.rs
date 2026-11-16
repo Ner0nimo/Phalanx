@@ -286,6 +286,8 @@ pub struct SystemManifestEntry {
     pub phase: Phase,
     /// The explicit in-phase ordering key.
     pub order: u64,
+    /// The deterministic run cadence in ticks (issue #36); 1 = every tick.
+    pub cadence: u64,
 }
 
 impl CanonicalSerialize for SystemManifestEntry {
@@ -293,6 +295,7 @@ impl CanonicalSerialize for SystemManifestEntry {
         self.id.write_canonical(sink);
         self.phase.write_canonical(sink);
         sink.write_u64(self.order);
+        sink.write_u64(self.cadence);
     }
 }
 
@@ -824,6 +827,19 @@ pub trait SimulationSystem<P, E = ()> {
     /// execution order, so registration order can never affect it.
     fn order(&self) -> u64;
 
+    /// The deterministic run cadence of this system (issue #36): `run`
+    /// executes only on ticks where `tick % cadence == 0` (default 1 = every
+    /// tick). Cadence must be >= 1; zero is rejected at registration with
+    /// [`SystemRegistrationError::InvalidCadence`]. Cadence gates `run` only
+    /// — `validate_command` still runs on every tick for
+    /// `Phase::ApplyCommands` systems, because command validation is a
+    /// per-command contract, not a cadence-scheduled update. Cadence is part
+    /// of the system manifest (replay compatibility data), so changing it is
+    /// a versioned transition, like the schedule itself.
+    fn cadence(&self) -> u64 {
+        1
+    }
+
     /// Stable diagnostic name used by tests and replay diagnostics.
     fn name(&self) -> &'static str;
 
@@ -898,6 +914,9 @@ pub enum SystemRegistrationError {
     /// `finalize_registry` or after the first tick has executed, so a run's
     /// behavior can never change mid-run without a versioned transition.
     RegistryFrozen,
+    /// The system declared a run cadence of zero (issue #36); cadence must be
+    /// at least one tick.
+    InvalidCadence { id: SystemId },
 }
 
 impl std::fmt::Display for SystemRegistrationError {
@@ -913,6 +932,13 @@ impl std::fmt::Display for SystemRegistrationError {
             ),
             Self::RegistryFrozen => {
                 formatter.write_str("system registry is frozen (finalized or past the first tick)")
+            }
+            Self::InvalidCadence { id } => {
+                write!(
+                    formatter,
+                    "system {} declares an invalid cadence of zero",
+                    id.0
+                )
             }
         }
     }
@@ -1006,6 +1032,7 @@ struct RegisteredSystem<P, E> {
     id: SystemId,
     phase: Phase,
     order: u64,
+    cadence: u64,
     system: Box<dyn SimulationSystem<P, E>>,
 }
 
@@ -1134,6 +1161,10 @@ impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
         }
         let phase = system.phase();
         let order = system.order();
+        let cadence = system.cadence();
+        if cadence == 0 {
+            return Err(SystemRegistrationError::InvalidCadence { id });
+        }
         if self
             .systems
             .iter()
@@ -1145,6 +1176,7 @@ impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
             id,
             phase,
             order,
+            cadence,
             system: Box::new(system),
         };
         self.systems.push(registered);
@@ -1169,6 +1201,7 @@ impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
                     id: registered.id,
                     phase: registered.phase,
                     order: registered.order,
+                    cadence: registered.cadence,
                 })
                 .collect();
             self.manifest = Some(SystemManifest { entries });
@@ -1379,7 +1412,10 @@ impl<P: CanonicalSerialize, E: CanonicalSerialize> SimulationRunner<P, E> {
         let mut termination: Option<SystemTermination> = None;
         'phases: for phase in Phase::SCHEDULE {
             for (system_index, registered) in systems.iter_mut().enumerate() {
-                if registered.phase != phase {
+                // Cadence gates `run` only (issue #36): a system runs on ticks
+                // where tick % cadence == 0. Command validation above is not
+                // cadence-gated.
+                if registered.phase != phase || ctx.tick() % registered.cadence != 0 {
                     continue;
                 }
                 let system_index = u32::try_from(system_index).unwrap_or(u32::MAX);
@@ -3373,5 +3409,169 @@ mod tests {
         assert_eq!(*log_a.borrow(), *log_b.borrow());
         assert_eq!(*last_a.borrow(), Some((ActorId(2), 200)));
         assert_eq!(*last_a.borrow(), *last_b.borrow());
+    }
+
+    // ---- issue #36: deterministic run cadence ----
+
+    struct CadenceProbe {
+        cadence: u64,
+        trace: Trace,
+    }
+
+    impl SimulationSystem<u32> for CadenceProbe {
+        fn id(&self) -> SystemId {
+            SystemId("cadence-probe")
+        }
+
+        fn phase(&self) -> Phase {
+            Phase::UpdateEconomy
+        }
+
+        fn order(&self) -> u64 {
+            0
+        }
+
+        fn cadence(&self) -> u64 {
+            self.cadence
+        }
+
+        fn name(&self) -> &'static str {
+            "cadence-probe"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn run(
+            &mut self,
+            ctx: &TickContext,
+            _simulation: &mut Simulation<u32>,
+            phase: Phase,
+        ) -> Result<SystemOutput<u32>, SystemError> {
+            self.trace
+                .borrow_mut()
+                .push((ctx.tick(), phase, self.name()));
+            Ok(SystemOutput::default())
+        }
+    }
+
+    #[test]
+    fn cadence_schedules_runs_deterministically() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner
+            .register_system(CadenceProbe {
+                cadence: 3,
+                trace: trace.clone(),
+            })
+            .expect("id");
+        runner.advance_ticks(7).expect("advance");
+        let ticks: Vec<u64> = trace.borrow().iter().map(|(tick, _, _)| *tick).collect();
+        assert_eq!(ticks, vec![3, 6], "cadence 3 runs on ticks 3 and 6 only");
+        // Cadence is part of the finalized manifest (replay compatibility).
+        let manifest = runner.finalize_registry();
+        assert_eq!(manifest.entries()[0].cadence, 3);
+    }
+
+    #[test]
+    fn zero_cadence_is_rejected_at_registration() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        assert_eq!(
+            runner
+                .register_system(CadenceProbe {
+                    cadence: 0,
+                    trace: Rc::new(RefCell::new(Vec::new())),
+                })
+                .map(|_| ()),
+            Err(SystemRegistrationError::InvalidCadence {
+                id: SystemId("cadence-probe")
+            })
+        );
+    }
+
+    #[test]
+    fn cadence_changes_the_manifest_digest() {
+        let build = |cadence: u64| {
+            let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+            runner
+                .register_system(CadenceProbe {
+                    cadence,
+                    trace: Rc::new(RefCell::new(Vec::new())),
+                })
+                .expect("id");
+            runner.finalize_registry().digest()
+        };
+        assert_ne!(build(1), build(2), "cadence is manifest/replay metadata");
+    }
+
+    #[test]
+    fn command_validation_is_not_cadence_gated() {
+        // A validating ApplyCommands system with cadence 2 must still
+        // validate commands on every tick (issue #36): validation is a
+        // per-command contract, not a cadence-scheduled update.
+        struct SlowValidator;
+        impl SimulationSystem<u32> for SlowValidator {
+            fn id(&self) -> SystemId {
+                SystemId("slow-validator")
+            }
+            fn phase(&self) -> Phase {
+                Phase::ApplyCommands
+            }
+            fn order(&self) -> u64 {
+                0
+            }
+            fn cadence(&self) -> u64 {
+                2
+            }
+            fn name(&self) -> &'static str {
+                "slow-validator"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+            fn validate_command(
+                &mut self,
+                _ctx: &TickContext,
+                _simulation: &Simulation<u32>,
+                envelope: &CommandEnvelope<u32>,
+            ) -> CommandVerdict {
+                if envelope.payload() == &42 {
+                    CommandVerdict::Reject { reason: 7 }
+                } else {
+                    CommandVerdict::Accept
+                }
+            }
+            fn run(
+                &mut self,
+                _ctx: &TickContext,
+                _simulation: &mut Simulation<u32>,
+                _phase: Phase,
+            ) -> Result<SystemOutput<u32>, SystemError> {
+                Ok(SystemOutput::default())
+            }
+        }
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner.register_system(SlowValidator).expect("id");
+        runner.submit_command(request(1, 1, 42)).expect("submit");
+        runner.submit_command(request(2, 2, 42)).expect("submit");
+        runner.advance_ticks(2).expect("advance");
+        // Tick 1 is odd (cadence 2 would skip `run`), but the tick-1 command
+        // is still validated and rejected.
+        assert_eq!(
+            runner.simulation().command_outcome(CommandId(0)),
+            Some(CommandOutcome::Rejected { reason: 7 })
+        );
+        assert_eq!(
+            runner.simulation().command_outcome(CommandId(1)),
+            Some(CommandOutcome::Rejected { reason: 7 })
+        );
     }
 }
