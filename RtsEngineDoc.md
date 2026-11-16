@@ -166,7 +166,7 @@ The simulation uses a fixed tick rate (initial proposal: 20 ticks/second; valida
 Determinism requirements:
 
 - No wall-clock reads inside authoritative systems.
-- All gameplay randomness uses explicitly seeded deterministic RNG streams.
+- All gameplay randomness uses explicitly seeded deterministic RNG streams. RNG streams are explicitly registered (`RngStreams::register`/`declare`); the registry is finalized on the first tick, after which an unknown stream name is a structured error instead of a silently derived new stream, and snapshot restore is exact and transactional (issues #46/#47). The name-to-seed derivation algorithm is versioned (`SEED_DERIVATION_VERSION`) and recorded in replay compatibility metadata; replays reject a different derivation version.
 - System execution order is explicit and versioned.
 - Entity and command iteration order must be stable wherever order can affect outcomes.
 - Parallel jobs must not introduce nondeterministic reductions, race-dependent writes, or order-dependent side effects.

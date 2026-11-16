@@ -16,6 +16,12 @@ const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const MIX1: u64 = 0xBF58_476D_1CE4_E5B9;
 const MIX2: u64 = 0x94D0_49BB_1331_11EB;
 
+/// Version of the name-to-seed derivation algorithm (issue #47). Recorded in
+/// replay compatibility metadata; a recording made with a different derivation
+/// version is rejected at the replay boundary because derived stream seeds
+/// would differ.
+pub const SEED_DERIVATION_VERSION: u32 = 1;
+
 fn splitmix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(MIX1);
     z = (z ^ (z >> 27)).wrapping_mul(MIX2);
@@ -94,7 +100,9 @@ impl CanonicalDecode for RngStream {
 /// Errors produced when registering or restoring RNG streams.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RngError {
-    /// The snapshot names a stream that is not registered.
+    /// The stream is not registered. After the registry is finalized (issue
+    /// #47), accessing an undeclared stream is this error instead of a
+    /// silently derived new stream.
     UnknownStream { name: String },
     /// The snapshot omits a registered stream; exact restore (issue #46)
     /// requires the full stream-name set.
@@ -102,6 +110,9 @@ pub enum RngError {
     /// A stream with this name is already registered; re-registering must
     /// not silently overwrite it.
     DuplicateStream { name: String },
+    /// Registering a new stream after the registry was finalized; the stream
+    /// set is frozen so behavior cannot change mid-run.
+    RegistryFrozen,
 }
 
 impl std::fmt::Display for RngError {
@@ -117,6 +128,7 @@ impl std::fmt::Display for RngError {
             Self::DuplicateStream { name } => {
                 write!(formatter, "RNG stream already registered: {name}")
             }
+            Self::RegistryFrozen => formatter.write_str("RNG stream registry is finalized"),
         }
     }
 }
@@ -125,6 +137,7 @@ impl std::error::Error for RngError {}
 
 /// Deterministically derives a sub-seed from a master seed and a stream name
 /// (FNV-1a over the name bytes, finished with the SplitMix64 mixer).
+/// Algorithm version: [`SEED_DERIVATION_VERSION`].
 fn derive_seed(master_seed: u64, name: &str) -> u64 {
     let mut hash = 0xCBF2_9CE4_8422_2325_u64 ^ master_seed;
     for byte in name.as_bytes() {
@@ -144,15 +157,20 @@ fn derive_seed(master_seed: u64, name: &str) -> u64 {
 pub struct RngStreams {
     master_seed: u64,
     streams: BTreeMap<String, RngStream>,
+    finalized: bool,
 }
 
 impl RngStreams {
-    /// Creates an empty registry from the simulation's master seed.
+    /// Creates an empty registry from the simulation's master seed. The
+    /// registry starts open: streams may be registered/declared/auto-derived
+    /// until [`RngStreams::finalize`] (the runner finalizes it on the first
+    /// tick, issue #47).
     #[must_use]
     pub const fn new(master_seed: u64) -> Self {
         Self {
             master_seed,
             streams: BTreeMap::new(),
+            finalized: false,
         }
     }
 
@@ -163,12 +181,16 @@ impl RngStreams {
     }
 
     /// Registers a stream with an explicit seed. Registering the same name
-    /// twice is an error rather than a silent overwrite.
+    /// twice is an error rather than a silent overwrite, and registering a new
+    /// stream after finalization is an error (the stream set is frozen).
     pub fn register(&mut self, name: &str, seed: u64) -> Result<&mut RngStream, RngError> {
         if self.streams.contains_key(name) {
             return Err(RngError::DuplicateStream {
                 name: name.to_owned(),
             });
+        }
+        if self.finalized {
+            return Err(RngError::RegistryFrozen);
         }
         Ok(self
             .streams
@@ -176,13 +198,56 @@ impl RngStreams {
             .or_insert_with(|| RngStream::from_seed(seed)))
     }
 
-    /// Returns the stream registered under `name`, deriving it
-    /// deterministically from the master seed if it does not exist yet.
-    pub fn stream(&mut self, name: &str) -> &mut RngStream {
+    /// Declares a stream whose seed is derived deterministically from the
+    /// master seed and the name (algorithm version [`SEED_DERIVATION_VERSION`]).
+    /// Systems should declare their required streams during setup, so the
+    /// stream set is explicit before the registry is finalized.
+    pub fn declare(&mut self, name: &str) -> Result<&mut RngStream, RngError> {
+        if self.streams.contains_key(name) {
+            return Err(RngError::DuplicateStream {
+                name: name.to_owned(),
+            });
+        }
+        if self.finalized {
+            return Err(RngError::RegistryFrozen);
+        }
         let master_seed = self.master_seed;
-        self.streams
+        Ok(self
+            .streams
             .entry(name.to_owned())
-            .or_insert_with(|| RngStream::from_seed(derive_seed(master_seed, name)))
+            .or_insert_with(|| RngStream::from_seed(derive_seed(master_seed, name))))
+    }
+
+    /// Returns the stream registered under `name`. Before finalization an
+    /// unknown name is auto-derived and registered (setup convenience); after
+    /// finalization an unknown name is a structured error (issue #47), so a
+    /// typo can never create a new stream mid-run.
+    pub fn stream(&mut self, name: &str) -> Result<&mut RngStream, RngError> {
+        if !self.streams.contains_key(name) {
+            if self.finalized {
+                return Err(RngError::UnknownStream {
+                    name: name.to_owned(),
+                });
+            }
+            let master_seed = self.master_seed;
+            self.streams.insert(
+                name.to_owned(),
+                RngStream::from_seed(derive_seed(master_seed, name)),
+            );
+        }
+        Ok(self.streams.get_mut(name).expect("just ensured present"))
+    }
+
+    /// Finalizes the registry: the stream set is frozen. Idempotent. The
+    /// runner finalizes it automatically on the first tick.
+    pub fn finalize(&mut self) {
+        self.finalized = true;
+    }
+
+    /// Returns whether the registry is finalized.
+    #[must_use]
+    pub const fn is_finalized(&self) -> bool {
+        self.finalized
     }
 
     /// Returns a shared reference to the stream registered under `name`.
@@ -260,11 +325,12 @@ impl RngStreams {
     }
 }
 
-/// Canonical form: master seed, then streams in name order (the registry is a
-/// `BTreeMap`), each with its recorded state.
+/// Canonical form: master seed, finalization flag, then streams in name order
+/// (the registry is a `BTreeMap`), each with its recorded state.
 impl CanonicalSerialize for RngStreams {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u64(self.master_seed);
+        sink.write_bool(self.finalized);
         sink.write_u64(self.streams.len() as u64);
         for (name, stream) in &self.streams {
             sink.write_bytes(name.as_bytes());
@@ -276,6 +342,7 @@ impl CanonicalSerialize for RngStreams {
 impl CanonicalDecode for RngStreams {
     fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
         let master_seed = reader.read_u64()?;
+        let finalized = reader.read_bool()?;
         let count = reader.read_u64()?;
         let count = usize::try_from(count).map_err(|_| CanonicalError::InvalidLength(count))?;
         let mut streams = BTreeMap::new();
@@ -291,6 +358,7 @@ impl CanonicalDecode for RngStreams {
         Ok(Self {
             master_seed,
             streams,
+            finalized,
         })
     }
 }
@@ -368,17 +436,38 @@ mod tests {
         let mut first = RngStreams::new(1234);
         let mut second = RngStreams::new(1234);
 
-        let a1 = first.stream("combat").next_u64();
-        let a2 = second.stream("combat").next_u64();
+        let a1 = first
+            .stream("combat")
+            .expect("auto-derived before finalization")
+            .next_u64();
+        let a2 = second
+            .stream("combat")
+            .expect("auto-derived before finalization")
+            .next_u64();
         assert_eq!(a1, a2);
 
         // Drawing from one stream must not perturb another.
-        let before = first.stream("ai").next_u64();
-        let _ = first.stream("combat").next_u64();
-        let after = first.stream("ai").next_u64();
+        let before = first
+            .stream("ai")
+            .expect("auto-derived before finalization")
+            .next_u64();
+        let _ = first
+            .stream("combat")
+            .expect("auto-derived before finalization")
+            .next_u64();
+        let after = first
+            .stream("ai")
+            .expect("auto-derived before finalization")
+            .next_u64();
         let mut expected_ai = RngStreams::new(1234);
-        let expected_before = expected_ai.stream("ai").next_u64();
-        let expected_after = expected_ai.stream("ai").next_u64();
+        let expected_before = expected_ai
+            .stream("ai")
+            .expect("auto-derived before finalization")
+            .next_u64();
+        let expected_after = expected_ai
+            .stream("ai")
+            .expect("auto-derived before finalization")
+            .next_u64();
         assert_eq!(before, expected_before);
         assert_eq!(after, expected_after);
         assert_ne!(before, after);
@@ -388,25 +477,48 @@ mod tests {
     fn explicit_registration_is_reproducible_and_snapshot_round_trips() {
         let mut streams = RngStreams::new(77);
         streams.register("loot", 1001).expect("register");
-        streams.stream("combat").next_u64();
-        streams.stream("combat").next_u64();
-        streams.stream("loot").next_u64();
+        streams
+            .stream("combat")
+            .expect("auto-derived before finalization")
+            .next_u64();
+        streams
+            .stream("combat")
+            .expect("auto-derived before finalization")
+            .next_u64();
+        streams
+            .stream("loot")
+            .expect("auto-derived before finalization")
+            .next_u64();
 
         let snapshot = streams.snapshot();
         assert_eq!(snapshot.len(), 2);
 
         let mut restored = RngStreams::new(77);
         restored.register("loot", 1001).expect("register");
-        restored.stream("combat");
+        restored
+            .stream("combat")
+            .expect("auto-derived before finalization");
         restored.restore(&snapshot).expect("restore");
 
         assert_eq!(
-            streams.stream("combat").next_u64(),
-            restored.stream("combat").next_u64()
+            streams
+                .stream("combat")
+                .expect("auto-derived before finalization")
+                .next_u64(),
+            restored
+                .stream("combat")
+                .expect("auto-derived before finalization")
+                .next_u64()
         );
         assert_eq!(
-            streams.stream("loot").next_u64(),
-            restored.stream("loot").next_u64()
+            streams
+                .stream("loot")
+                .expect("auto-derived before finalization")
+                .next_u64(),
+            restored
+                .stream("loot")
+                .expect("auto-derived before finalization")
+                .next_u64()
         );
     }
 
@@ -438,8 +550,14 @@ mod tests {
         source.register("combat", 1).expect("register");
         source.register("ai", 2).expect("register");
         for _ in 0..10 {
-            source.stream("combat").next_u64();
-            source.stream("ai").next_bool();
+            source
+                .stream("combat")
+                .expect("auto-derived before finalization")
+                .next_u64();
+            source
+                .stream("ai")
+                .expect("auto-derived before finalization")
+                .next_bool();
         }
         let snapshot = source.snapshot();
 
@@ -447,17 +565,32 @@ mod tests {
         target.register("combat", 999).expect("register");
         target.register("ai", 888).expect("register");
         for _ in 0..5 {
-            target.stream("combat").next_u64();
+            target
+                .stream("combat")
+                .expect("auto-derived before finalization")
+                .next_u64();
         }
         target.restore(&snapshot).expect("exact restore");
         for _ in 0..100 {
             assert_eq!(
-                source.stream("combat").next_u64(),
-                target.stream("combat").next_u64()
+                source
+                    .stream("combat")
+                    .expect("auto-derived before finalization")
+                    .next_u64(),
+                target
+                    .stream("combat")
+                    .expect("auto-derived before finalization")
+                    .next_u64()
             );
             assert_eq!(
-                source.stream("ai").next_u64(),
-                target.stream("ai").next_u64()
+                source
+                    .stream("ai")
+                    .expect("auto-derived before finalization")
+                    .next_u64(),
+                target
+                    .stream("ai")
+                    .expect("auto-derived before finalization")
+                    .next_u64()
             );
         }
     }
@@ -467,7 +600,9 @@ mod tests {
         let mut rng = RngStreams::new(42);
         rng.register("combat", 1).expect("register");
         rng.register("ai", 2).expect("register");
-        rng.stream("combat").next_u64();
+        rng.stream("combat")
+            .expect("auto-derived before finalization")
+            .next_u64();
         let before = rng.snapshot();
 
         // Unknown name in the snapshot.
@@ -495,15 +630,28 @@ mod tests {
         let mut reference = RngStreams::new(42);
         reference.register("combat", 1).expect("register");
         reference.register("ai", 2).expect("register");
-        reference.stream("combat").next_u64();
+        reference
+            .stream("combat")
+            .expect("auto-derived before finalization")
+            .next_u64();
         for _ in 0..50 {
             assert_eq!(
-                rng.stream("combat").next_u64(),
-                reference.stream("combat").next_u64()
+                rng.stream("combat")
+                    .expect("auto-derived before finalization")
+                    .next_u64(),
+                reference
+                    .stream("combat")
+                    .expect("auto-derived before finalization")
+                    .next_u64()
             );
             assert_eq!(
-                rng.stream("ai").next_u64(),
-                reference.stream("ai").next_u64()
+                rng.stream("ai")
+                    .expect("auto-derived before finalization")
+                    .next_u64(),
+                reference
+                    .stream("ai")
+                    .expect("auto-derived before finalization")
+                    .next_u64()
             );
         }
 
@@ -517,5 +665,56 @@ mod tests {
             reference.get("ai").map(RngStream::state),
             "the partial update left the other stream untouched"
         );
+    }
+
+    #[test]
+    fn unknown_stream_after_finalization_is_a_structured_error() {
+        let mut streams = RngStreams::new(7);
+        streams.declare("combat").expect("declare");
+        assert!(!streams.is_finalized());
+        streams.finalize();
+        assert!(streams.is_finalized());
+        // Declared stream is accessible after finalization.
+        streams
+            .stream("combat")
+            .expect("declared stream")
+            .next_u64();
+        // An unknown name is now an error, not a silently derived stream.
+        assert_eq!(
+            streams.stream("typo"),
+            Err(RngError::UnknownStream {
+                name: "typo".to_owned()
+            })
+        );
+        assert!(!streams.contains("typo"));
+        // New registrations are rejected once frozen.
+        assert_eq!(streams.register("new", 1), Err(RngError::RegistryFrozen));
+        assert_eq!(streams.declare("new"), Err(RngError::RegistryFrozen));
+        assert_eq!(
+            streams.declare("combat"),
+            Err(RngError::DuplicateStream {
+                name: "combat".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn derived_stream_seeds_are_reproducible_and_versioned() {
+        let mut a = RngStreams::new(0xABCD);
+        let mut b = RngStreams::new(0xABCD);
+        a.declare("combat").expect("declare");
+        b.declare("combat").expect("declare");
+        assert_eq!(
+            a.stream("combat").expect("declared").state(),
+            b.stream("combat").expect("declared").state(),
+            "same master seed + name derives the same seed"
+        );
+        let mut c = RngStreams::new(0xABCD + 1);
+        c.declare("combat").expect("declare");
+        assert_ne!(
+            a.stream("combat").expect("declared").state(),
+            c.stream("combat").expect("declared").state()
+        );
+        assert_eq!(SEED_DERIVATION_VERSION, 1);
     }
 }

@@ -19,17 +19,20 @@ use crate::command::{
     CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
 };
 use crate::hash::{CanonicalSerialize, Digest, DigestAlgorithm};
+use crate::rng::SEED_DERIVATION_VERSION;
 use crate::simulation::{SIMULATION_SCHEMA_VERSION, SimulationRunner, SystemManifest, TickRate};
 
 /// The replay container format version. Recorded in every replay; bump on
-/// incompatible format changes.
-pub const REPLAY_FORMAT_VERSION: u32 = 1;
+/// incompatible format changes. Version 2 added the RNG seed-derivation
+/// version to the compatibility metadata (issue #47).
+pub const REPLAY_FORMAT_VERSION: u32 = 2;
 
 /// An immutable record of one deterministic simulation run.
 #[derive(Clone, Debug)]
 pub struct ReplayRecording<P> {
     format_version: u32,
     simulation_version: u32,
+    rng_derivation_version: u32,
     digest_algorithm: DigestAlgorithm,
     system_manifest: SystemManifest,
     tick_rate: TickRate,
@@ -47,6 +50,7 @@ impl<P> ReplayRecording<P> {
         Self {
             format_version: REPLAY_FORMAT_VERSION,
             simulation_version: SIMULATION_SCHEMA_VERSION,
+            rng_derivation_version: SEED_DERIVATION_VERSION,
             digest_algorithm: DigestAlgorithm::current(),
             system_manifest: SystemManifest::default(),
             tick_rate,
@@ -66,6 +70,14 @@ impl<P> ReplayRecording<P> {
     #[must_use]
     pub const fn simulation_version(&self) -> u32 {
         self.simulation_version
+    }
+
+    /// Returns the RNG seed-derivation algorithm version the recording was
+    /// made with (issue #47). Replays reject recordings whose derived stream
+    /// seeds could differ.
+    #[must_use]
+    pub const fn rng_derivation_version(&self) -> u32 {
+        self.rng_derivation_version
     }
 
     /// Returns the digest algorithm the per-tick digests were recorded with.
@@ -262,6 +274,10 @@ pub enum ReplayError {
     /// are distinct checks: a recording can use a supported container format
     /// but encode state against an incompatible simulation schema.
     UnsupportedSimulationVersion { found: u32, expected: u32 },
+    /// The recording's RNG seed-derivation version differs from this build's;
+    /// derived stream seeds would differ, so the replay is rejected (issue
+    /// #47).
+    IncompatibleRngDerivationVersion { found: u32, expected: u32 },
     /// The recording's digest algorithm is not the one this build produces;
     /// digests of a different algorithm or width cannot be compared.
     IncompatibleDigestAlgorithm {
@@ -290,6 +306,10 @@ impl std::fmt::Display for ReplayError {
             Self::UnsupportedSimulationVersion { found, expected } => write!(
                 formatter,
                 "unsupported simulation schema version {found} (expected {expected})"
+            ),
+            Self::IncompatibleRngDerivationVersion { found, expected } => write!(
+                formatter,
+                "incompatible RNG seed-derivation version {found} (expected {expected})"
             ),
             Self::IncompatibleDigestAlgorithm { expected, found } => write!(
                 formatter,
@@ -334,6 +354,12 @@ pub fn replay_recording<P: CanonicalSerialize + Clone>(
         return Err(ReplayError::UnsupportedSimulationVersion {
             found: recording.simulation_version(),
             expected: SIMULATION_SCHEMA_VERSION,
+        });
+    }
+    if recording.rng_derivation_version() != SEED_DERIVATION_VERSION {
+        return Err(ReplayError::IncompatibleRngDerivationVersion {
+            found: recording.rng_derivation_version(),
+            expected: SEED_DERIVATION_VERSION,
         });
     }
     let current_algorithm = DigestAlgorithm::current();
@@ -521,6 +547,23 @@ mod tests {
         }
 
         fn run(&mut self, _simulation: &mut Simulation<CommandPayload>, _phase: Phase) {}
+    }
+
+    #[test]
+    fn incompatible_rng_derivation_version_is_rejected() {
+        let mut recording = record_scenario(4);
+        assert_eq!(
+            recording.rng_derivation_version(),
+            crate::rng::SEED_DERIVATION_VERSION
+        );
+        recording.rng_derivation_version = crate::rng::SEED_DERIVATION_VERSION + 1;
+        assert_eq!(
+            replay_recording(&recording, 4, setup_scenario),
+            Err(ReplayError::IncompatibleRngDerivationVersion {
+                found: crate::rng::SEED_DERIVATION_VERSION + 1,
+                expected: crate::rng::SEED_DERIVATION_VERSION
+            })
+        );
     }
 
     #[test]
