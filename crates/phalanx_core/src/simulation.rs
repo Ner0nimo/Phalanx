@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use crate::command::{
-    CommandEnvelope, CommandId, CommandRequest, CommandSubmitError, ENVELOPE_VERSION,
+    ActorId, CommandEnvelope, CommandId, CommandLimits, CommandLimitsError, CommandRequest,
+    CommandSubmitError, ENVELOPE_VERSION, RequestId,
 };
 use crate::entity::EntityAllocator;
 use crate::hash::{
@@ -36,7 +37,11 @@ pub const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 
 /// The version of the authoritative simulation state layout. Recorded in
 /// replays and savegames; bump it on any change that alters canonical state.
-pub const SIMULATION_SCHEMA_VERSION: u32 = 1;
+/// The simulation schema version. Bumped when the canonical simulation state
+/// layout changes incompatibly (issue #39 changed command bookkeeping from an
+/// unbounded request map to per-actor high-water marks plus a bounded applied
+/// transcript, so schema 1 replays are rejected at the boundary, issue #30).
+pub const SIMULATION_SCHEMA_VERSION: u32 = 2;
 
 /// The fixed simulation rate. This configures simulation time, not wall-clock
 /// scheduling: the runner itself never reads the clock.
@@ -277,15 +282,24 @@ pub struct Simulation<P> {
     pending_commands: BTreeMap<u64, Vec<CommandEnvelope<P>>>,
     /// Durable transcript of commands applied at tick boundaries, in
     /// application order (ascending command ID within each tick). Part of the
-    /// canonical state.
+    /// canonical state, bounded to the runner's `max_applied_history` window
+    /// (issue #39); the full stream remains available in replay recordings.
     applied_commands: Vec<CommandEnvelope<P>>,
+    /// Total number of commands applied so far (the transcript keeps only a
+    /// bounded window, so the count preserves the total).
+    applied_command_count: u64,
     /// Transient view of the commands being applied on the tick currently
     /// executing: a range into `applied_commands`. Rebuilt from the pending
     /// queue at each tick boundary and never part of the canonical encoding,
     /// so a recorded per-tick checkpoint digest equals the public digest once
     /// `step_tick` returns (issue #38).
     current_tick_commands: std::ops::Range<usize>,
-    seen_requests: BTreeMap<crate::command::RequestId, CommandId>,
+    /// Per-actor high-water mark of accepted request IDs. A retry at or below
+    /// the actor's mark is rejected as a duplicate (never applied twice),
+    /// while the dedup state stays bounded to one entry per actor instead of
+    /// growing with every accepted request (issue #39). Actor-scoped request
+    /// identity is prepared for per-session scoping (issue #41).
+    last_request_id_per_actor: BTreeMap<ActorId, RequestId>,
     next_command_id: u64,
 }
 
@@ -300,8 +314,9 @@ impl<P> Simulation<P> {
             entities: EntityAllocator::new(),
             pending_commands: BTreeMap::new(),
             applied_commands: Vec::new(),
+            applied_command_count: 0,
             current_tick_commands: 0..0,
-            seen_requests: BTreeMap::new(),
+            last_request_id_per_actor: BTreeMap::new(),
             next_command_id: 0,
         }
     }
@@ -348,10 +363,18 @@ impl<P> Simulation<P> {
 
     /// Returns the durable transcript of commands applied at tick boundaries,
     /// in application order. This is authoritative input history and is part
-    /// of the canonical state.
+    /// of the canonical state (bounded to the runner's configured window,
+    /// issue #39).
     #[must_use]
     pub fn applied_commands(&self) -> &[CommandEnvelope<P>] {
         &self.applied_commands
+    }
+
+    /// Returns the total number of commands applied since tick 0 (the
+    /// transcript keeps only a bounded window of the most recent ones).
+    #[must_use]
+    pub const fn applied_command_count(&self) -> u64 {
+        self.applied_command_count
     }
 
     /// Returns the ticks that still have queued commands, in ascending order.
@@ -365,16 +388,18 @@ impl<P> Simulation<P> {
 /// Canonical encoding of the authoritative simulation state (ADR-0001
 /// Decision §8, `RtsEngineDoc.md` §13.3, encoding contract in
 /// [`crate::hash`]). Covers the encoding and schema versions, tick, entity
-/// allocator, RNG stream states, the full command bookkeeping (pending queue,
-/// durable applied-command transcript, accepted requests, command-ID
-/// sequence) — the pending queue is authoritative input state and is hashed
-/// from submission. The transient current-tick command view is excluded: it
-/// is rebuilt from the pending queue at each tick boundary, so a recorded
-/// per-tick checkpoint digest equals the public digest after the tick
-/// (issue #38). Ordering is stable and logical (slot index, stream name, tick,
-/// command ID) and never depends on storage layout. Renderer/GPU state and
-/// wall-clock data cannot enter because the authoritative types do not
-/// contain them.
+/// allocator, RNG stream states, the command bookkeeping (pending queue,
+/// applied-command count and bounded transcript, per-actor request
+/// high-water marks, command-ID sequence) — the pending queue is
+/// authoritative input state and is hashed from submission, while the dedup
+/// and transcript state stay bounded so hash cost does not grow with match
+/// duration (issue #39). The transient current-tick command view is
+/// excluded: it is rebuilt from the pending queue at each tick boundary, so
+/// a recorded per-tick checkpoint digest equals the public digest after the
+/// tick (issue #38). Ordering is stable and logical (slot index, stream
+/// name, tick, command ID) and never depends on storage layout.
+/// Renderer/GPU state and wall-clock data cannot enter because the
+/// authoritative types do not contain them.
 impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
     fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
         sink.write_u32(CANONICAL_ENCODING_VERSION);
@@ -383,8 +408,9 @@ impl<P: CanonicalSerialize> CanonicalSerialize for Simulation<P> {
         self.entities.write_canonical(sink);
         self.rng.write_canonical(sink);
         self.pending_commands.write_canonical(sink);
+        sink.write_u64(self.applied_command_count);
         self.applied_commands.write_canonical(sink);
-        self.seen_requests.write_canonical(sink);
+        self.last_request_id_per_actor.write_canonical(sink);
         sink.write_u64(self.next_command_id);
     }
 }
@@ -410,9 +436,10 @@ impl<P: CanonicalDecode> CanonicalDecode for Simulation<P> {
             entities: CanonicalDecode::read_canonical(reader)?,
             rng: CanonicalDecode::read_canonical(reader)?,
             pending_commands: CanonicalDecode::read_canonical(reader)?,
+            applied_command_count: reader.read_u64()?,
             applied_commands: CanonicalDecode::read_canonical(reader)?,
             current_tick_commands: 0..0,
-            seen_requests: CanonicalDecode::read_canonical(reader)?,
+            last_request_id_per_actor: CanonicalDecode::read_canonical(reader)?,
             next_command_id: reader.read_u64()?,
         })
     }
@@ -608,6 +635,7 @@ pub struct SimulationRunner<P> {
     manifest: Option<SystemManifest>,
     hashes: Vec<Digest>,
     record_hashes: bool,
+    command_limits: CommandLimits,
 }
 
 impl<P: CanonicalSerialize> SimulationRunner<P> {
@@ -623,7 +651,26 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             manifest: None,
             hashes: Vec::new(),
             record_hashes: true,
+            command_limits: CommandLimits::DEFAULT,
         }
+    }
+
+    /// Returns the active command ingress limits (issue #39).
+    #[must_use]
+    pub const fn command_limits(&self) -> &CommandLimits {
+        &self.command_limits
+    }
+
+    /// Installs new validated command ingress limits. Limits may only change
+    /// before the first tick; afterwards the running configuration is locked
+    /// so behavior stays deterministic.
+    pub fn set_command_limits(&mut self, limits: CommandLimits) -> Result<(), CommandLimitsError> {
+        limits.validate().map_err(CommandLimitsError::Invalid)?;
+        if self.simulation.tick > 0 {
+            return Err(CommandLimitsError::LockedAfterFirstTick);
+        }
+        self.command_limits = limits;
+        Ok(())
     }
 
     /// Returns the canonical state digest recorded for each executed tick, in
@@ -831,8 +878,10 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
     /// Queues a command to be applied at the boundary of its target tick.
     ///
     /// Returns the assigned [`CommandId`]. Commands targeting the current or a
-    /// past tick, duplicate request IDs, and unsupported envelope versions are
-    /// rejected with structured errors; commands are never silently retargeted.
+    /// past tick, commands beyond the configured look-ahead limit, duplicate
+    /// request IDs (at or below the actor's high-water mark), saturated
+    /// pending queues, and unsupported envelope versions are rejected with
+    /// structured errors; commands are never silently retargeted.
     pub fn submit_command(
         &mut self,
         request: CommandRequest<P>,
@@ -843,13 +892,60 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
                 current: self.simulation.tick,
             });
         }
-        if self
+        let max_target = self
             .simulation
-            .seen_requests
-            .contains_key(&request.request_id)
+            .tick
+            .saturating_add(self.command_limits.max_lookahead_ticks);
+        if request.tick > max_target {
+            return Err(CommandSubmitError::LookAheadExceeded {
+                requested: request.tick,
+                current: self.simulation.tick,
+                max_lookahead_ticks: self.command_limits.max_lookahead_ticks,
+            });
+        }
+        // Per-actor monotonic high-water mark (issue #39): a request ID at or
+        // below the actor's accepted mark is a retry and rejected, so an old
+        // retry can never be applied twice, while the dedup state stays
+        // bounded to one entry per actor. Different actors may reuse local
+        // request IDs (actor-scoped identity, issue #41).
+        if let Some(&last) = self
+            .simulation
+            .last_request_id_per_actor
+            .get(&request.actor)
         {
-            return Err(CommandSubmitError::DuplicateRequest {
-                request_id: request.request_id,
+            if request.request_id <= last {
+                return Err(CommandSubmitError::DuplicateRequest {
+                    request_id: request.request_id,
+                });
+            }
+        }
+        // Pending queue limits (issue #39). The queue is already bounded by
+        // max_pending_total, so counting it is O(limit).
+        let pending_total = self
+            .simulation
+            .pending_commands
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        let pending_actor = self
+            .simulation
+            .pending_commands
+            .values()
+            .flatten()
+            .filter(|envelope| envelope.actor() == request.actor)
+            .count();
+        let to_u32 = |count: usize| u32::try_from(count).unwrap_or(u32::MAX);
+        if pending_actor >= self.command_limits.max_pending_per_actor as usize {
+            return Err(CommandSubmitError::ActorPendingFull {
+                actor: request.actor,
+                count: to_u32(pending_actor),
+                limit: self.command_limits.max_pending_per_actor,
+            });
+        }
+        if pending_total >= self.command_limits.max_pending_total as usize {
+            return Err(CommandSubmitError::PendingQueueFull {
+                count: to_u32(pending_total),
+                limit: self.command_limits.max_pending_total,
             });
         }
         let raw_id = self.simulation.next_command_id;
@@ -868,8 +964,8 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             request.payload,
         )?;
         self.simulation
-            .seen_requests
-            .insert(request.request_id, command_id);
+            .last_request_id_per_actor
+            .insert(request.actor, request.request_id);
         self.simulation
             .pending_commands
             .entry(request.tick)
@@ -898,6 +994,8 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
         commands.sort_by_key(|envelope| envelope.command_id());
         let start = self.simulation.applied_commands.len();
         self.simulation.applied_commands.append(&mut commands);
+        self.simulation.applied_command_count +=
+            (self.simulation.applied_commands.len() - start) as u64;
         self.simulation.current_tick_commands = start..self.simulation.applied_commands.len();
 
         let SimulationRunner {
@@ -905,6 +1003,7 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             systems,
             hashes,
             record_hashes,
+            command_limits,
             ..
         } = self;
         for phase in Phase::SCHEDULE {
@@ -924,6 +1023,16 @@ impl<P: CanonicalSerialize> SimulationRunner<P> {
             hashes.push(checkpoint_digest(simulation, systems));
         }
         simulation.current_tick_commands = 0..0;
+        // Bound the in-state applied transcript (issue #39): keep only the
+        // most recent `max_applied_history` entries; the total count keeps
+        // the full number. This keeps canonical hash cost independent of
+        // match duration.
+        let cap = usize::try_from(command_limits.max_applied_history).unwrap_or(usize::MAX);
+        if simulation.applied_commands.len() > cap {
+            simulation
+                .applied_commands
+                .drain(..simulation.applied_commands.len() - cap);
+        }
         Ok(())
     }
 
@@ -943,7 +1052,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::command::{ActorId, CommandId, RequestId};
+    use crate::command::{
+        ActorId, CommandId, CommandLimits, CommandLimitsError, InvalidCommandLimits, RequestId,
+    };
+    use crate::hash::canonical_encode;
 
     type Trace = Rc<RefCell<Vec<(u64, Phase, &'static str)>>>;
     type IngestCounts = Rc<RefCell<Vec<(u64, usize)>>>;
@@ -1050,9 +1162,13 @@ mod tests {
     }
 
     fn request(request_id: u64, tick: u64, payload: u32) -> CommandRequest<u32> {
+        request_from(0, request_id, tick, payload)
+    }
+
+    fn request_from(actor: u64, request_id: u64, tick: u64, payload: u32) -> CommandRequest<u32> {
         CommandRequest {
             request_id: RequestId(request_id),
-            actor: ActorId(0),
+            actor: ActorId(actor),
             tick,
             subject: None,
             payload,
@@ -1578,6 +1694,191 @@ mod tests {
         assert_eq!(runner.simulation().canonical_digest(), digest);
         runner.simulation_mut().current_tick_commands = 0..0;
         assert_eq!(runner.simulation().canonical_digest(), digest);
+    }
+
+    #[test]
+    fn lookahead_limit_rejects_distant_future_commands() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        let limits = CommandLimits {
+            max_lookahead_ticks: 10,
+            ..CommandLimits::DEFAULT
+        };
+        runner.set_command_limits(limits).expect("valid limits");
+        assert_eq!(runner.command_limits(), &limits);
+
+        runner
+            .submit_command(request(1, 10, 1))
+            .expect("within lookahead");
+        assert_eq!(
+            runner.submit_command(request(2, 11, 2)),
+            Err(CommandSubmitError::LookAheadExceeded {
+                requested: 11,
+                current: 0,
+                max_lookahead_ticks: 10
+            })
+        );
+        runner.advance_ticks(5).expect("advance to tick 5");
+        runner
+            .submit_command(request(3, 15, 3))
+            .expect("within lookahead at tick 5");
+        assert_eq!(
+            runner.submit_command(request(4, 16, 4)),
+            Err(CommandSubmitError::LookAheadExceeded {
+                requested: 16,
+                current: 5,
+                max_lookahead_ticks: 10
+            })
+        );
+    }
+
+    #[test]
+    fn pending_queue_limits_are_enforced_per_actor_and_in_total() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner
+            .set_command_limits(CommandLimits {
+                max_lookahead_ticks: 100,
+                max_pending_per_actor: 2,
+                max_pending_total: 3,
+                max_applied_history: 8,
+            })
+            .expect("valid limits");
+
+        runner
+            .submit_command(request_from(0, 1, 50, 1))
+            .expect("actor 0 first");
+        runner
+            .submit_command(request_from(0, 2, 51, 2))
+            .expect("actor 0 second");
+        assert_eq!(
+            runner.submit_command(request_from(0, 3, 52, 3)),
+            Err(CommandSubmitError::ActorPendingFull {
+                actor: ActorId(0),
+                count: 2,
+                limit: 2
+            })
+        );
+        // A different actor may reuse the same local request ID (actor-scoped
+        // dedup) and still has queue room until the total limit.
+        runner
+            .submit_command(request_from(1, 1, 50, 4))
+            .expect("actor 1 reuses local request id 1");
+        assert_eq!(
+            runner.submit_command(request_from(1, 2, 51, 5)),
+            Err(CommandSubmitError::PendingQueueFull { count: 3, limit: 3 })
+        );
+    }
+
+    #[test]
+    fn duplicate_retries_are_rejected_even_after_many_newer_requests() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner.submit_command(request(5, 10, 1)).expect("first");
+        for id in 6..=8_u64 {
+            runner
+                .submit_command(request(id, 10, 1))
+                .expect("newer request");
+        }
+        assert_eq!(
+            runner.submit_command(request(5, 11, 2)),
+            Err(CommandSubmitError::DuplicateRequest {
+                request_id: RequestId(5)
+            })
+        );
+        // The high-water mark is permanent: a retry is still rejected after
+        // the original was applied — no retention boundary can re-admit it.
+        runner.advance_ticks(10).expect("advance past tick 10");
+        assert_eq!(
+            runner.submit_command(request(5, 20, 3)),
+            Err(CommandSubmitError::DuplicateRequest {
+                request_id: RequestId(5)
+            })
+        );
+        assert_eq!(runner.simulation().applied_command_count(), 4);
+    }
+
+    #[test]
+    fn applied_transcript_is_bounded_but_counted_and_hash_input_stays_constant() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        runner
+            .set_command_limits(CommandLimits {
+                max_lookahead_ticks: 100,
+                max_pending_per_actor: 16,
+                max_pending_total: 16,
+                max_applied_history: 4,
+            })
+            .expect("valid limits");
+        for tick in 1..=6_u64 {
+            runner
+                .submit_command(request(tick, tick, tick as u32))
+                .expect("submit");
+        }
+        runner.advance_ticks(6).expect("6 ticks");
+        let encoded_at_6 = canonical_encode(runner.simulation()).len();
+        assert_eq!(runner.simulation().applied_command_count(), 6);
+        assert_eq!(
+            runner.simulation().applied_commands().len(),
+            4,
+            "transcript window is capped"
+        );
+        assert_eq!(
+            runner.simulation().applied_commands()[0].tick(),
+            3,
+            "oldest entries are dropped first"
+        );
+        for tick in 7..=12_u64 {
+            runner
+                .submit_command(request(tick, tick, tick as u32))
+                .expect("submit");
+        }
+        runner.advance_ticks(6).expect("6 more ticks");
+        assert_eq!(
+            canonical_encode(runner.simulation()).len(),
+            encoded_at_6,
+            "canonical input size does not grow with match duration"
+        );
+        assert_eq!(runner.simulation().applied_command_count(), 12);
+        assert_eq!(runner.simulation().applied_commands().len(), 4);
+    }
+
+    #[test]
+    fn invalid_or_locked_command_limits_are_rejected() {
+        let mut runner: SimulationRunner<u32> = SimulationRunner::new(TickRate::DEFAULT, SEED);
+        assert_eq!(
+            runner.set_command_limits(CommandLimits {
+                max_lookahead_ticks: 0,
+                ..CommandLimits::DEFAULT
+            }),
+            Err(CommandLimitsError::Invalid(
+                InvalidCommandLimits::LookAheadOutOfRange {
+                    found: 0,
+                    min: 1,
+                    max: CommandLimits::MAX_LOOKAHEAD_TICKS
+                }
+            ))
+        );
+        assert_eq!(
+            runner.set_command_limits(CommandLimits {
+                max_pending_per_actor: 10,
+                max_pending_total: 5,
+                ..CommandLimits::DEFAULT
+            }),
+            Err(CommandLimitsError::Invalid(
+                InvalidCommandLimits::PendingTotalBelowPerActor {
+                    per_actor: 10,
+                    total: 5
+                }
+            ))
+        );
+        runner
+            .set_command_limits(CommandLimits::DEFAULT)
+            .expect("defaults are valid");
+        runner.step_tick().expect("first tick");
+        assert_eq!(
+            runner.set_command_limits(CommandLimits {
+                max_lookahead_ticks: 5,
+                ..CommandLimits::DEFAULT
+            }),
+            Err(CommandLimitsError::LockedAfterFirstTick)
+        );
     }
 
     #[test]
