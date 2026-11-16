@@ -383,6 +383,13 @@ pub enum ReplayError {
     },
     /// The recorded command limits are not valid (issue #52).
     InvalidRecordedCommandLimits(CommandLimitsError),
+    /// A recorded command targets a tick beyond the recording's declared end
+    /// tick, so it was never applied within the recorded horizon (issue #55).
+    CommandBeyondEndTick {
+        index: usize,
+        tick: u64,
+        end_tick: u64,
+    },
     /// The replay ran out of representable ticks.
     TickOverflow,
     /// Per-tick digest recording is disabled, so no fresh state digest exists
@@ -475,6 +482,14 @@ impl std::fmt::Display for ReplayError {
             Self::InvalidRecordedCommandLimits(error) => {
                 write!(formatter, "recorded command limits are invalid: {error}")
             }
+            Self::CommandBeyondEndTick {
+                index,
+                tick,
+                end_tick,
+            } => write!(
+                formatter,
+                "recorded command {index} targets tick {tick}, beyond the recorded end tick {end_tick}"
+            ),
             Self::TickOverflow => formatter.write_str("replay tick counter overflowed"),
             Self::HashRecordingDisabled => {
                 formatter.write_str("per-tick state hash recording is disabled")
@@ -496,6 +511,15 @@ fn validate_recording_structure<P>(
     ticks: u64,
     content: &BTreeMap<String, Digest>,
 ) -> Result<(), ReplayError> {
+    // The explicit end tick must be consistent with the checkpoints (issue
+    // #52): one hash per executed tick.
+    let recorded_hashes = recording.tick_hashes().len();
+    if recording.end_tick != recorded_hashes as u64 {
+        return Err(ReplayError::InconsistentEndTick {
+            end_tick: recording.end_tick,
+            checkpoints: recorded_hashes,
+        });
+    }
     let mut seen_identities = BTreeSet::new();
     for (index, envelope) in recording.commands().iter().enumerate() {
         if envelope.version() != ENVELOPE_VERSION {
@@ -528,20 +552,19 @@ fn validate_recording_structure<P>(
                 tick: envelope.tick(),
             });
         }
+        // Commands must lie within the recorded horizon (issue #55).
+        if envelope.tick() > recording.end_tick {
+            return Err(ReplayError::CommandBeyondEndTick {
+                index,
+                tick: envelope.tick(),
+                end_tick: recording.end_tick,
+            });
+        }
     }
-    let recorded_hashes = recording.tick_hashes().len();
     if ticks > recorded_hashes as u64 {
         return Err(ReplayError::IncompleteCheckpointCoverage {
             recorded: recorded_hashes,
             requested: ticks,
-        });
-    }
-    // The explicit end tick must be consistent with the checkpoints (issue
-    // #52): one hash per executed tick.
-    if recording.end_tick != recorded_hashes as u64 {
-        return Err(ReplayError::InconsistentEndTick {
-            end_tick: recording.end_tick,
-            checkpoints: recorded_hashes,
         });
     }
     // Required content identities must be provided and match (issue #52).
@@ -796,6 +819,34 @@ mod tests {
         }
 
         fn run(&mut self, _simulation: &mut Simulation<CommandPayload>, _phase: Phase) {}
+    }
+
+    #[test]
+    fn recorded_commands_must_lie_within_the_end_tick() {
+        // A command beyond the declared end tick is rejected (issue #55).
+        let mut recording = record_scenario(4);
+        let envelope = &recording.commands()[0];
+        recording.push_command(
+            CommandEnvelope::new(
+                ENVELOPE_VERSION,
+                RequestId(100),
+                CommandId(2),
+                envelope.actor(),
+                envelope.session(),
+                100,
+                None,
+                CommandPayload::Diagnostics { value: 1 },
+            )
+            .expect("current version"),
+        );
+        assert_eq!(
+            replay_recording(&recording, 4, &BTreeMap::new(), setup_scenario),
+            Err(ReplayError::CommandBeyondEndTick {
+                index: recording.commands().len() - 1,
+                tick: 100,
+                end_tick: 4
+            })
+        );
     }
 
     #[test]
