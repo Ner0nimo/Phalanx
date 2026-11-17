@@ -925,9 +925,11 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
             // the CPU projection (a surviving unit's box top vs. ground farther
             // from the camera) — absolute depth deltas shrink with camera
             // distance, so a fixed threshold would be flaky across GPUs.
-            let size = BATTLE_OFFSCREEN_SIZE as usize;
+            // Depth readback is at render resolution, so the threshold uses
+            // render_w/render_h (at scale < 1.0 the buffer is smaller than the
+            // output framebuffer).
             let rendered = depths.iter().filter(|depth| **depth < 1.0).count();
-            if rendered <= size * size / 4 {
+            if rendered <= (render_w * render_h) as usize / 4 {
                 return Err(
                     "offscreen 3D battle frame verification failed: no rendered depth in frame"
                         .to_owned(),
@@ -1294,19 +1296,20 @@ mod tests {
         // resolution and presents via the fallback upscale, verifying the
         // color/depth/motion readbacks; without one the CPU-only probe still
         // runs the sim and exits 0 (issue #97).
+        let result = run([
+            "--graphical",
+            "--offscreen",
+            "--battle",
+            "--frames",
+            "4",
+            "--render-scale",
+            "0.5",
+        ]
+        .into_iter()
+        .map(str::to_owned));
         assert!(
-            run([
-                "--graphical",
-                "--offscreen",
-                "--battle",
-                "--frames",
-                "4",
-                "--render-scale",
-                "0.5"
-            ]
-            .into_iter()
-            .map(str::to_owned))
-            .is_ok()
+            result.is_ok(),
+            "offscreen battle with --render-scale 0.5 failed: {result:?}"
         );
     }
 
