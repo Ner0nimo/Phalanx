@@ -139,8 +139,7 @@ const SCENE_SHADER_WGSL: &str = r#"
 struct Uniforms {
     vp: mat4x4<f32>,
     prev_vp: mat4x4<f32>,
-    exposure: f32,
-    _pad: vec3<f32>,
+    exposure: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -203,7 +202,7 @@ fn motion_of(in: VsOut) -> vec2<f32> {
 fn fs_lit(in: VsOut) -> FsOut {
     let factor = 0.55 + 0.45 * max(in.normal.y, 0.0);
     var out: FsOut;
-    out.color = vec4<f32>(in.color.rgb * uniforms.exposure * factor, in.color.a);
+    out.color = vec4<f32>(in.color.rgb * uniforms.exposure.x * factor, in.color.a);
     out.motion = vec4<f32>(motion_of(in), 0.0, 1.0);
     return out;
 }
@@ -1330,6 +1329,36 @@ mod tests {
         );
         let side = lit_color([1.0, 1.0, 1.0, 1.0], AMBIENT);
         assert!((side[0] - 0.55).abs() < 1e-7);
+    }
+
+    #[test]
+    fn uniform_struct_wgsl_layout_matches_rust_encoding() {
+        // The WGSL Uniforms struct must be exactly the size of
+        // FrameUniforms::to_bytes (144 bytes) and of the bind group layout's
+        // min_binding_size. WGSL aligns vec3<f32> to 16 bytes, so a trailing
+        // `f32 + vec3<f32>` pad would inflate the struct to 160 bytes and fail
+        // pipeline validation on real adapters (observed on the Windows DX12
+        // CI adapter). Compute the layout with naga so this check also runs on
+        // GPU-less machines.
+        let module = wgpu::naga::front::wgsl::parse_str(SCENE_SHADER_WGSL).expect("wgsl parses");
+        let gctx = wgpu::naga::proc::GlobalCtx {
+            types: &module.types,
+            constants: &module.constants,
+            overrides: &module.overrides,
+            global_expressions: &module.global_expressions,
+        };
+        let mut layouter = wgpu::naga::proc::Layouter::default();
+        layouter.update(gctx).expect("layout computes");
+        let uniforms = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("Uniforms"))
+            .expect("Uniforms struct present");
+        let expected = FrameUniforms::identity().to_bytes().len() as u32;
+        assert_eq!(
+            layouter[uniforms.0].size, expected,
+            "WGSL Uniforms size must match FrameUniforms::to_bytes and min_binding_size"
+        );
     }
 
     #[test]
