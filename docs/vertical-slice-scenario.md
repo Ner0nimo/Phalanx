@@ -31,7 +31,7 @@ Map data is static scenario data (part of the replay's initial scenario hash), n
 
 Two teams, setting-neutral names: **Team A** (player side, `ActorId(1)`) and **Team B** (scripted side, `ActorId(2)`). Each side spawns 6 units at tick 0 (scenario setup, not commands): 3 `striker` + 3 `skirmisher`, placed on the team's spawn pad in a fixed layout (deterministic order by spawn index).
 
-Unit definitions (placeholder balance values; definitions are data, not code constants):
+Unit definitions (placeholder balance values; represented as typed data values but currently constructed in Rust, not loaded from external authoring files; see #122 for the later content-catalog pipeline):
 
 | Field | striker | skirmisher |
 |---|---|---|
