@@ -12,7 +12,7 @@ The current repository has a real but early presentation path:
 
 - `phalanx_render` uses `wgpu = 30.0.1` and `winit = 0.30`.
 - The current backend requests all compiled wgpu backends, enables validation, and requests no optional wgpu features beyond defaults.
-- The visible scene is still primarily debug geometry: 2D colored shapes, unit/obstacle rectangles, and HUD/debug overlays. The offscreen target is currently `Rgba8Unorm`.
+- The visible scene is a minimal depth-tested 3D presentation (issue #104: ground/obstacle/unit boxes under a perspective camera with a `Depth32Float` buffer — wgpu convention, NDC z in `[0,1]`, 0 near / 1 far, less-is-closer, non-inverted) over the 2D debug-geometry HUD overlays. The offscreen target is currently `Rgba8Unorm`.
 - The render snapshot exposes presentation-oriented positions, team/category/radius and map obstacles, not production mesh/material/animation data.
 - The performance overlay measures CPU-side encoding/submission but does not yet measure GPU execution with timestamp queries.
 - There is no production render graph, HDR scene-color path, depth/motion-vector pipeline, cooked material/texture pipeline, or temporal history management.
@@ -46,7 +46,7 @@ The renderer should choose an explicit platform/backend capability profile. `Bac
 The renderer must represent render resolution separately from display/output resolution. Its render graph must be able to provide the upscaler's required inputs without ad-hoc copies or hidden conventions:
 
 - Linear scene color in a documented HDR working space.
-- Depth with an explicit convention (including inverted/infinite-depth flags where relevant).
+- Depth with an explicit convention (including inverted/infinite-depth flags where relevant). The M1 3D pass already fixes the base convention: NDC z in `[0, 1]`, 0 near / 1 far, less-is-closer, non-inverted (issue #104, `phalanx_render::scene3d`); an inverted/infinite variant for upscalers would be a deliberate, documented change on top of it.
 - Motion vectors with documented coordinate space, scale, sign, and jitter convention. Opaque, alpha-tested, alpha-blended, instanced, and animated objects must contribute valid motion wherever they cover pixels.
 - Camera jitter and the exact offset used for the current frame.
 - Exposure or the selected effect's automatic-exposure mode.

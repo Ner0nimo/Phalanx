@@ -12,10 +12,12 @@ use phalanx_game::{
 };
 use phalanx_navigation::{Map, crossing_map};
 use phalanx_render::{
-    BackendError, ClearColor, DEFAULT_CLEAR, DEFAULT_PERF_WINDOW, DebugPipeline, FrameProfiler,
-    FrameTimer, InputEvent, KeyCode, MouseButton, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection,
-    PerfStats, RenderSnapshot, count_color, demo_shapes, init_headless, overlay_projection,
-    overlay_shapes, run_windowed, run_windowed_with, team_color, verify_clear_pixels_background,
+    AMBIENT, BackendError, Camera3D, ClearColor, DEFAULT_CLEAR, DEFAULT_PERF_WINDOW, DIFFUSE,
+    DebugPipeline, FrameProfiler, FrameRenderer, FrameTimer, GROUND_COLOR, InputEvent, KeyCode,
+    MouseButton, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection, PerfStats, RenderSnapshot,
+    UNIT_HEIGHT_M, build_hud_geometry, build_scene_geometry, count_color, count_color_family,
+    demo_shapes, init_headless, lit_color, overlay_hud_vertices, run_windowed, run_windowed_with,
+    team_color, verify_clear_pixels_background, verify_depth_ordering, verify_pixels_in_set,
     write_ppm,
 };
 
@@ -92,17 +94,6 @@ impl BattleDemo {
         self.runner.simulation().tick()
     }
 
-    /// The top-down battle view over the whole map (world meters
-    /// 0..width x 0..depth), adjusted to the view aspect.
-    fn view(&self, aspect: f32) -> OrthoProjection {
-        OrthoProjection::new(0.0, self.map.width_m, 0.0, self.map.depth_m).for_aspect(aspect)
-    }
-
-    /// The battle view with the perf-overlay strip above the map (issue #88).
-    fn overlay_view(&self, aspect: f32) -> OrthoProjection {
-        overlay_projection(self.map.width_m, self.map.depth_m, aspect)
-    }
-
     /// Extracts the render snapshot of the current tick without stepping,
     /// marking `selected` entity indices (issues #90/#92).
     fn snapshot_selected(&self, selected: &[u32]) -> RenderSnapshot {
@@ -156,13 +147,17 @@ impl BattleDemo {
     }
 }
 
-/// The interactive camera (issue #91): center position in world meters and
-/// zoom as the visible world height in meters. Pure presentation state.
+/// The interactive camera (issue #91 pan/zoom, issue #104 yaw): center
+/// position in world meters, zoom as the visible world height in meters, and a
+/// yaw angle around the view center. Pure presentation state; the depth-tested
+/// 3D perspective camera is derived from it via [`Camera::camera3d`].
 struct Camera {
     /// Center of the view in world coordinates (x, z).
     center: [f32; 2],
     /// Visible world height in meters (zoom: smaller = more zoomed in).
     view_height_m: f32,
+    /// Yaw around the view center in radians (Q/E rotate).
+    yaw: f32,
     /// Map bounds for clamping.
     map_width_m: f32,
     map_depth_m: f32,
@@ -173,6 +168,7 @@ impl Camera {
         Self {
             center: [map_width_m / 2.0, map_depth_m / 2.0],
             view_height_m: map_depth_m,
+            yaw: 0.0,
             map_width_m,
             map_depth_m,
         }
@@ -192,16 +188,15 @@ impl Camera {
         self.view_height_m = (self.view_height_m * factor).clamp(20.0, self.map_depth_m);
     }
 
-    /// Builds the ortho projection for the given aspect.
-    fn projection(&self, aspect: f32) -> OrthoProjection {
-        let half_h = self.view_height_m / 2.0;
-        let half_w = half_h * aspect;
-        OrthoProjection::new(
-            self.center[0] - half_w,
-            self.center[0] + half_w,
-            self.center[1] - half_h,
-            self.center[1] + half_h,
-        )
+    /// Rotates the view around the center (yaw in radians).
+    fn rotate(&mut self, delta_rad: f32) {
+        self.yaw += delta_rad;
+    }
+
+    /// Derives the perspective 3D camera (issue #104) from the pan/zoom/yaw
+    /// state, preserving the existing interaction semantics.
+    fn camera3d(&self) -> Camera3D {
+        Camera3D::from_view(self.center, self.view_height_m, self.yaw)
     }
 }
 
@@ -423,13 +418,12 @@ fn run_battle_graphical(
         let mut selection = SelectionState::default();
         return run_windowed_with(
             "Phalanx — autonomous battle (graphical)",
-            move |device, queue, pipeline, view, aspect, input| {
+            move |device, queue, renderer, view, aspect, input| {
                 let mut timer = profiler.begin_frame();
 
                 // --- Input handling (issues #90/#91/#93) ---
                 let events = input.take_events();
                 let wheel = input.take_wheel();
-                let projection = camera.projection(aspect);
 
                 // Camera zoom via mouse wheel (issue #91).
                 if wheel != 0.0 {
@@ -454,6 +448,16 @@ fn run_battle_graphical(
                 if pan_dx != 0.0 || pan_dy != 0.0 {
                     camera.pan_screen(pan_dx, pan_dy, aspect);
                 }
+                // Camera rotation around the view center (3D view, issue #104).
+                if input.key_held(KeyCode::KeyQ) {
+                    camera.rotate(-0.04);
+                }
+                if input.key_held(KeyCode::KeyE) {
+                    camera.rotate(0.04);
+                }
+                // The perspective 3D camera used for picking and rendering
+                // this frame (recomputed per frame, so resize stays correct).
+                let camera3d = camera.camera3d();
 
                 // Process input events for selection and commands.
                 for event in &events {
@@ -470,11 +474,15 @@ fn run_battle_graphical(
                                 let drag_dist = ((pos[0] - start[0]).powi(2)
                                     + (pos[1] - start[1]).powi(2))
                                 .sqrt();
-                                let world_pos = projection.screen_to_world(pos[0], pos[1]);
+                                let Some(world_pos) =
+                                    camera3d.screen_to_ground(aspect, pos[0], pos[1])
+                                else {
+                                    continue;
+                                };
                                 let snapshot = demo.snapshot();
                                 if drag_dist < 0.02 {
                                     // Click: select nearest own unit within threshold.
-                                    let threshold_world = projection.world_height() * 0.02;
+                                    let threshold_world = camera.view_height_m * 0.02;
                                     let mut best: Option<(f32, u32, u64)> = None;
                                     for entity in &snapshot.entities {
                                         if entity.team != TEAM_A {
@@ -502,9 +510,12 @@ fn run_battle_graphical(
                                     };
                                 } else {
                                     // Box select: all own units inside the drag rect.
-                                    let start_world =
-                                        projection.screen_to_world(start[0], start[1]);
-                                    let end_world = projection.screen_to_world(pos[0], pos[1]);
+                                    let (Some(start_world), Some(end_world)) = (
+                                        camera3d.screen_to_ground(aspect, start[0], start[1]),
+                                        camera3d.screen_to_ground(aspect, pos[0], pos[1]),
+                                    ) else {
+                                        continue;
+                                    };
                                     let min_x = start_world[0].min(end_world[0]);
                                     let max_x = start_world[0].max(end_world[0]);
                                     let min_z = start_world[1].min(end_world[1]);
@@ -536,10 +547,13 @@ fn run_battle_graphical(
                             }
                             let append = input.key_held(KeyCode::ShiftLeft)
                                 || input.key_held(KeyCode::ShiftRight);
-                            let world_pos = projection.screen_to_world(pos[0], pos[1]);
+                            let Some(world_pos) = camera3d.screen_to_ground(aspect, pos[0], pos[1])
+                            else {
+                                continue;
+                            };
                             let snapshot = demo.snapshot();
                             // Check if an enemy unit is near the click point → Attack.
-                            let click_threshold = projection.world_height() * 0.02;
+                            let click_threshold = camera.view_height_m * 0.02;
                             let enemy = snapshot.entities.iter().find(|e| {
                                 if e.team == TEAM_A {
                                     return false;
@@ -674,41 +688,36 @@ fn run_battle_graphical(
                         println!("MATCH winner={winner} tick={}", snapshot.tick);
                     }
                 }
-                let projection = if perf_overlay {
-                    demo.overlay_view(aspect)
+                // --- Depth-tested 3D battle rendering (issue #104) ---
+                let vp = camera3d.view_projection(aspect);
+                let scene = build_scene_geometry(&snapshot, demo.map.width_m, demo.map.depth_m);
+                let drag_world = selection.drag_start.and_then(|start| {
+                    let from = camera3d.screen_to_ground(aspect, start[0], start[1])?;
+                    let to = camera3d.screen_to_ground(
+                        aspect,
+                        input.mouse_pos[0],
+                        input.mouse_pos[1],
+                    )?;
+                    Some((from, to))
+                });
+                let world_hud = build_hud_geometry(&snapshot, camera.view_height_m, drag_world);
+                let screen_hud = if perf_overlay {
+                    overlay_hud_vertices(&profiler.stats(), demo.map.width_m)
                 } else {
-                    camera.projection(aspect)
+                    Vec::new()
                 };
-                let mut shapes = if perf_overlay {
-                    snapshot.shapes()
-                } else {
-                    snapshot.shapes_with_hud(projection.world_height())
-                };
-                // Draw drag-box outline (issue #90).
-                if let Some(start) = selection.drag_start {
-                    let pos = input.mouse_pos;
-                    let sw = projection.screen_to_world(start[0], start[1]);
-                    let ew = projection.screen_to_world(pos[0], pos[1]);
-                    let min_x = sw[0].min(ew[0]);
-                    let max_x = sw[0].max(ew[0]);
-                    let min_z = sw[1].min(ew[1]);
-                    let max_z = sw[1].max(ew[1]);
-                    let cx = (min_x + max_x) / 2.0;
-                    let cz = (min_z + max_z) / 2.0;
-                    let hx = (max_x - min_x) / 2.0;
-                    let hz = (max_z - min_z) / 2.0;
-                    if hx > 0.1 && hz > 0.1 {
-                        shapes.push(phalanx_render::geometry::DebugShape::Rect {
-                            center: [cx, cz],
-                            half_size: [hx, hz],
-                            color: [1.0, 1.0, 1.0, 0.3],
-                        });
-                    }
-                }
-                if perf_overlay {
-                    shapes.extend(overlay_shapes(&profiler.stats(), demo.map.width_m));
-                }
-                pipeline.render(device, queue, view, clear.to_wgpu(), &projection, &shapes);
+                renderer.render_battle(
+                    device,
+                    queue,
+                    view,
+                    clear.to_wgpu(),
+                    &phalanx_render::BattleFrame {
+                        vp: &vp,
+                        scene: &scene,
+                        world_hud: &world_hud,
+                        screen_hud: &screen_hud,
+                    },
+                );
                 timer.mark_graphics_cpu();
                 profiler.record(timer.finish());
                 // Windowed: PERF lines only with the overlay flag; offscreen
@@ -741,13 +750,21 @@ fn run_battle_graphical(
                 BATTLE_OFFSCREEN_SIZE,
             )
             .map_err(|error| error.to_string())?;
-            let mut pipeline = DebugPipeline::new(&backend.device, OffscreenTarget::FORMAT);
+            // Issue #104: the offscreen battle renders through the depth-tested
+            // 3D path (scene + HUD per frame), then a final scene-only frame is
+            // verified against the color AND depth readbacks.
+            let mut renderer = FrameRenderer::new(
+                &backend.device,
+                &backend.queue,
+                OffscreenTarget::FORMAT,
+                BATTLE_OFFSCREEN_SIZE,
+                BATTLE_OFFSCREEN_SIZE,
+            );
             let map_width_m = demo.map.width_m;
-            let projection = if perf_overlay {
-                overlay_projection(map_width_m, demo.map.depth_m, 1.0)
-            } else {
-                demo.view(1.0)
-            };
+            let map_depth_m = demo.map.depth_m;
+            let camera = Camera::new(map_width_m, map_depth_m);
+            let camera3d = camera.camera3d();
+            let vp = camera3d.view_projection(1.0);
             let clear_wgpu = clear.to_wgpu();
             let mut profiler = FrameProfiler::new(DEFAULT_PERF_WINDOW);
             let snapshot = run_battle_to_end(
@@ -756,35 +773,114 @@ fn run_battle_graphical(
                 chunk,
                 &mut profiler,
                 |snapshot, timer, stats| {
-                    let mut shapes = snapshot.shapes();
-                    if perf_overlay {
-                        shapes.extend(overlay_shapes(stats, map_width_m));
-                    }
-                    pipeline.render(
+                    let scene = build_scene_geometry(snapshot, map_width_m, map_depth_m);
+                    let world_hud = build_hud_geometry(snapshot, camera.view_height_m, None);
+                    let screen_hud = if perf_overlay {
+                        overlay_hud_vertices(stats, map_width_m)
+                    } else {
+                        Vec::new()
+                    };
+                    renderer.render_battle(
                         &backend.device,
                         &backend.queue,
                         &target.view,
                         clear_wgpu,
-                        &projection,
-                        &shapes,
+                        &phalanx_render::BattleFrame {
+                            vp: &vp,
+                            scene: &scene,
+                            world_hud: &world_hud,
+                            screen_hud: &screen_hud,
+                        },
                     );
                     timer.mark_graphics_cpu();
                 },
             )?;
             let winner = demo.match_winner().ok_or("battle ended without a winner")?;
             let loser = if winner == TEAM_A { TEAM_B } else { TEAM_A };
+            // Final verification frame: 3D scene only (no HUD), so every pixel
+            // must be the clear color or a lit scene color.
+            let scene = build_scene_geometry(&snapshot, map_width_m, map_depth_m);
+            renderer.render_battle(
+                &backend.device,
+                &backend.queue,
+                &target.view,
+                clear_wgpu,
+                &phalanx_render::BattleFrame {
+                    vp: &vp,
+                    scene: &scene,
+                    world_hud: &[],
+                    screen_hud: &[],
+                },
+            );
             let pixels = target
                 .read_back(&backend.device, &backend.queue)
                 .map_err(|error| error.to_string())?;
-            let mut shapes = snapshot.shapes();
-            if perf_overlay {
-                shapes.extend(overlay_shapes(&profiler.stats(), map_width_m));
+            let depths = renderer
+                .read_back_depth(&backend.device, &backend.queue)
+                .map_err(|error| error.to_string())?;
+            let mut allowed: Vec<[f32; 4]> = vec![[
+                clear.0[0] as f32,
+                clear.0[1] as f32,
+                clear.0[2] as f32,
+                clear.0[3] as f32,
+            ]];
+            for base in [
+                GROUND_COLOR,
+                OBSTACLE_COLOR,
+                team_color(TEAM_A),
+                team_color(TEAM_B),
+            ] {
+                allowed.push(lit_color(base, AMBIENT + DIFFUSE));
+                allowed.push(lit_color(base, AMBIENT));
             }
-            verify_clear_pixels_background(&pixels, target.width, target.height, clear, &shapes)
-                .map_err(|error| format!("offscreen battle frame verification failed: {error}"))?;
+            verify_pixels_in_set(&pixels, clear, &allowed).map_err(|error| {
+                format!("offscreen 3D battle frame verification failed: {error}")
+            })?;
+            // Depth: geometry was rendered, and the depth buffer orders near
+            // geometry before far geometry. The ordering is checked against
+            // the CPU projection (a surviving unit's box top vs. ground farther
+            // from the camera) — absolute depth deltas shrink with camera
+            // distance, so a fixed threshold would be flaky across GPUs.
+            let size = BATTLE_OFFSCREEN_SIZE as usize;
+            let rendered = depths.iter().filter(|depth| **depth < 1.0).count();
+            if rendered <= size * size / 4 {
+                return Err(
+                    "offscreen 3D battle frame verification failed: no rendered depth in frame"
+                        .to_owned(),
+                );
+            }
+            let first = snapshot
+                .entities
+                .first()
+                .ok_or("offscreen 3D battle frame verification failed: no surviving units")?;
+            let (ex, ez) = (first.position[0], first.position[1]);
+            let away_x = camera3d.eye[0] - ex;
+            let away_z = camera3d.eye[2] - ez;
+            let away_len = (away_x * away_x + away_z * away_z).sqrt().max(1.0);
+            let far_ground = [
+                (ex - away_x / away_len * 25.0).clamp(10.0, map_width_m - 10.0),
+                0.0,
+                (ez - away_z / away_len * 25.0).clamp(10.0, map_depth_m - 10.0),
+            ];
+            verify_depth_ordering(
+                &depths,
+                BATTLE_OFFSCREEN_SIZE,
+                BATTLE_OFFSCREEN_SIZE,
+                &camera3d,
+                1.0,
+                [ex, UNIT_HEIGHT_M, ez],
+                far_ground,
+            )
+            .map_err(|error| format!("offscreen 3D battle frame verification failed: {error}"))?;
+            if count_color(&pixels, GROUND_COLOR) == 0 {
+                return Err(
+                    "offscreen 3D battle frame verification failed: no terrain pixels rendered"
+                        .to_owned(),
+                );
+            }
             if count_color(&pixels, OBSTACLE_COLOR) == 0 {
                 return Err(
-                    "offscreen battle frame verification failed: no obstacle pixels rendered"
+                    "offscreen 3D battle frame verification failed: no obstacle pixels rendered"
                         .to_owned(),
                 );
             }
@@ -794,12 +890,15 @@ fn run_battle_graphical(
                         .to_owned(),
                 );
             }
-            if count_color(&pixels, team_color(winner)) == 0 {
+            // Team presence is checked on either lit variant of the team color
+            // (box top = factor 1.0, sides = AMBIENT), robust to which face of
+            // a small unit box covers the rasterized pixels.
+            if count_color_family(&pixels, team_color(winner)) == 0 {
                 return Err(format!(
                     "offscreen battle frame verification failed: winner team {winner} color not rendered"
                 ));
             }
-            if count_color(&pixels, team_color(loser)) != 0 {
+            if count_color_family(&pixels, team_color(loser)) != 0 {
                 return Err(format!(
                     "offscreen battle frame verification failed: destroyed team {loser} still rendered"
                 ));
@@ -818,7 +917,7 @@ fn run_battle_graphical(
                 );
             }
             println!(
-                "FRAME offscreen battle size={}x{} tick={} entities={} winner={winner} background=verified obstacles=verified winner=verified loser=absent pixels ok",
+                "FRAME offscreen battle3d size={}x{} tick={} entities={} winner={winner} pixels=verified terrain=verified obstacles=verified depth=verified winner=verified loser=absent",
                 target.width,
                 target.height,
                 snapshot.tick,
@@ -901,7 +1000,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT] [--seed SEED]\n    phalanx_runtime --graphical --battle [--perf-overlay] [--clear RRGGBB] [--seed SEED]\n    phalanx_runtime --graphical --offscreen --battle [--perf-overlay] [--frames N] [--ticks N] [--clear RRGGBB] [--seed SEED] [--screenshot PATH]\n\n--headless runs the deterministic CPU-only scenario through SimulationRunner (no graphics initialization). --graphical presents wgpu frames in a native window (phalanx_render); on headless machines use --graphical --offscreen, which renders frames to an offscreen texture and verifies the pixels. --battle (graphical only, issue #64) runs the first autonomous battle: two teams spawn on the Crossing map with no unit commands and fight to MatchOver through the real SimulationRunner; windowed steps the sim at its fixed 20 Hz wall-clock rate per rendered frame, offscreen runs to the terminal state (default --ticks 2000) and verifies the final frame pixels (background, obstacles, winner color present, loser color absent); --screenshot writes the final offscreen frame as a PPM image. --perf-overlay (battle mode) shows the in-game FPS/frametime overlay: per-stage bars (simulation, snapshot, graphics, total) drawn over the battlefield plus a structured PERF line every 20 frames (issue #88)."
+                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT] [--seed SEED]\n    phalanx_runtime --graphical --battle [--perf-overlay] [--clear RRGGBB] [--seed SEED]\n    phalanx_runtime --graphical --offscreen --battle [--perf-overlay] [--frames N] [--ticks N] [--clear RRGGBB] [--seed SEED] [--screenshot PATH]\n\n--headless runs the deterministic CPU-only scenario through SimulationRunner (no graphics initialization). --graphical presents wgpu frames in a native window (phalanx_render); on headless machines use --graphical --offscreen, which renders frames to an offscreen texture and verifies the pixels. --battle (graphical only, issues #64/#104) runs the first autonomous battle: two teams spawn on the Crossing map with no unit commands and fight to MatchOver through the real SimulationRunner, rendered as a depth-tested 3D scene (ground, obstacle and unit boxes, perspective camera with pan/zoom/rotate, HUD overlay); windowed steps the sim at its fixed 20 Hz wall-clock rate per rendered frame, offscreen runs to the terminal state (default --ticks 2000) and verifies the final frame's color and depth readbacks (terrain, obstacles, depth discrimination, winner color present, loser color absent); --screenshot writes the final offscreen frame as a PPM image. --perf-overlay (battle mode) shows the in-game FPS/frametime overlay: per-stage bars (simulation, snapshot, graphics, total) drawn over the battlefield plus a structured PERF line every 20 frames (issue #88)."
                 );
                 return Ok(());
             }
@@ -1226,6 +1325,43 @@ mod tests {
             twin.runner.canonical_digest()
         );
         assert_eq!(winner, twin.match_winner().expect("winner"));
+    }
+
+    #[test]
+    fn battle_camera3d_picks_the_view_center_at_screen_center() {
+        use super::Camera;
+        // The 3D camera preserves the 2D picking contract: the screen center
+        // maps to the camera's world center on the ground plane, at any aspect.
+        let camera = Camera::new(200.0, 200.0);
+        let camera3d = camera.camera3d();
+        for aspect in [0.8, 1.0, 1.7] {
+            let ground = camera3d
+                .screen_to_ground(aspect, 0.5, 0.5)
+                .expect("screen center hits the ground plane");
+            assert!(
+                (ground[0] - 100.0).abs() < 1e-3 && (ground[1] - 100.0).abs() < 1e-3,
+                "aspect={aspect} ground={ground:?}"
+            );
+        }
+        // Zooming in keeps the center pinned and shrinks the picked span.
+        let mut zoomed = Camera::new(200.0, 200.0);
+        zoomed.zoom(5.0);
+        let camera3d = zoomed.camera3d();
+        let center = camera3d.screen_to_ground(1.0, 0.5, 0.5).expect("center");
+        let edge = camera3d.screen_to_ground(1.0, 1.0, 0.5).expect("edge");
+        let full = camera
+            .camera3d()
+            .screen_to_ground(1.0, 1.0, 0.5)
+            .expect("edge");
+        let full_center = camera
+            .camera3d()
+            .screen_to_ground(1.0, 0.5, 0.5)
+            .expect("c");
+        assert!((center[0] - 100.0).abs() < 1e-3);
+        assert!(
+            (edge[0] - center[0]).abs() < (full[0] - full_center[0]).abs(),
+            "zoomed-in view covers less world"
+        );
     }
 
     #[test]

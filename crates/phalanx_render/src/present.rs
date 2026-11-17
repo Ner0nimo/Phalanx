@@ -398,6 +398,54 @@ pub fn verify_clear_pixels_background(
     Ok(())
 }
 
+/// Verifies that every pixel of an RGBA8 readback is either the clear color
+/// or one of the given `colors` (per-channel tolerance 1 for unorm rounding,
+/// alpha included). Used to prove a frame contains only expected GPU-rendered
+/// colors (issue #104: clear + lit scene + HUD colors of the 3D battle frame).
+pub fn verify_pixels_in_set(
+    pixels: &[u8],
+    clear: ClearColor,
+    colors: &[[f32; 4]],
+) -> Result<(), PresentError> {
+    let matches = |pixel: [u8; 4], color: [f32; 4]| {
+        let expected = [
+            (color[0] * 255.0).round() as i32,
+            (color[1] * 255.0).round() as i32,
+            (color[2] * 255.0).round() as i32,
+            (color[3] * 255.0).round() as i32,
+        ];
+        let found = [
+            pixel[0] as i32,
+            pixel[1] as i32,
+            pixel[2] as i32,
+            pixel[3] as i32,
+        ];
+        (0..4).all(|c| (found[c] - expected[c]).abs() <= 1)
+    };
+    let clear_rgba = [
+        clear.0[0] as f32,
+        clear.0[1] as f32,
+        clear.0[2] as f32,
+        clear.0[3] as f32,
+    ];
+    for (index, chunk) in pixels.chunks_exact(4).enumerate() {
+        let pixel = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        if !matches(pixel, clear_rgba) && !colors.iter().any(|color| matches(pixel, *color)) {
+            return Err(PresentError::PixelMismatch {
+                pixel: index,
+                expected: [
+                    (clear.0[0] * 255.0).round() as u8,
+                    (clear.0[1] * 255.0).round() as u8,
+                    (clear.0[2] * 255.0).round() as u8,
+                    255,
+                ],
+                found: pixel,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Writes an RGBA8 readback as a binary PPM (P6) screenshot file — the
 /// completion evidence for the graphical battle (issue #64). Pure CPU file
 /// I/O over GPU-produced pixels; no CPU framebuffer rendering is involved in
