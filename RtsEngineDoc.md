@@ -223,8 +223,8 @@ The stack is a proposal, not a reason to force a library into a poor fit. Record
 
 - **Language/toolchain:** stable Rust; Cargo workspace.
 - **Window/input:** winit.
-- **Rendering/compute candidate:** wgpu selected over ash after a headless spike on both candidates — see [ADR-0004](docs/adr/0004-rendering-backend.md) and `benchmarks/graphics/`. wgpu reduces low-level Vulkan lifetime/synchronization work and offers multiple backends; ash offers direct Vulkan control at substantially higher engineering cost. Do not build both production backends.
-- **Shaders:** WGSL if using wgpu; GLSL/SPIR-V if using ash. Shader compilation and validation must be part of CI.
+- **Rendering/compute:** `phalanx_render` currently uses `wgpu 30.0.1` and `winit 0.30` (ADR-0004). Keep wgpu as the working renderer baseline; do not interpret the debug-geometry/battle prototype as proof of production visual quality or native vendor-effect interoperability. The production renderer must select a deliberate native backend profile (DX12/Vulkan on Windows; Vulkan on Linux where supported) instead of assuming every compiled wgpu backend is equivalent for vendor SDK integration. Do not replace wgpu with raw Vulkan/ash without the FSR interop and real-GPU evidence in ADR-0010.
+- **Shaders:** WGSL for engine-owned wgpu passes, with shader compilation, reflection/validation, and cooked-shader caching in CI/build tooling. Native vendor effects may ship separately compiled/signed binaries; do not assume WGSL can replace their required native API integration.
 - **ECS candidate:** bevy_ecs vs hecs benchmarked on representative workloads at 10k/50k/100k entities; hecs selected for the initial implementation spike — see [ADR-0003](docs/adr/0003-ecs-selection.md) for measurements and revisit criteria. Do not build a custom ECS before measurements justify it.
 - **Math:** glam, subject to deterministic-simulation validation.
 - **CPU parallelism:** rayon only for jobs whose writes and reductions preserve deterministic outcomes.
@@ -247,7 +247,11 @@ Before finalizing major choices, create isolated prototypes and record results:
 6. Benchmark navigation for mixed movement profiles and crowded chokepoints.
 7. Validate asset import, animation, and hot-reload requirements.
 
-Each spike must have a short report: hardware, versions, workload, measured results, limitations, and recommendation.
+8. Prove AMD FSR Upscaling 4.1.2 native integration with the selected wgpu backend on a supported Windows GPU, including zero-copy resource access, synchronization, SDK binary loading/redistribution constraints, and a real image-quality comparison. Do not assume that Vulkan API support implies a supported Linux FSR SDK runtime.
+9. Validate the complete temporal-upscaler inputs and temporal stability in representative RTS scenes: HDR color, depth, motion vectors, jitter, moving/instanced/skinned units, camera pans, particles, transparency, camera cuts, and history invalidation.
+10. Add real GPU timestamp queries and per-pass/per-resource telemetry; CPU encode/submit timing alone is not a GPU performance measurement.
+
+Each spike must have a short report: hardware, OS, driver, backend/API, SDK/library versions, build profile, workload, measured results, image-quality observations, limitations, and recommendation.
 
 ---
 
@@ -260,11 +264,10 @@ Suggested Cargo workspace (names may evolve; boundaries should remain clear):
 - phalanx_core: simulation clock, world state, entity identity, commands, events, deterministic RNG, state hashing, simulation schedule.
 - phalanx_game: game rules and authoritative systems (combat, economy, production, territory, supply, research, unit definitions).
 - phalanx_navigation: nav representation, global pathfinding, flow fields, local movement constraints, formation movement.
-- phalanx_render: presentation only — wgpu backend init, windowed (winit) and offscreen presenters, frame loop (issue #61). Never owns authoritative state; `--headless` never touches it.
+- phalanx_render: presentation only — wgpu backend, native window/surface and offscreen presenters, render graph/passes, materials, terrain/mesh rendering, temporal reconstruction/upscaling and presentation. It never owns authoritative state; `--headless` never touches it. Native vendor SDK interop, if required, stays behind a very small, audited backend boundary rather than leaking raw handles through the renderer API.
 - phalanx_runtime: CLI entry point; `--headless` runs the deterministic simulation without any graphics initialization, `--graphical` presents wgpu frames (issues #61–#63, `--battle` renders the live simulation snapshot).
 - phalanx_map: map schema, terrain data, region graph, map validation, import/export.
 - phalanx_ai: strategic, operational, and tactical AI. AI submits ordinary commands through the same validated command interface as players.
-- phalanx_render: renderer, materials, terrain rendering, instancing, LOD, overlays, visual effects.
 - phalanx_gpu: optional GPU compute and upload/readback utilities; never owns authoritative gameplay state.
 - phalanx_assets: asset registry, import/cook pipeline, manifests, runtime loading.
 - phalanx_audio: audio playback and spatial audio.
@@ -546,7 +549,7 @@ Map formats require schema versions and migration policy. Validation reports mus
 
 ## 11. Rendering and strategic readability
 
-*[Provisional] — backend spike only (ADR-0004); real-GPU hardware validation is issue #33; the headed graphical path is issues #61–#64.*
+*[Provisional] — the current wgpu path proves presentation and a debug battle, not a finished 3D renderer; see ADR-0004 and ADR-0010. FSR/native-effect integration and visual-quality validation remain open.*
 
 ### 11.1 Rendering goals
 
@@ -588,6 +591,42 @@ Rendering must be optional for headless simulation. Renderer initialization fail
 **First autonomous battle in graphical mode (issue #64, implemented):** `BattleWorld::set_autonomous(true)` enables the autonomous stance (canonical state): units without any command acquire the nearest enemy in sight, navigate toward it when outside weapon range, and hold-and-fire in range — so the battle proceeds with zero per-unit commands. `--graphical --battle` spawns both teams 20 m apart on the Crossing map (`AUTONOMOUS_PAD_A/B`) and runs the real `SimulationRunner` to `MatchOver` (default `--ticks` 2000, `--seed` reproducible): windowed advances the sim at its fixed 20 Hz wall-clock rate per rendered frame (render and simulation rates are independent) and presents until closed; `--graphical --offscreen --battle` renders `frames` frames spread across the run and verifies the final readback — background, obstacle gray, winner team color present, loser team color absent (all its units destroyed) — and `--screenshot PATH` writes the final frame as a PPM (`phalanx_render::write_ppm`). On GPU-less machines the offscreen path still runs the actual simulation to its terminal state and exits 0 with the structured probe result, so CI verifies the battle end-to-end without a GPU; real-GPU runs additionally verify pixels. Battle completion is logged as `MATCH winner=<team> tick=<n>`.
 
 **In-game FPS/frametime overlay (issue #88, implemented):** `phalanx_render::perf` is an independent presentation-side collector: `FrameTimer` marks the per-frame stages with explicit measurement boundaries — `simulation` (wall-clock `SimulationRunner` advance, with `simulation_steps` so an idle frame at the fixed 20 Hz rate reads `sim_ms=0, sim_steps=0`, not "free"), `snapshot` (`extract_snapshot`), `graphics_cpu` (CPU-side wgpu encode/submit only; presentation is asynchronous and true on-GPU time would need timestamp queries, deferred), and `total` measured independently from frame start to end, never summed from stages. `FrameProfiler` aggregates a fixed-size sliding window (default 120 frames, no per-frame allocation or formatting) into `PerfStats` (avg FPS, worst frametime, per-stage averages). `--graphical --battle --perf-overlay` draws bar-based stage timings via the debug-geometry pipeline (a strip above the map; numeric values are stdout-only since there is no text renderer) and prints a structured line every 20 frames: `PERF frame=<n> fps=<avg> worst_ms=<x> total_ms=<x> sim_ms=<x> snapshot_ms=<x> graphics_cpu_ms=<x> sim_steps=<n>`. Works windowed and offscreen; the GPU-less offscreen probe still runs the sim and collector and emits the `PERF` lines (`graphics_cpu_ms=0`, nothing rendered), so CI verifies it without a GPU — collection is separated from rendering, pixel verification only when an adapter exists. Measurement is wall-clock only and never feeds back into simulation state: the `--headless` digest is unchanged with the overlay enabled.
+
+### 11.5 Product visual-quality baseline
+
+The shipping goal is a polished 3D RTS with high visual quality at tactical zoom, clear strategic readability at large zoom, and a credible performance profile in large battles. The current colored debug geometry is a development visualization only; it is not the target art/rendering quality.
+
+The first production-quality rendering slice must demonstrate, in the Crossing reference battle and at wide, medium, and close camera distances:
+
+- A linear-HDR scene-color pipeline with explicit exposure and tone mapping; correct sRGB/linear handling and a defined policy for display output and HDR-capable displays.
+- A coherent physically based material model for units, buildings, terrain, and props (base color, normal, roughness/metalness or the selected equivalent), with texture filtering, mip generation, anisotropy, and GPU-friendly texture formats.
+- Directional sunlight, ambient/skylight contribution, stable shadowing (including cascades or an equivalent RTS-appropriate solution), atmospheric depth/fog, and readable terrain/material blending.
+- Real mesh rendering with instancing/batching, mesh and material LOD, frustum/occlusion culling where useful, and a representation transition from aggregated armies to individual units.
+- A defined model/animation path for skeletal units, animation LOD, particles, decals, explosions, water/foliage where present, and visual effects that remain presentation-only.
+- High-contrast, legible selection, health, command, ownership, and objective feedback across zoom levels without obscuring the battlefield.
+
+The implementation should use an engine-owned cooked asset pipeline rather than loading authoring files directly at runtime. glTF 2.0 is the initial interchange candidate, not the runtime format. Import/cook steps must validate mesh/material/texture/skeleton data, generate mipmaps and required LODs, compress textures for the target GPU formats, and emit a versioned content manifest. The exact material model, lighting approach, and quality tiers must be measured against real content and hardware before they are frozen.
+
+A visual acceptance scene must include dense unit formations, fast camera panning, mixed materials, shadows, transparent/alpha-tested effects, particles, and long sight lines. Review both still-image quality and motion/temporal stability; a screenshot-only test is insufficient.
+
+### 11.6 Temporal upscaling, frame generation, and presentation
+
+Upscaling is a renderer capability, not a final-screen filter that can be bolted on after the render pipeline is complete. The renderer must support a native render resolution distinct from output resolution and expose an explicit temporal input contract.
+
+For AMD FSR Upscaling 4.1.2, the renderer must be able to provide:
+- Linear-color scene input at render resolution.
+- A render-resolution depth buffer with its depth convention communicated to the effect.
+- Motion vectors with a documented scale/space convention. Opaque, alpha-tested, alpha-blended, instanced, and animated objects should contribute motion wherever they cover pixels.
+- A jittered projection and the exact jitter offset used for the frame; motion vectors must follow the SDK's jitter convention.
+- Optional exposure (or the SDK's automatic-exposure path), plus deterministic history reset/invalidation for camera cuts, map loads, resolution changes, and other discontinuities.
+
+FSR 4 no longer requires reactive and transparency/composition masks, but an implementation should query the selected effect version's actual resource requirements. Earlier fallback effects may have different needs. Keep the render graph responsible for resource formats, lifetimes, usage transitions, and pass ordering. Do not hide these requirements behind an upscaler interface that cannot express native resource handles or synchronization.
+
+As of 2026-11-17, AMD's FSR SDK 2.4 contains FSR Upscaling 4.1.2 and FSR Frame Generation 4.0.2. AMD documents DX12 and Vulkan 1.2 integration and requires the prebuilt, signed SDK loader/effect DLLs. FSR Upscaling 4.1.2 supports selected Radeon RX 6000/7000/9000 GPUs and supported Ryzen APUs; the AMD API selects FSR 3.1.6 on other hardware. AMD's published supported-OS list is Windows 10/11. Although the SDK now exposes Vulkan support, this project must not claim Linux FSR 4 runtime support unless the actual Linux binary/runtime and driver path are confirmed. Linux remains a first-class rendering target and needs a tested vendor-neutral fallback path.
+
+Keep the upscaler interface capability-based and vendor-neutral: query available effects, supported modes, input/output formats, and hardware/driver requirements at runtime. FSR should be an optional quality/performance choice, not a startup dependency or a reason to fail on NVIDIA, Intel, unsupported AMD hardware, or Linux. The native integration prototype in [ADR-0010](docs/adr/0010-high-fidelity-rendering-and-upscaling.md) must establish whether wgpu's native backend resources can be shared safely and without expensive copies. A backend-specific unsafe bridge, if required, must be isolated and audited; do not spread unsafe native handles or synchronization assumptions throughout `phalanx_render`.
+
+Frame generation is optional and separate from upscaling. AMD FSR Frame Generation 4.0.2 currently requires Windows 11, a Radeon RX 9000-series GPU or later, and DX12 (with the required Agility SDK) or Vulkan 1.2; AMD documents a 30 FPS minimum input rate for this generation path. It must not be used to conceal a slow simulation or poor base frame rate. RTS HUD/text/selection overlays need special treatment: render and composite them at output resolution or use the SDK's supported UI-composition path so hard UI edges are not distorted by interpolated scene motion. Frame generation must be separately toggleable, capability-gated, frame-paced, and validated for latency and UI artifacts before shipping.
 
 ---
 
@@ -764,6 +803,7 @@ ADR index (remaining entries are created as their decisions land):
 - 0007-map-and-save-format.md
 - 0008-agent-command-protocol.md
 - [0009-phase-schedule-cadence-and-access.md](docs/adr/0009-phase-schedule-cadence-and-access.md) (accepted; phase-ordering invariants justified by real systems, deterministic system cadence, access contract and deferred parallel path)
+- [0010-high-fidelity-rendering-and-upscaling.md](docs/adr/0010-high-fidelity-rendering-and-upscaling.md) (accepted direction; wgpu remains the working renderer baseline, but FSR/native interop, temporal inputs, fallback platforms, and production visual quality must be proven before final backend commitment)
 
 An agent must not silently override an accepted ADR. If new evidence invalidates a decision, propose a replacement ADR and explain migration impact.
 
