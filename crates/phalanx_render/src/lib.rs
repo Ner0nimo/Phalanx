@@ -22,10 +22,13 @@ pub mod perf;
 pub mod present;
 pub mod scene3d;
 pub mod snapshot;
+pub mod temporal;
 pub mod window;
 
 pub use backend::{AdapterReport, BackendError, GpuBackend, init_headless};
-pub use frame::{BattleFrame, FrameRenderer, create_depth_target, read_back_depth};
+pub use frame::{
+    BattleTemporalFrame, FrameRenderer, create_depth_target, read_back_depth, read_back_motion,
+};
 pub use geometry::{DebugPipeline, DebugShape, OrthoProjection, Vertex, count_color, demo_shapes};
 pub use math::Mat4;
 pub use perf::{
@@ -38,14 +41,21 @@ pub use present::{
     verify_pixels_in_set, write_ppm,
 };
 pub use scene3d::{
-    AMBIENT, CAMERA_FOV_Y_RAD, CAMERA_PITCH_RAD, Camera3D, DEPTH_FORMAT, DIFFUSE, GROUND_COLOR,
-    HudVertex, OBSTACLE_HEIGHT_M, ScenePipelines, SceneVertex, UNIT_HEIGHT_M, build_hud_geometry,
-    build_scene_geometry, count_color_family, lit_color, overlay_hud_vertices, sample_depth_window,
-    verify_depth_ordering, world_to_screen,
+    AMBIENT, CAMERA_FOV_Y_RAD, CAMERA_PITCH_RAD, Camera3D, DEPTH_FORMAT, DIFFUSE, FrameUniforms,
+    GROUND_COLOR, HudVertex, OBSTACLE_HEIGHT_M, ScenePipelines, SceneVertex, UNIT_HEIGHT_M,
+    build_hud_geometry, build_scene_geometry, count_color_family, lit_color, overlay_hud_vertices,
+    sample_depth_window, verify_depth_ordering, world_to_screen,
 };
 pub use snapshot::{
     EntityCategory, OBSTACLE_COLOR, ObstacleShape, RenderEntity, RenderSnapshot, RenderSpace,
     team_color,
+};
+pub use temporal::{
+    DEFAULT_RENDER_SCALE, DEPTH_CONVENTION, Discontinuity, INPUT_DEPTH, INPUT_EXPOSURE,
+    INPUT_HISTORY, INPUT_JITTER, INPUT_MOTION, INPUT_SCENE_COLOR, JitterSequence, MIN_RENDER_SCALE,
+    MOTION_CONVENTION, MOTION_FORMAT, SCENE_COLOR_FORMAT, SCENE_COLOR_SPACE, TemporalHistory,
+    TemporalRenderConfig, UpscalerContract, available_upscalers, fallback_contract, fsr4_contract,
+    half_to_f32, halton, jitter_translation,
 };
 pub use window::{
     FrameCallback, InputEvent, InputState, RenderError, run_windowed, run_windowed_with,

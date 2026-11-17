@@ -138,8 +138,14 @@ impl HudVertex {
 const SCENE_SHADER_WGSL: &str = r#"
 struct Uniforms {
     vp: mat4x4<f32>,
+    prev_vp: mat4x4<f32>,
+    exposure: f32,
+    _pad: vec3<f32>,
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+@group(1) @binding(0) var scene_tex: texture_2d<f32>;
+@group(1) @binding(1) var scene_sampler: sampler;
 
 struct SceneIn {
     @location(0) position: vec3<f32>,
@@ -154,12 +160,20 @@ struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) clip_cur: vec4<f32>,
+    @location(3) clip_prev: vec4<f32>,
+};
+struct FsOut {
+    @location(0) color: vec4<f32>,
+    @location(1) motion: vec4<f32>,
 };
 
 @vertex
 fn vs_scene(in: SceneIn) -> VsOut {
     var out: VsOut;
-    out.position = uniforms.vp * vec4<f32>(in.position, 1.0);
+    out.clip_cur = uniforms.vp * vec4<f32>(in.position, 1.0);
+    out.position = out.clip_cur;
+    out.clip_prev = uniforms.prev_vp * vec4<f32>(in.position, 1.0);
     out.color = in.color;
     out.normal = in.normal;
     return out;
@@ -168,23 +182,97 @@ fn vs_scene(in: SceneIn) -> VsOut {
 @vertex
 fn vs_hud(in: HudIn) -> VsOut {
     var out: VsOut;
-    out.position = uniforms.vp * vec4<f32>(in.position, 1.0);
+    out.clip_cur = uniforms.vp * vec4<f32>(in.position, 1.0);
+    out.position = out.clip_cur;
+    out.clip_prev = uniforms.prev_vp * vec4<f32>(in.position, 1.0);
     out.color = in.color;
     out.normal = vec3<f32>(0.0, 1.0, 0.0);
     return out;
 }
 
-@fragment
-fn fs_lit(in: VsOut) -> @location(0) vec4<f32> {
-    let factor = 0.55 + 0.45 * max(in.normal.y, 0.0);
-    return vec4<f32>(in.color.rgb * factor, in.color.a);
+// Motion vectors per crate::temporal::MOTION_CONVENTION: UV-space delta
+// (cur - prev) in fractions of the full target, +x right, +y down; both
+// frames use jittered projections, so the jitter delta is included.
+fn motion_of(in: VsOut) -> vec2<f32> {
+    let cur = in.clip_cur.xy / in.clip_cur.w;
+    let prev = in.clip_prev.xy / in.clip_prev.w;
+    return (cur - prev) * vec2<f32>(0.5, -0.5);
 }
 
 @fragment
-fn fs_flat(in: VsOut) -> @location(0) vec4<f32> {
-    return in.color;
+fn fs_lit(in: VsOut) -> FsOut {
+    let factor = 0.55 + 0.45 * max(in.normal.y, 0.0);
+    var out: FsOut;
+    out.color = vec4<f32>(in.color.rgb * uniforms.exposure * factor, in.color.a);
+    out.motion = vec4<f32>(motion_of(in), 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_flat(in: VsOut) -> FsOut {
+    var out: FsOut;
+    out.color = in.color;
+    // World HUD is composited at output resolution; it contributes no motion.
+    out.motion = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    return out;
+}
+
+// Present pass (bilinear fallback upscaler): fullscreen triangle sampling the
+// scene-color attachment at render resolution into the output view.
+struct PresentOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_present(@builtin(vertex_index) index: u32) -> PresentOut {
+    var out: PresentOut;
+    let x = f32((index << 1u) & 2u);
+    let y = f32(index & 2u);
+    out.position = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(x, 1.0 - y);
+    return out;
+}
+
+@fragment
+fn fs_present(in: PresentOut) -> @location(0) vec4<f32> {
+    return textureSample(scene_tex, scene_sampler, in.uv);
 }
 "#;
+
+/// The per-frame uniform block: current (jittered) view-projection, previous
+/// frame's view-projection (for motion vectors), and linear exposure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameUniforms {
+    /// Current frame's view-projection (jitter already applied).
+    pub vp: Mat4,
+    /// Previous frame's view-projection (jittered), for motion vectors.
+    pub prev_vp: Mat4,
+    /// Linear exposure multiplier (1.0 = neutral).
+    pub exposure: f32,
+}
+
+impl FrameUniforms {
+    /// The identity/neutral uniforms (used for output-space HUD draws).
+    #[must_use]
+    pub fn identity() -> Self {
+        Self {
+            vp: Mat4::IDENTITY,
+            prev_vp: Mat4::IDENTITY,
+            exposure: 1.0,
+        }
+    }
+
+    /// Encodes as 144 bytes (two mat4 + f32 + vec3 pad), column-major LE.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 144] {
+        let mut out = [0u8; 144];
+        out[0..64].copy_from_slice(&self.vp.to_bytes());
+        out[64..128].copy_from_slice(&self.prev_vp.to_bytes());
+        out[128..132].copy_from_slice(&self.exposure.to_le_bytes());
+        out
+    }
+}
 
 /// The perspective 3D camera (issue #104): derived from the existing pan/zoom
 /// state (`center` in world x/z, `view_height_m` = visible ground height) plus
@@ -728,13 +816,23 @@ pub fn overlay_hud_vertices(stats: &PerfStats, map_width_m: f32) -> Vec<HudVerte
     vertices
 }
 
-/// The lit scene + unlit HUD pipelines sharing one WGSL module and one
-/// view-projection uniform layout. The scene pipeline writes depth
-/// (`Less`); the HUD pipeline is depth-always without writes, so HUD elements
-/// overlay the 3D scene correctly.
+/// The scene-pass + present-pass pipelines (issues #104/#97), sharing one WGSL
+/// module:
+/// - `scene_pipeline`: targets `[scene_color, motion]` + depth, writes depth
+///   (`Less`) and motion vectors;
+/// - `hud_pipeline`: targets `[scene_color, motion]` + depth-always, no depth
+///   writes, zero motion — world HUD overlaid on the 3D scene;
+/// - `present_pipeline`: targets `[output]`, no depth — the bilinear-fallback
+///   fullscreen upscale from render to output resolution;
+/// - `hud_output_pipeline`: targets `[output]`, no depth, identity VP — the
+///   screen-space HUD strip composited at output resolution.
 pub struct ScenePipelines {
     scene_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
+    present_pipeline: wgpu::RenderPipeline,
+    hud_output_pipeline: wgpu::RenderPipeline,
+    present_layout: wgpu::PipelineLayout,
+    present_bind_group_layout: wgpu::BindGroupLayout,
     vp_bind: wgpu::BindGroup,
     identity_bind: wgpu::BindGroup,
     vp_uniform: wgpu::Buffer,
@@ -742,46 +840,87 @@ pub struct ScenePipelines {
     scene_capacity: usize,
     hud_buffer: wgpu::Buffer,
     hud_capacity: usize,
+    hud_output_buffer: wgpu::Buffer,
+    hud_output_capacity: usize,
 }
 
 impl ScenePipelines {
-    /// Creates the pipelines targeting `color_format` with [`DEPTH_FORMAT`].
+    /// Creates the pipelines: scene/HUD target `[scene_format, motion_format]`
+    /// with [`DEPTH_FORMAT`]; present/HUD-output target `output_format`.
     #[must_use]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        color_format: wgpu::TextureFormat,
+        scene_format: wgpu::TextureFormat,
+        motion_format: wgpu::TextureFormat,
+        output_format: wgpu::TextureFormat,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("phalanx-scene3d-shader"),
             source: wgpu::ShaderSource::Wgsl(SCENE_SHADER_WGSL.into()),
         });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("phalanx-scene3d-uniforms"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZeroU64::new(64),
-                },
-                count: None,
-            }],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("phalanx-scene3d-uniforms"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(144),
+                    },
+                    count: None,
+                }],
+            });
+        let present_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("phalanx-present-texture"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let uniform_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("phalanx-scene3d-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[Some(&uniform_bind_group_layout)],
             immediate_size: 0,
         });
+        let present_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("phalanx-present-layout"),
+            bind_group_layouts: &[Some(&present_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let color_target = |format: wgpu::TextureFormat| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        };
         let make_pipeline = |vertex_entry: &'static str,
                              fragment_entry: &'static str,
                              vertex_buffer: Option<wgpu::VertexBufferLayout<'static>>,
-                             depth_write: bool,
-                             depth_compare: wgpu::CompareFunction| {
+                             targets: Vec<Option<wgpu::ColorTargetState>>,
+                             depth: Option<(bool, wgpu::CompareFunction)>,
+                             layout: &wgpu::PipelineLayout| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("phalanx-scene3d-pipeline"),
-                layout: Some(&layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(vertex_entry),
@@ -792,21 +931,17 @@ impl ScenePipelines {
                     module: &shader,
                     entry_point: Some(fragment_entry),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets: &targets,
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     cull_mode: None,
                     ..Default::default()
                 },
-                depth_stencil: Some(wgpu::DepthStencilState {
+                depth_stencil: depth.map(|(write, compare)| wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(depth_compare),
+                    depth_write_enabled: Some(write),
+                    depth_compare: Some(compare),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -819,32 +954,50 @@ impl ScenePipelines {
             "vs_scene",
             "fs_lit",
             Some(SceneVertex::layout()),
-            true,
-            wgpu::CompareFunction::Less,
+            vec![color_target(scene_format), color_target(motion_format)],
+            Some((true, wgpu::CompareFunction::Less)),
+            &uniform_layout,
         );
         let hud_pipeline = make_pipeline(
             "vs_hud",
             "fs_flat",
             Some(HudVertex::layout()),
-            false,
-            wgpu::CompareFunction::Always,
+            vec![color_target(scene_format), color_target(motion_format)],
+            Some((false, wgpu::CompareFunction::Always)),
+            &uniform_layout,
+        );
+        let present_pipeline = make_pipeline(
+            "vs_present",
+            "fs_present",
+            None,
+            vec![color_target(output_format)],
+            None,
+            &present_layout,
+        );
+        let hud_output_pipeline = make_pipeline(
+            "vs_hud",
+            "fs_flat",
+            Some(HudVertex::layout()),
+            vec![color_target(output_format)],
+            None,
+            &uniform_layout,
         );
         let vp_uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("phalanx-scene3d-vp"),
-            size: 64,
+            label: Some("phalanx-scene3d-uniforms"),
+            size: 144,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let identity_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("phalanx-scene3d-identity"),
-            size: 64,
+            size: 144,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&identity_uniform, 0, &Mat4::IDENTITY.to_bytes());
+        queue.write_buffer(&identity_uniform, 0, &FrameUniforms::identity().to_bytes());
         let vp_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("phalanx-scene3d-vp-bind"),
-            layout: &bind_group_layout,
+            layout: &uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: vp_uniform.as_entire_binding(),
@@ -852,35 +1005,51 @@ impl ScenePipelines {
         });
         let identity_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("phalanx-scene3d-identity-bind"),
-            layout: &bind_group_layout,
+            layout: &uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: identity_uniform.as_entire_binding(),
             }],
         });
-        let scene_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("phalanx-scene3d-scene-vertices"),
-            size: 4096,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let hud_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("phalanx-scene3d-hud-vertices"),
-            size: 4096,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let make_vertex_buffer = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: 4096,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
         Self {
             scene_pipeline,
             hud_pipeline,
+            present_pipeline,
+            hud_output_pipeline,
+            present_layout,
+            present_bind_group_layout,
             vp_bind,
             identity_bind,
             vp_uniform,
-            scene_buffer,
+            scene_buffer: make_vertex_buffer("phalanx-scene3d-scene-vertices"),
             scene_capacity: 4096 / std::mem::size_of::<SceneVertex>(),
-            hud_buffer,
+            hud_buffer: make_vertex_buffer("phalanx-scene3d-hud-vertices"),
             hud_capacity: 4096 / std::mem::size_of::<HudVertex>(),
+            hud_output_buffer: make_vertex_buffer("phalanx-scene3d-hud-output-vertices"),
+            hud_output_capacity: 4096 / std::mem::size_of::<HudVertex>(),
         }
+    }
+
+    /// The present-pass pipeline layout (scene texture + bilinear sampler in
+    /// group 1), for building the per-resize present bind group.
+    #[must_use]
+    pub fn present_layout(&self) -> &wgpu::PipelineLayout {
+        &self.present_layout
+    }
+
+    /// The present-pass bind group layout (scene texture + bilinear sampler in
+    /// group 1), for building the per-resize present bind group.
+    #[must_use]
+    pub fn present_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.present_bind_group_layout
     }
 
     fn grow(
@@ -902,18 +1071,17 @@ impl ScenePipelines {
         }
     }
 
-    /// Uploads the view-projection matrix and all vertex batches; returns the
-    /// vertex counts `(scene, world_hud, screen_hud)`.
+    /// Uploads the frame uniforms and the scene-pass vertex batches; returns
+    /// the vertex counts `(scene, world_hud)`.
     pub fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vp: &Mat4,
+        uniforms: &FrameUniforms,
         scene: &[SceneVertex],
         world_hud: &[HudVertex],
-        screen_hud: &[HudVertex],
-    ) -> (u32, u32, u32) {
-        queue.write_buffer(&self.vp_uniform, 0, &vp.to_bytes());
+    ) -> (u32, u32) {
+        queue.write_buffer(&self.vp_uniform, 0, &uniforms.to_bytes());
         Self::grow(
             device,
             &mut self.scene_buffer,
@@ -923,35 +1091,42 @@ impl ScenePipelines {
             "phalanx-scene3d-scene-vertices",
         );
         queue.write_buffer(&self.scene_buffer, 0, &SceneVertex::to_bytes(scene));
-        let hud_total = world_hud.len() + screen_hud.len();
         Self::grow(
             device,
             &mut self.hud_buffer,
             &mut self.hud_capacity,
-            hud_total,
+            world_hud.len(),
             std::mem::size_of::<HudVertex>(),
             "phalanx-scene3d-hud-vertices",
         );
         queue.write_buffer(&self.hud_buffer, 0, &HudVertex::to_bytes(world_hud));
-        if !screen_hud.is_empty() {
-            queue.write_buffer(
-                &self.hud_buffer,
-                std::mem::size_of_val(world_hud) as u64,
-                &HudVertex::to_bytes(screen_hud),
-            );
-        }
-        (
-            scene.len() as u32,
-            world_hud.len() as u32,
-            screen_hud.len() as u32,
-        )
+        (scene.len() as u32, world_hud.len() as u32)
     }
 
-    /// Draws the uploaded batches into an open render pass that already has
-    /// the depth attachment: scene first (depth-tested), then the world HUD
-    /// (view-projection), then the screen-space strip (identity).
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, counts: (u32, u32, u32)) {
-        let (scene_n, world_hud_n, screen_hud_n) = counts;
+    /// Uploads the present-pass screen-space HUD strip; returns its vertex count.
+    pub fn upload_output(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_hud: &[HudVertex],
+    ) -> u32 {
+        Self::grow(
+            device,
+            &mut self.hud_output_buffer,
+            &mut self.hud_output_capacity,
+            screen_hud.len(),
+            std::mem::size_of::<HudVertex>(),
+            "phalanx-scene3d-hud-output-vertices",
+        );
+        queue.write_buffer(&self.hud_output_buffer, 0, &HudVertex::to_bytes(screen_hud));
+        screen_hud.len() as u32
+    }
+
+    /// Draws the scene pass: scene (depth-tested, motion) then world HUD
+    /// (depth-always, zero motion) into an open pass with scene-color, motion,
+    /// and depth attachments.
+    pub fn draw_scene<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, counts: (u32, u32)) {
+        let (scene_n, world_hud_n) = counts;
         if scene_n > 0 {
             pass.set_pipeline(&self.scene_pipeline);
             pass.set_bind_group(0, &self.vp_bind, &[]);
@@ -964,11 +1139,25 @@ impl ScenePipelines {
             pass.set_vertex_buffer(0, self.hud_buffer.slice(..));
             pass.draw(0..world_hud_n, 0..1);
         }
+    }
+
+    /// Draws the present pass into an open pass targeting the output view: the
+    /// fullscreen upscale of the scene color, then the screen-space HUD strip
+    /// (identity VP) on top at output resolution.
+    pub fn draw_output<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        present_bind: &wgpu::BindGroup,
+        screen_hud_n: u32,
+    ) {
+        pass.set_pipeline(&self.present_pipeline);
+        pass.set_bind_group(1, present_bind, &[]);
+        pass.draw(0..3, 0..1);
         if screen_hud_n > 0 {
-            pass.set_pipeline(&self.hud_pipeline);
+            pass.set_pipeline(&self.hud_output_pipeline);
             pass.set_bind_group(0, &self.identity_bind, &[]);
-            pass.set_vertex_buffer(0, self.hud_buffer.slice(..));
-            pass.draw(world_hud_n..world_hud_n + screen_hud_n, 0..1);
+            pass.set_vertex_buffer(0, self.hud_output_buffer.slice(..));
+            pass.draw(0..screen_hud_n, 0..1);
         }
     }
 }
@@ -1168,112 +1357,117 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_3d_scene_renders_depth_tested_geometry_when_adapter_exists() {
+    fn offscreen_temporal_frame_renders_scene_depth_and_motion_when_adapter_exists() {
         match crate::init_headless() {
             Err(crate::BackendError::NoAdapter(_)) => {}
             Err(other) => panic!("unexpected backend error: {other}"),
             Ok((backend, report)) => {
                 println!("{report}");
-                let color_format = crate::OffscreenTarget::FORMAT;
-                let mut pipelines =
-                    ScenePipelines::new(&backend.device, &backend.queue, color_format);
-                // 512x512 so a 1 m unit box top face covers several pixels (at
-                // 128x128 it can rasterize to zero top-face pixels).
-                let target =
-                    crate::OffscreenTarget::new(&backend.device, 512, 512).expect("target");
-                let (depth, depth_view) =
-                    crate::frame::create_depth_target(&backend.device, 512, 512);
-                let camera = Camera3D::from_view([100.0, 100.0], 200.0, 0.0);
-                let vp = camera.view_projection(1.0);
-                let mut snapshot = test_snapshot();
-                snapshot.obstacles.clear();
-                let scene = build_scene_geometry(&snapshot, 200.0, 200.0);
-                let hud = build_hud_geometry(&snapshot, 200.0, None);
-                let counts =
-                    pipelines.upload(&backend.device, &backend.queue, &vp, &scene, &hud, &[]);
-                let mut encoder =
-                    backend
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("test-3d-encoder"),
-                        });
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("test-3d-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &target.view,
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(crate::DEFAULT_CLEAR.to_wgpu()),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: &depth_view,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(1.0),
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: None,
-                        }),
-                        ..Default::default()
-                    });
-                    pipelines.draw(&mut pass, counts);
-                }
-                backend.queue.submit([encoder.finish()]);
-                let pixels = target
-                    .read_back(&backend.device, &backend.queue)
-                    .expect("readback");
-                let depths = crate::frame::read_back_depth(
+                use crate::temporal::TemporalRenderConfig;
+                // Render at half resolution into a 512x512 output (render/output
+                // separation, issue #97).
+                let config = TemporalRenderConfig::new(0.5);
+                let mut renderer = crate::FrameRenderer::new(
                     &backend.device,
                     &backend.queue,
-                    &depth,
+                    crate::OffscreenTarget::FORMAT,
                     512,
                     512,
-                )
-                .expect("depth readback");
-                // Color: every pixel is the clear color or a lit scene/HUD color.
-                let clear = crate::DEFAULT_CLEAR;
-                let mut allowed: Vec<[f32; 4]> = vec![[
-                    clear.0[0] as f32,
-                    clear.0[1] as f32,
-                    clear.0[2] as f32,
-                    clear.0[3] as f32,
-                ]];
-                for base in [GROUND_COLOR, OBSTACLE_COLOR, team_color(1), team_color(2)] {
-                    allowed.push(lit_color(base, AMBIENT + DIFFUSE));
-                    allowed.push(lit_color(base, AMBIENT));
-                }
-                for hud_color in [
-                    [0.1, 0.1, 0.1, 0.8],
-                    [0.2, 0.8, 0.2, 1.0],
-                    [0.9, 0.2, 0.2, 1.0],
-                    [1.0, 1.0, 1.0, 0.9],
-                    [1.0, 1.0, 0.4, 0.6],
-                ] {
-                    allowed.push(hud_color);
-                }
-                crate::present::verify_pixels_in_set(&pixels, clear, &allowed)
-                    .expect("all pixels must be clear or lit scene/HUD colors");
-                // Depth: geometry was rendered and the depth buffer discriminates
-                // near geometry (unit tops) from the ground plane.
-                let rendered = depths.iter().filter(|d| **d < 1.0).count();
-                assert!(
-                    rendered > 512 * 512 / 2,
-                    "ground plane covers most of the frame"
+                    config,
                 );
-                // Depth ordering, proven against the CPU projection (robust to
-                // camera distance — absolute depth deltas shrink when far away):
-                // the team-1 unit's box top must read back closer than the
-                // ground 10 m farther from the camera behind it.
-                let near = [20.0, UNIT_HEIGHT_M, 100.0];
-                let far = [20.0, 0.0, 90.0];
-                verify_depth_ordering(&depths, 512, 512, &camera, 1.0, near, far)
-                    .expect("depth buffer must order near geometry before far");
-                // Both team colors are present (either lit variant of a unit box).
+                assert_eq!(renderer.scene_size(), (256, 256), "render resolution");
+                let output =
+                    crate::OffscreenTarget::new(&backend.device, 512, 512).expect("output");
+                let camera = Camera3D::from_view([100.0, 100.0], 200.0, 0.0);
+                let vp = camera.view_projection(1.0);
+                let jitter = [0.05, -0.03];
+
+                // Frame 1: unit at (20, 100).
+                let snapshot_a = test_snapshot();
+                let scene_a = build_scene_geometry(&snapshot_a, 200.0, 200.0);
+                let hud_a = build_hud_geometry(&snapshot_a, 200.0, None);
+                renderer.render_battle_temporal(
+                    &backend.device,
+                    &backend.queue,
+                    &output.view,
+                    crate::DEFAULT_CLEAR.to_wgpu(),
+                    &crate::BattleTemporalFrame {
+                        vp: &vp,
+                        scene: &scene_a,
+                        world_hud: &hud_a,
+                        screen_hud: &[],
+                        jitter,
+                        exposure: 1.0,
+                    },
+                );
+                assert_eq!(renderer.last_jitter(), jitter, "exact offset reported");
+                // Frame 2: the team-1 unit moved 5 m — motion vectors must be
+                // non-zero at the unit, ~zero for static ground (same camera).
+                let mut snapshot_b = snapshot_a.clone();
+                snapshot_b.entities[0].position = [25.0, 100.0];
+                let scene_b = build_scene_geometry(&snapshot_b, 200.0, 200.0);
+                renderer.render_battle_temporal(
+                    &backend.device,
+                    &backend.queue,
+                    &output.view,
+                    crate::DEFAULT_CLEAR.to_wgpu(),
+                    &crate::BattleTemporalFrame {
+                        vp: &vp,
+                        scene: &scene_b,
+                        world_hud: &[],
+                        screen_hud: &[],
+                        jitter,
+                        exposure: 1.0,
+                    },
+                );
+                let pixels = output
+                    .read_back(&backend.device, &backend.queue)
+                    .expect("output readback");
+                let motion = renderer
+                    .read_back_motion(&backend.device, &backend.queue)
+                    .expect("motion readback");
+                assert_eq!(motion.len(), 256 * 256);
+                // The moved unit's screen area has non-zero motion.
+                let (sx, sy, _) =
+                    world_to_screen(&camera, 1.0, [25.0, UNIT_HEIGHT_M, 100.0]).expect("visible");
+                let px = (sx * 255.0).round() as usize;
+                let py = (sy * 255.0).round() as usize;
+                let unit_motion = motion[py * 256 + px];
+                assert!(
+                    unit_motion[0].abs() > 1e-4 || unit_motion[1].abs() > 1e-4,
+                    "moved unit must have non-zero motion: {unit_motion:?}"
+                );
+                // A static far corner of the map has ~zero motion (same camera).
+                let corner_motion = motion[5 * 256 + 5];
+                assert!(
+                    corner_motion[0].abs() < 1e-3 && corner_motion[1].abs() < 1e-3,
+                    "static ground with static camera has ~zero motion: {corner_motion:?}"
+                );
+                let moving = motion
+                    .iter()
+                    .filter(|m| m[0].abs() > 1e-4 || m[1].abs() > 1e-4)
+                    .count();
+                assert!(moving > 0, "some pixels carry motion");
+                // Output frame (bilinear upscale of the 256px scene) still shows
+                // the team colors.
                 assert!(count_color_family(&pixels, team_color(1)) > 0);
                 assert!(count_color_family(&pixels, team_color(2)) > 0);
+                // Depth readback at render resolution orders near before far.
+                let depths = renderer
+                    .read_back_depth(&backend.device, &backend.queue)
+                    .expect("depth readback");
+                verify_depth_ordering(
+                    &depths,
+                    256,
+                    256,
+                    &camera,
+                    1.0,
+                    [25.0, UNIT_HEIGHT_M, 100.0],
+                    [25.0, 0.0, 90.0],
+                )
+                .expect("depth ordering");
+                assert!(renderer.history().is_valid());
+                assert_eq!(renderer.history().frames_since_reset(), 2);
             }
         }
     }

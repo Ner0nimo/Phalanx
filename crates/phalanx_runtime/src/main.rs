@@ -12,13 +12,14 @@ use phalanx_game::{
 };
 use phalanx_navigation::{Map, crossing_map};
 use phalanx_render::{
-    AMBIENT, BackendError, Camera3D, ClearColor, DEFAULT_CLEAR, DEFAULT_PERF_WINDOW, DIFFUSE,
-    DebugPipeline, FrameProfiler, FrameRenderer, FrameTimer, GROUND_COLOR, InputEvent, KeyCode,
+    AMBIENT, BackendError, BattleTemporalFrame, Camera3D, ClearColor, DEFAULT_CLEAR,
+    DEFAULT_PERF_WINDOW, DEFAULT_RENDER_SCALE, DIFFUSE, DebugPipeline, Discontinuity,
+    FrameProfiler, FrameRenderer, FrameTimer, GROUND_COLOR, InputEvent, JitterSequence, KeyCode,
     MouseButton, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection, PerfStats, RenderSnapshot,
-    UNIT_HEIGHT_M, build_hud_geometry, build_scene_geometry, count_color, count_color_family,
-    demo_shapes, init_headless, lit_color, overlay_hud_vertices, run_windowed, run_windowed_with,
-    team_color, verify_clear_pixels_background, verify_depth_ordering, verify_pixels_in_set,
-    write_ppm,
+    TemporalRenderConfig, UNIT_HEIGHT_M, build_hud_geometry, build_scene_geometry, count_color,
+    count_color_family, demo_shapes, init_headless, lit_color, overlay_hud_vertices, run_windowed,
+    run_windowed_with, team_color, verify_clear_pixels_background, verify_depth_ordering,
+    verify_pixels_in_set, write_ppm,
 };
 
 fn main() -> ExitCode {
@@ -221,7 +222,7 @@ const OFFSCREEN_SIZE: u32 = 64;
 /// rectangles rasterize to several pixels on the 200 m map.
 const BATTLE_OFFSCREEN_SIZE: u32 = 512;
 
-/// Parsed graphical-mode options (issue #61, extended by #63/#64/#88).
+/// Parsed graphical-mode options (issue #61, extended by #63/#64/#88/#97).
 struct GraphicalOptions {
     offscreen: bool,
     frames: u64,
@@ -231,6 +232,7 @@ struct GraphicalOptions {
     seed: u64,
     screenshot: Option<String>,
     perf_overlay: bool,
+    render_scale: f32,
 }
 
 /// Runs graphical mode (issue #61). `--offscreen` renders `frames` clear
@@ -244,33 +246,21 @@ struct GraphicalOptions {
 /// `ticks` ticks (until `MatchOver`) and each frame is drawn from the
 /// extracted [`RenderSnapshot`].
 fn run_graphical(options: GraphicalOptions) -> Result<(), String> {
+    if options.battle {
+        if options.frames == 0 {
+            return Err("--frames must be at least 1 in --battle mode".to_owned());
+        }
+        if options.screenshot.is_some() && !options.offscreen {
+            return Err("--screenshot requires --offscreen in --battle mode".to_owned());
+        }
+        return run_battle_graphical(options);
+    }
     let GraphicalOptions {
         offscreen,
         frames,
-        ticks,
         clear,
-        battle,
-        seed,
-        screenshot,
-        perf_overlay,
+        ..
     } = options;
-    if battle {
-        if frames == 0 {
-            return Err("--frames must be at least 1 in --battle mode".to_owned());
-        }
-        if screenshot.is_some() && !offscreen {
-            return Err("--screenshot requires --offscreen in --battle mode".to_owned());
-        }
-        return run_battle_graphical(
-            offscreen,
-            frames,
-            ticks,
-            clear,
-            seed,
-            screenshot,
-            perf_overlay,
-        );
-    }
     if !offscreen {
         return run_windowed(clear, "Phalanx graphical mode").map_err(|error| error.to_string());
     }
@@ -390,15 +380,18 @@ fn run_battle_to_end(
 /// `screenshot` writes the final frame as a PPM file (completion evidence). On
 /// machines without a GPU adapter the offscreen path still runs the actual
 /// simulation to its terminal state (CPU-only probe) and exits 0.
-fn run_battle_graphical(
-    offscreen: bool,
-    frames: u64,
-    ticks: u64,
-    clear: ClearColor,
-    seed: u64,
-    screenshot: Option<String>,
-    perf_overlay: bool,
-) -> Result<(), String> {
+fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
+    let GraphicalOptions {
+        offscreen,
+        frames,
+        ticks,
+        clear,
+        battle: _,
+        seed,
+        screenshot,
+        perf_overlay,
+        render_scale,
+    } = options;
     let mut demo = BattleDemo::new(seed)?;
     if !offscreen {
         // Windowed: wall-clock 20 Hz stepping inside the frame callback; the
@@ -416,6 +409,10 @@ fn run_battle_graphical(
         let mut profiler = FrameProfiler::new(DEFAULT_PERF_WINDOW);
         let mut camera = Camera::new(demo.map.width_m, demo.map.depth_m);
         let mut selection = SelectionState::default();
+        // Issue #97: per-frame camera jitter (Halton) and temporal history.
+        // Any camera change is a discontinuity that resets temporal history.
+        let mut jitter_seq = JitterSequence::new();
+        let mut last_camera = (camera.center, camera.view_height_m, camera.yaw);
         return run_windowed_with(
             "Phalanx — autonomous battle (graphical)",
             move |device, queue, renderer, view, aspect, input| {
@@ -458,6 +455,15 @@ fn run_battle_graphical(
                 // The perspective 3D camera used for picking and rendering
                 // this frame (recomputed per frame, so resize stays correct).
                 let camera3d = camera.camera3d();
+                // Camera moved/zoomed/rotated this frame -> temporal history
+                // reset (no ghosting across a camera cut, issue #97).
+                let current_camera = (camera.center, camera.view_height_m, camera.yaw);
+                if current_camera != last_camera {
+                    renderer.note_discontinuity(Discontinuity::CameraCut);
+                    last_camera = current_camera;
+                }
+                let (render_w, render_h) = renderer.scene_size();
+                let jitter = jitter_seq.next(render_w, render_h);
 
                 // Process input events for selection and commands.
                 for event in &events {
@@ -706,16 +712,18 @@ fn run_battle_graphical(
                 } else {
                     Vec::new()
                 };
-                renderer.render_battle(
+                renderer.render_battle_temporal(
                     device,
                     queue,
                     view,
                     clear.to_wgpu(),
-                    &phalanx_render::BattleFrame {
+                    &BattleTemporalFrame {
                         vp: &vp,
                         scene: &scene,
                         world_hud: &world_hud,
                         screen_hud: &screen_hud,
+                        jitter,
+                        exposure: 1.0,
                     },
                 );
                 timer.mark_graphics_cpu();
@@ -750,16 +758,21 @@ fn run_battle_graphical(
                 BATTLE_OFFSCREEN_SIZE,
             )
             .map_err(|error| error.to_string())?;
-            // Issue #104: the offscreen battle renders through the depth-tested
-            // 3D path (scene + HUD per frame), then a final scene-only frame is
-            // verified against the color AND depth readbacks.
+            // Issues #104/#97: the offscreen battle renders through the
+            // temporal 3D path (scene at render resolution into scene-color +
+            // motion + depth, then the bilinear-fallback present pass to the
+            // output target), then a final scene-only frame is verified
+            // against the color, depth, and motion readbacks.
+            let render_config = TemporalRenderConfig::new(render_scale);
             let mut renderer = FrameRenderer::new(
                 &backend.device,
                 &backend.queue,
                 OffscreenTarget::FORMAT,
                 BATTLE_OFFSCREEN_SIZE,
                 BATTLE_OFFSCREEN_SIZE,
+                render_config,
             );
+            let (render_w, render_h) = renderer.scene_size();
             let map_width_m = demo.map.width_m;
             let map_depth_m = demo.map.depth_m;
             let camera = Camera::new(map_width_m, map_depth_m);
@@ -767,6 +780,7 @@ fn run_battle_graphical(
             let vp = camera3d.view_projection(1.0);
             let clear_wgpu = clear.to_wgpu();
             let mut profiler = FrameProfiler::new(DEFAULT_PERF_WINDOW);
+            let mut jitter_seq = JitterSequence::new();
             let snapshot = run_battle_to_end(
                 &mut demo,
                 ticks,
@@ -780,16 +794,19 @@ fn run_battle_graphical(
                     } else {
                         Vec::new()
                     };
-                    renderer.render_battle(
+                    let jitter = jitter_seq.next(render_w, render_h);
+                    renderer.render_battle_temporal(
                         &backend.device,
                         &backend.queue,
                         &target.view,
                         clear_wgpu,
-                        &phalanx_render::BattleFrame {
+                        &BattleTemporalFrame {
                             vp: &vp,
                             scene: &scene,
                             world_hud: &world_hud,
                             screen_hud: &screen_hud,
+                            jitter,
+                            exposure: 1.0,
                         },
                     );
                     timer.mark_graphics_cpu();
@@ -800,24 +817,50 @@ fn run_battle_graphical(
             // Final verification frame: 3D scene only (no HUD), so every pixel
             // must be the clear color or a lit scene color.
             let scene = build_scene_geometry(&snapshot, map_width_m, map_depth_m);
-            renderer.render_battle(
+            let final_jitter = jitter_seq.next(render_w, render_h);
+            renderer.render_battle_temporal(
                 &backend.device,
                 &backend.queue,
                 &target.view,
                 clear_wgpu,
-                &phalanx_render::BattleFrame {
+                &BattleTemporalFrame {
                     vp: &vp,
                     scene: &scene,
                     world_hud: &[],
                     screen_hud: &[],
+                    jitter: final_jitter,
+                    exposure: 1.0,
                 },
             );
+            if renderer.last_jitter() != final_jitter {
+                return Err(
+                    "offscreen battle frame verification failed: applied jitter != reported jitter"
+                        .to_owned(),
+                );
+            }
             let pixels = target
                 .read_back(&backend.device, &backend.queue)
                 .map_err(|error| error.to_string())?;
             let depths = renderer
                 .read_back_depth(&backend.device, &backend.queue)
                 .map_err(|error| error.to_string())?;
+            let motion = renderer
+                .read_back_motion(&backend.device, &backend.queue)
+                .map_err(|error| error.to_string())?;
+            if depths.len() != (render_w * render_h) as usize
+                || motion.len() != (render_w * render_h) as usize
+            {
+                return Err(
+                    "offscreen battle frame verification failed: depth/motion readback size mismatch"
+                        .to_owned(),
+                );
+            }
+            if !motion.iter().all(|m| m[0].is_finite() && m[1].is_finite()) {
+                return Err(
+                    "offscreen battle frame verification failed: non-finite motion vector"
+                        .to_owned(),
+                );
+            }
             let mut allowed: Vec<[f32; 4]> = vec![[
                 clear.0[0] as f32,
                 clear.0[1] as f32,
@@ -864,8 +907,8 @@ fn run_battle_graphical(
             ];
             verify_depth_ordering(
                 &depths,
-                BATTLE_OFFSCREEN_SIZE,
-                BATTLE_OFFSCREEN_SIZE,
+                render_w,
+                render_h,
                 &camera3d,
                 1.0,
                 [ex, UNIT_HEIGHT_M, ez],
@@ -917,9 +960,11 @@ fn run_battle_graphical(
                 );
             }
             println!(
-                "FRAME offscreen battle3d size={}x{} tick={} entities={} winner={winner} pixels=verified terrain=verified obstacles=verified depth=verified winner=verified loser=absent",
+                "FRAME offscreen battle3d size={}x{} render={}x{} tick={} entities={} winner={winner} pixels=verified terrain=verified obstacles=verified depth=verified motion=finite winner=verified loser=absent",
                 target.width,
                 target.height,
+                render_w,
+                render_h,
                 snapshot.tick,
                 snapshot.entities.len()
             );
@@ -948,6 +993,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut ticks: Option<u64> = None;
     let mut seed: Option<u64> = None;
     let mut screenshot: Option<String> = None;
+    let mut render_scale = DEFAULT_RENDER_SCALE;
     let mut index = 0;
 
     while index < arguments.len() {
@@ -998,9 +1044,24 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                     .ok_or("--seed requires an unsigned integer")?;
                 seed = Some(parse_u64(value)?);
             }
+            "--render-scale" => {
+                index += 1;
+                let value = arguments
+                    .get(index)
+                    .ok_or("--render-scale requires a number in [0.25, 1.0]")?;
+                let scale: f32 = value
+                    .parse()
+                    .map_err(|_| format!("invalid render scale: {value}"))?;
+                if !(0.25..=1.0).contains(&scale) {
+                    return Err(format!(
+                        "--render-scale must be in [0.25, 1.0], got {scale} (issue #97 contract)"
+                    ));
+                }
+                render_scale = scale;
+            }
             "--help" | "-h" => {
                 println!(
-                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT] [--seed SEED]\n    phalanx_runtime --graphical --battle [--perf-overlay] [--clear RRGGBB] [--seed SEED]\n    phalanx_runtime --graphical --offscreen --battle [--perf-overlay] [--frames N] [--ticks N] [--clear RRGGBB] [--seed SEED] [--screenshot PATH]\n\n--headless runs the deterministic CPU-only scenario through SimulationRunner (no graphics initialization). --graphical presents wgpu frames in a native window (phalanx_render); on headless machines use --graphical --offscreen, which renders frames to an offscreen texture and verifies the pixels. --battle (graphical only, issues #64/#104) runs the first autonomous battle: two teams spawn on the Crossing map with no unit commands and fight to MatchOver through the real SimulationRunner, rendered as a depth-tested 3D scene (ground, obstacle and unit boxes, perspective camera with pan/zoom/rotate, HUD overlay); windowed steps the sim at its fixed 20 Hz wall-clock rate per rendered frame, offscreen runs to the terminal state (default --ticks 2000) and verifies the final frame's color and depth readbacks (terrain, obstacles, depth discrimination, winner color present, loser color absent); --screenshot writes the final offscreen frame as a PPM image. --perf-overlay (battle mode) shows the in-game FPS/frametime overlay: per-stage bars (simulation, snapshot, graphics, total) drawn over the battlefield plus a structured PERF line every 20 frames (issue #88)."
+                    "Phalanx runtime (bootstrap)\n\nUSAGE:\n    phalanx_runtime --headless [--ticks COUNT] [--seed SEED]\n    phalanx_runtime --graphical --battle [--perf-overlay] [--clear RRGGBB] [--seed SEED] [--render-scale S]\n    phalanx_runtime --graphical --offscreen --battle [--perf-overlay] [--frames N] [--ticks N] [--clear RRGGBB] [--seed SEED] [--render-scale S] [--screenshot PATH]\n\n--headless runs the deterministic CPU-only scenario through SimulationRunner (no graphics initialization). --graphical presents wgpu frames in a native window (phalanx_render); on headless machines use --graphical --offscreen, which renders frames to an offscreen texture and verifies the pixels. --battle (graphical only, issues #64/#104) runs the first autonomous battle: two teams spawn on the Crossing map with no unit commands and fight to MatchOver through the real SimulationRunner, rendered as a depth-tested 3D scene (ground, obstacle and unit boxes, perspective camera with pan/zoom/rotate, HUD overlay); windowed steps the sim at its fixed 20 Hz wall-clock rate per rendered frame, offscreen runs to the terminal state (default --ticks 2000) and verifies the final frame's color and depth readbacks (terrain, obstacles, depth discrimination, winner color present, loser color absent); --screenshot writes the final offscreen frame as a PPM image. --perf-overlay (battle mode) shows the in-game FPS/frametime overlay: per-stage bars (simulation, snapshot, graphics, total) drawn over the battlefield plus a structured PERF line every 20 frames (issue #88). --render-scale S (battle mode, issue #97) sets the render resolution as a fraction of the output resolution (0.25..=1.0, default 1.0): the 3D scene renders into scene-color + motion-vector + depth attachments at render resolution and is presented to the output via the bilinear-fallback upscale, with per-frame camera jitter and temporal-history reset on discontinuities."
                 );
                 return Ok(());
             }
@@ -1029,6 +1090,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             seed,
             screenshot,
             perf_overlay,
+            render_scale,
         });
     }
     if battle {
@@ -1183,6 +1245,54 @@ mod tests {
             .map(str::to_owned))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn offscreen_battle_with_render_scale_runs_without_a_display() {
+        // With a GPU adapter this renders the battle at half render
+        // resolution and presents via the fallback upscale, verifying the
+        // color/depth/motion readbacks; without one the CPU-only probe still
+        // runs the sim and exits 0 (issue #97).
+        assert!(
+            run([
+                "--graphical",
+                "--offscreen",
+                "--battle",
+                "--frames",
+                "4",
+                "--render-scale",
+                "0.5"
+            ]
+            .into_iter()
+            .map(str::to_owned))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn render_scale_out_of_range_is_rejected() {
+        let error = run([
+            "--graphical",
+            "--offscreen",
+            "--battle",
+            "--render-scale",
+            "2.0",
+        ]
+        .into_iter()
+        .map(str::to_owned))
+        .expect_err("render scale above 1.0 must be rejected");
+        assert!(error.contains("--render-scale"));
+        let error = run([
+            "--graphical",
+            "--offscreen",
+            "--battle",
+            "--render-scale",
+            "abc",
+        ]
+        .into_iter()
+        .map(str::to_owned))
+        .expect_err("non-numeric render scale must be rejected");
+        assert!(error.contains("invalid render scale"));
     }
 
     #[test]
