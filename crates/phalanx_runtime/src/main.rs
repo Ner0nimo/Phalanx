@@ -15,9 +15,9 @@ use phalanx_render::{
     AMBIENT, BackendError, Camera3D, ClearColor, DEFAULT_CLEAR, DEFAULT_PERF_WINDOW, DIFFUSE,
     DebugPipeline, FrameProfiler, FrameRenderer, FrameTimer, GROUND_COLOR, InputEvent, KeyCode,
     MouseButton, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection, PerfStats, RenderSnapshot,
-    build_hud_geometry, build_scene_geometry, count_color, demo_shapes, init_headless, lit_color,
-    overlay_hud_vertices, run_windowed, run_windowed_with, team_color,
-    verify_clear_pixels_background, verify_pixels_in_set, write_ppm,
+    UNIT_HEIGHT_M, build_hud_geometry, build_scene_geometry, count_color, demo_shapes,
+    init_headless, lit_color, overlay_hud_vertices, run_windowed, run_windowed_with, team_color,
+    verify_clear_pixels_background, verify_depth_ordering, verify_pixels_in_set, write_ppm,
 };
 
 fn main() -> ExitCode {
@@ -835,8 +835,11 @@ fn run_battle_graphical(
             verify_pixels_in_set(&pixels, clear, &allowed).map_err(|error| {
                 format!("offscreen 3D battle frame verification failed: {error}")
             })?;
-            // Depth: geometry was rendered and the depth buffer discriminates
-            // near geometry (unit/obstacle tops) from the ground plane.
+            // Depth: geometry was rendered, and the depth buffer orders near
+            // geometry before far geometry. The ordering is checked against
+            // the CPU projection (a surviving unit's box top vs. ground farther
+            // from the camera) — absolute depth deltas shrink with camera
+            // distance, so a fixed threshold would be flaky across GPUs.
             let size = BATTLE_OFFSCREEN_SIZE as usize;
             let rendered = depths.iter().filter(|depth| **depth < 1.0).count();
             if rendered <= size * size / 4 {
@@ -845,17 +848,29 @@ fn run_battle_graphical(
                         .to_owned(),
                 );
             }
-            let min_depth = depths.iter().copied().fold(1.0_f32, f32::min);
-            let max_depth = depths
-                .iter()
-                .copied()
-                .filter(|depth| *depth < 1.0)
-                .fold(0.0_f32, f32::max);
-            if min_depth >= max_depth - 0.005 {
-                return Err(format!(
-                    "offscreen 3D battle frame verification failed: depth buffer does not discriminate geometry (min={min_depth} max={max_depth})"
-                ));
-            }
+            let first = snapshot
+                .entities
+                .first()
+                .ok_or("offscreen 3D battle frame verification failed: no surviving units")?;
+            let (ex, ez) = (first.position[0], first.position[1]);
+            let away_x = camera3d.eye[0] - ex;
+            let away_z = camera3d.eye[2] - ez;
+            let away_len = (away_x * away_x + away_z * away_z).sqrt().max(1.0);
+            let far_ground = [
+                (ex - away_x / away_len * 25.0).clamp(10.0, map_width_m - 10.0),
+                0.0,
+                (ez - away_z / away_len * 25.0).clamp(10.0, map_depth_m - 10.0),
+            ];
+            verify_depth_ordering(
+                &depths,
+                BATTLE_OFFSCREEN_SIZE,
+                BATTLE_OFFSCREEN_SIZE,
+                &camera3d,
+                1.0,
+                [ex, UNIT_HEIGHT_M, ez],
+                far_ground,
+            )
+            .map_err(|error| format!("offscreen 3D battle frame verification failed: {error}"))?;
             if count_color(&pixels, GROUND_COLOR) == 0 {
                 return Err(
                     "offscreen 3D battle frame verification failed: no terrain pixels rendered"

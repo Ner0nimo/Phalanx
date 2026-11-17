@@ -283,6 +283,88 @@ impl Camera3D {
     }
 }
 
+/// Projects a world point to normalized screen coordinates (x right, y down)
+/// plus its NDC z; `None` when the point is behind the camera.
+#[must_use]
+pub fn world_to_screen(camera: &Camera3D, aspect: f32, world: [f32; 3]) -> Option<(f32, f32, f32)> {
+    camera
+        .project(aspect, world)
+        .map(|ndc| ((ndc[0] + 1.0) / 2.0, (1.0 - ndc[1]) / 2.0, ndc[2]))
+}
+
+/// Samples a depth readback in a `(2*radius+1)^2` window around the normalized
+/// screen position `(sx, sy)`, returning the min (or max) of the window.
+#[must_use]
+pub fn sample_depth_window(
+    depths: &[f32],
+    width: u32,
+    height: u32,
+    sx: f32,
+    sy: f32,
+    radius: u32,
+    take_min: bool,
+) -> Option<f32> {
+    let px = (sx * (width.saturating_sub(1)) as f32).round() as i64;
+    let py = (sy * (height.saturating_sub(1)) as f32).round() as i64;
+    let radius = i64::from(radius);
+    let mut best: Option<f32> = None;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let x = px + dx;
+            let y = py + dy;
+            if x < 0 || y < 0 || x >= i64::from(width) || y >= i64::from(height) {
+                continue;
+            }
+            let depth = depths[y as usize * width as usize + x as usize];
+            best = Some(match best {
+                None => depth,
+                Some(b) => {
+                    if take_min {
+                        b.min(depth)
+                    } else {
+                        b.max(depth)
+                    }
+                }
+            });
+        }
+    }
+    best
+}
+
+/// Verifies that a depth readback orders near geometry before far geometry:
+/// the sampled depth at `near`'s screen position must be strictly smaller
+/// (closer) than at `far`'s, matching the CPU-projected NDC z ordering. This
+/// is the scale-independent proof that the depth buffer discriminates 3D
+/// geometry (absolute depth deltas shrink with camera distance, so a fixed
+/// threshold would be flaky across GPUs).
+pub fn verify_depth_ordering(
+    depths: &[f32],
+    width: u32,
+    height: u32,
+    camera: &Camera3D,
+    aspect: f32,
+    near: [f32; 3],
+    far: [f32; 3],
+) -> Result<(), String> {
+    let (snx, sny, zn) = world_to_screen(camera, aspect, near).ok_or("near point not visible")?;
+    let (sfx, sfy, zf) = world_to_screen(camera, aspect, far).ok_or("far point not visible")?;
+    if zn >= zf {
+        return Err(format!(
+            "probe points are not depth-ordered on CPU: zn={zn} zf={zf}"
+        ));
+    }
+    let d_near = sample_depth_window(depths, width, height, snx, sny, 2, true)
+        .ok_or("no depth sample at the near point")?;
+    let d_far = sample_depth_window(depths, width, height, sfx, sfy, 2, false)
+        .ok_or("no depth sample at the far point")?;
+    if d_near >= d_far {
+        return Err(format!(
+            "depth readback does not order near before far: near={d_near} far={d_far} (cpu zn={zn} < zf={zf})"
+        ));
+    }
+    Ok(())
+}
+
 /// Pushes one quad (two triangles) into a scene vertex list.
 fn push_quad(
     vertices: &mut Vec<SceneVertex>,
@@ -1053,6 +1135,30 @@ mod tests {
     }
 
     #[test]
+    fn verify_depth_ordering_detects_unordered_and_ordered_readbacks() {
+        let camera = Camera3D::from_view([100.0, 100.0], 200.0, 0.0);
+        let near = [20.0, UNIT_HEIGHT_M, 100.0];
+        let far = [20.0, 0.0, 90.0];
+        let (snx, sny, zn) = world_to_screen(&camera, 1.0, near).expect("near visible");
+        let (sfx, sfy, zf) = world_to_screen(&camera, 1.0, far).expect("far visible");
+        assert!(zn < zf, "probe points must be depth-ordered on CPU");
+        let (w, h) = (64_u32, 64_u32);
+        // A flat buffer (nothing rendered closer) fails the ordering check.
+        let flat = vec![1.0_f32; (w * h) as usize];
+        assert!(verify_depth_ordering(&flat, w, h, &camera, 1.0, near, far).is_err());
+        // A buffer with a nearer surface at the near point passes.
+        let mut depths = vec![zf; (w * h) as usize];
+        let px = (snx * (w - 1) as f32).round() as usize;
+        let py = (sny * (h - 1) as f32).round() as usize;
+        depths[py * w as usize + px] = zn - 0.001;
+        verify_depth_ordering(&depths, w, h, &camera, 1.0, near, far)
+            .expect("ordered readback passes");
+        // Swapped probe points are rejected by the CPU ordering pre-check.
+        assert!(verify_depth_ordering(&depths, w, h, &camera, 1.0, far, near).is_err());
+        let _ = (sfx, sfy);
+    }
+
+    #[test]
     fn offscreen_3d_scene_renders_depth_tested_geometry_when_adapter_exists() {
         match crate::init_headless() {
             Err(crate::BackendError::NoAdapter(_)) => {}
@@ -1146,16 +1252,14 @@ mod tests {
                     rendered > 128 * 128 / 2,
                     "ground plane covers most of the frame"
                 );
-                let min = depths.iter().copied().fold(1.0_f32, f32::min);
-                let max = depths
-                    .iter()
-                    .copied()
-                    .filter(|d| *d < 1.0)
-                    .fold(0.0_f32, f32::max);
-                assert!(
-                    min < max - 0.005,
-                    "depth buffer discriminates near geometry: min={min} max={max}"
-                );
+                // Depth ordering, proven against the CPU projection (robust to
+                // camera distance — absolute depth deltas shrink when far away):
+                // the team-1 unit's box top must read back closer than the
+                // ground 10 m farther from the camera behind it.
+                let near = [20.0, UNIT_HEIGHT_M, 100.0];
+                let far = [20.0, 0.0, 90.0];
+                verify_depth_ordering(&depths, 128, 128, &camera, 1.0, near, far)
+                    .expect("depth buffer must order near geometry before far");
                 // Both team colors are present (unit top faces get factor 1.0).
                 assert!(crate::geometry::count_color(&pixels, team_color(1)) > 0);
                 assert!(crate::geometry::count_color(&pixels, team_color(2)) > 0);

@@ -40,7 +40,8 @@ pub use present::{
 pub use scene3d::{
     AMBIENT, CAMERA_FOV_Y_RAD, CAMERA_PITCH_RAD, Camera3D, DEPTH_FORMAT, DIFFUSE, GROUND_COLOR,
     HudVertex, OBSTACLE_HEIGHT_M, ScenePipelines, SceneVertex, UNIT_HEIGHT_M, build_hud_geometry,
-    build_scene_geometry, lit_color, overlay_hud_vertices,
+    build_scene_geometry, lit_color, overlay_hud_vertices, sample_depth_window,
+    verify_depth_ordering, world_to_screen,
 };
 pub use snapshot::{
     EntityCategory, OBSTACLE_COLOR, ObstacleShape, RenderEntity, RenderSnapshot, RenderSpace,
