@@ -858,6 +858,12 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
             let pixels = target
                 .read_back(&backend.device, &backend.queue)
                 .map_err(|error| error.to_string())?;
+            // Exact color checks run on the scene-color readback at render
+            // resolution; the presented output is a bilinear upscale of it, so
+            // below render scale 1.0 its pixels are blends, not exact colors.
+            let scene_pixels = renderer
+                .read_back_scene(&backend.device, &backend.queue)
+                .map_err(|error| error.to_string())?;
             let depths = renderer
                 .read_back_depth(&backend.device, &backend.queue)
                 .map_err(|error| error.to_string())?;
@@ -893,9 +899,27 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
                 allowed.push(lit_color(base, AMBIENT + DIFFUSE));
                 allowed.push(lit_color(base, AMBIENT));
             }
-            verify_pixels_in_set(&pixels, clear, &allowed).map_err(|error| {
+            verify_pixels_in_set(&scene_pixels, clear, &allowed).map_err(|error| {
                 format!("offscreen 3D battle frame verification failed: {error}")
             })?;
+            // The presented output must show the upscaled scene, not just the
+            // clear color (robust to bilinear blending at any render scale).
+            let clear8 = [
+                (clear.0[0] * 255.0).round() as i32,
+                (clear.0[1] * 255.0).round() as i32,
+                (clear.0[2] * 255.0).round() as i32,
+                255,
+            ];
+            let non_clear = pixels
+                .chunks_exact(4)
+                .filter(|c| (0..3).any(|i| (c[i] as i32 - clear8[i]).abs() > 1))
+                .count();
+            if non_clear == 0 {
+                return Err(
+                    "offscreen 3D battle frame verification failed: presented output is only the clear color"
+                        .to_owned(),
+                );
+            }
             // Depth: geometry was rendered, and the depth buffer orders near
             // geometry before far geometry. The ordering is checked against
             // the CPU projection (a surviving unit's box top vs. ground farther
@@ -932,13 +956,13 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
                 far_ground,
             )
             .map_err(|error| format!("offscreen 3D battle frame verification failed: {error}"))?;
-            if count_color(&pixels, GROUND_COLOR) == 0 {
+            if count_color(&scene_pixels, GROUND_COLOR) == 0 {
                 return Err(
                     "offscreen 3D battle frame verification failed: no terrain pixels rendered"
                         .to_owned(),
                 );
             }
-            if count_color(&pixels, OBSTACLE_COLOR) == 0 {
+            if count_color(&scene_pixels, OBSTACLE_COLOR) == 0 {
                 return Err(
                     "offscreen 3D battle frame verification failed: no obstacle pixels rendered"
                         .to_owned(),
@@ -953,12 +977,12 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
             // Team presence is checked on either lit variant of the team color
             // (box top = factor 1.0, sides = AMBIENT), robust to which face of
             // a small unit box covers the rasterized pixels.
-            if count_color_family(&pixels, team_color(winner)) == 0 {
+            if count_color_family(&scene_pixels, team_color(winner)) == 0 {
                 return Err(format!(
                     "offscreen battle frame verification failed: winner team {winner} color not rendered"
                 ));
             }
-            if count_color_family(&pixels, team_color(loser)) != 0 {
+            if count_color_family(&scene_pixels, team_color(loser)) != 0 {
                 return Err(format!(
                     "offscreen battle frame verification failed: destroyed team {loser} still rendered"
                 ));

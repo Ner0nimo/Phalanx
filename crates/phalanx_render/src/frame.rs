@@ -519,6 +519,25 @@ impl FrameRenderer {
     ) -> Result<Vec<[f32; 2]>, PresentError> {
         read_back_motion(device, queue, &self.motion, self.render_w, self.render_h)
     }
+
+    /// Reads back the scene-color target of the last rendered battle frame as
+    /// `render_w * render_h * 4` RGBA8 bytes (row-major, no padding).
+    pub fn read_back_scene(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<u8>, PresentError> {
+        let texels = read_back_texels(
+            device,
+            queue,
+            &self.scene_color,
+            self.render_w,
+            self.render_h,
+            4,
+            |b| [b[0], b[1], b[2], b[3]],
+        )?;
+        Ok(texels.into_iter().flatten().collect())
+    }
 }
 
 fn make_present_bind(
