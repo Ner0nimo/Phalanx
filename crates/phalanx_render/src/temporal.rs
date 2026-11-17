@@ -46,7 +46,7 @@ pub const SCENE_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Un
 pub const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The documented motion-vector convention (see module docs).
-pub const MOTION_CONVENTION: &str = "motion = uv_current - uv_previous, in fractions of the full target extent per frame; +x right, +y down (texture v); includes the camera-jitter delta";
+pub const MOTION_CONVENTION: &str = "motion = uv_current - uv_previous, in fractions of the full target extent per frame; +x right, +y down (texture v); current = current jittered VP * current position, previous = previous jittered VP * previous-frame position, so camera motion, object motion, and the camera-jitter delta are all included";
 
 /// The documented depth convention (fixed by issue #104).
 pub const DEPTH_CONVENTION: &str =

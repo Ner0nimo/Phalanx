@@ -232,6 +232,7 @@ pub struct FrameRenderer {
     prev_vp: Mat4,
     last_jitter: [f32; 2],
     history: TemporalHistory,
+    prev_positions: std::collections::HashMap<u32, [f32; 2]>,
 }
 
 impl FrameRenderer {
@@ -305,6 +306,7 @@ impl FrameRenderer {
             prev_vp: Mat4::IDENTITY,
             last_jitter: [0.0, 0.0],
             history: TemporalHistory::new(),
+            prev_positions: std::collections::HashMap::new(),
         }
     }
 
@@ -330,6 +332,26 @@ impl FrameRenderer {
     /// skip): temporal history is invalidated so stale history is never used.
     pub fn note_discontinuity(&mut self, reason: Discontinuity) {
         self.history.note_discontinuity(reason);
+        // Previous positions are also invalidated so the next frame contributes
+        // zero object motion instead of ghosting across the discontinuity.
+        self.prev_positions.clear();
+    }
+
+    /// Per-entity previous-frame positions (keyed by entity index) for motion
+    /// vectors; pass to [`crate::build_scene_geometry`].
+    #[must_use]
+    pub fn prev_positions(&self) -> &std::collections::HashMap<u32, [f32; 2]> {
+        &self.prev_positions
+    }
+
+    /// Records the snapshot's entity positions as the previous-frame positions
+    /// for the next frame's motion vectors. Call after rendering the frame.
+    pub fn commit_prev_positions(&mut self, snapshot: &crate::RenderSnapshot) {
+        self.prev_positions.clear();
+        for entity in &snapshot.entities {
+            self.prev_positions
+                .insert(entity.entity_index, entity.position);
+        }
     }
 
     /// Recreates the render-resolution targets after an output resize and

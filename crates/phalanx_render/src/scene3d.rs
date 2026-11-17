@@ -69,6 +69,9 @@ pub struct SceneVertex {
     pub normal: [f32; 3],
     /// Linear RGBA base color.
     pub color: [f32; 4],
+    /// This vertex's world position in the previous frame (issue #97 motion
+    /// vectors); equals `position` for static geometry.
+    pub prev_position: [f32; 3],
 }
 
 /// One unlit HUD vertex: world position + linear RGBA color, drawn with the
@@ -83,8 +86,8 @@ pub struct HudVertex {
     pub color: [f32; 4],
 }
 
-const SCENE_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4];
+const SCENE_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x3];
 const HUD_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
 
@@ -98,14 +101,15 @@ impl SceneVertex {
     }
 
     fn to_bytes(vertices: &[SceneVertex]) -> Vec<u8> {
-        assert_eq!(std::mem::size_of::<SceneVertex>(), 40, "no padding allowed");
-        let mut out = Vec::with_capacity(vertices.len() * 40);
+        assert_eq!(std::mem::size_of::<SceneVertex>(), 52, "no padding allowed");
+        let mut out = Vec::with_capacity(vertices.len() * 52);
         for v in vertices {
             for component in v
                 .position
                 .iter()
                 .chain(v.normal.iter())
                 .chain(v.color.iter())
+                .chain(v.prev_position.iter())
             {
                 out.extend_from_slice(&component.to_le_bytes());
             }
@@ -147,6 +151,7 @@ struct SceneIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) prev_position: vec3<f32>,
 };
 struct HudIn {
     @location(0) position: vec3<f32>,
@@ -169,7 +174,9 @@ fn vs_scene(in: SceneIn) -> VsOut {
     var out: VsOut;
     out.clip_cur = uniforms.vp * vec4<f32>(in.position, 1.0);
     out.position = out.clip_cur;
-    out.clip_prev = uniforms.prev_vp * vec4<f32>(in.position, 1.0);
+    // Previous frame: previous jittered view-projection * previous-frame world
+    // position, so both camera motion and object motion produce motion.
+    out.clip_prev = uniforms.prev_vp * vec4<f32>(in.prev_position, 1.0);
     out.color = in.color;
     out.normal = in.normal;
     return out;
@@ -473,20 +480,32 @@ pub fn verify_depth_ordering(
 }
 
 /// Pushes one quad (two triangles) into a scene vertex list.
+/// Per-face shading and motion data for one quad.
+struct QuadFace {
+    normal: [f32; 3],
+    color: [f32; 4],
+    /// World-space delta from the vertex's previous-frame position.
+    prev_delta: [f32; 2],
+}
+
 fn push_quad(
     vertices: &mut Vec<SceneVertex>,
     a: [f32; 3],
     b: [f32; 3],
     c: [f32; 3],
     d: [f32; 3],
-    normal: [f32; 3],
-    color: [f32; 4],
+    face: QuadFace,
 ) {
     for position in [a, b, c, a, c, d] {
         vertices.push(SceneVertex {
             position,
-            normal,
-            color,
+            normal: face.normal,
+            color: face.color,
+            prev_position: [
+                position[0] - face.prev_delta[0],
+                position[1],
+                position[2] - face.prev_delta[1],
+            ],
         });
     }
 }
@@ -499,6 +518,7 @@ fn push_box(
     half_size: [f32; 2],
     height: f32,
     color: [f32; 4],
+    prev_delta: [f32; 2],
 ) {
     let (cx, cz) = (center[0], center[1]);
     let (hx, hz) = (half_size[0], half_size[1]);
@@ -511,8 +531,11 @@ fn push_box(
         [x1, y1, z0],
         [x1, y1, z1],
         [x0, y1, z1],
-        [0.0, 1.0, 0.0],
-        color,
+        QuadFace {
+            normal: [0.0, 1.0, 0.0],
+            color,
+            prev_delta,
+        },
     );
     // +x side.
     push_quad(
@@ -521,8 +544,11 @@ fn push_box(
         [x1, y0, z1],
         [x1, y1, z1],
         [x1, y1, z0],
-        [1.0, 0.0, 0.0],
-        color,
+        QuadFace {
+            normal: [1.0, 0.0, 0.0],
+            color,
+            prev_delta,
+        },
     );
     // -x side.
     push_quad(
@@ -531,8 +557,11 @@ fn push_box(
         [x0, y0, z0],
         [x0, y1, z0],
         [x0, y1, z1],
-        [-1.0, 0.0, 0.0],
-        color,
+        QuadFace {
+            normal: [-1.0, 0.0, 0.0],
+            color,
+            prev_delta,
+        },
     );
     // +z side.
     push_quad(
@@ -541,8 +570,11 @@ fn push_box(
         [x0, y0, z1],
         [x0, y1, z1],
         [x1, y1, z1],
-        [0.0, 0.0, 1.0],
-        color,
+        QuadFace {
+            normal: [0.0, 0.0, 1.0],
+            color,
+            prev_delta,
+        },
     );
     // -z side.
     push_quad(
@@ -551,8 +583,11 @@ fn push_box(
         [x1, y0, z0],
         [x1, y1, z0],
         [x0, y1, z0],
-        [0.0, 0.0, -1.0],
-        color,
+        QuadFace {
+            normal: [0.0, 0.0, -1.0],
+            color,
+            prev_delta,
+        },
     );
 }
 
@@ -612,6 +647,7 @@ fn push_ground_rect_outline(
 #[must_use]
 pub fn build_scene_geometry(
     snapshot: &RenderSnapshot,
+    prev_positions: &std::collections::HashMap<u32, [f32; 2]>,
     map_width_m: f32,
     map_depth_m: f32,
 ) -> Vec<SceneVertex> {
@@ -623,8 +659,11 @@ pub fn build_scene_geometry(
         [map_width_m, 0.0, 0.0],
         [map_width_m, 0.0, map_depth_m],
         [0.0, 0.0, map_depth_m],
-        [0.0, 1.0, 0.0],
-        GROUND_COLOR,
+        QuadFace {
+            normal: [0.0, 1.0, 0.0],
+            color: GROUND_COLOR,
+            prev_delta: [0.0, 0.0],
+        },
     );
     for obstacle in &snapshot.obstacles {
         push_box(
@@ -633,16 +672,26 @@ pub fn build_scene_geometry(
             obstacle.half_size,
             OBSTACLE_HEIGHT_M,
             OBSTACLE_COLOR,
+            [0.0, 0.0],
         );
     }
     for entity in &snapshot.entities {
         let radius = entity.radius_m.max(0.5);
+        // Previous-frame position for motion vectors (issue #97): entities
+        // missing from the map (first frame, after a discontinuity, spawned
+        // this frame) contribute zero object motion.
+        let prev = prev_positions
+            .get(&entity.entity_index)
+            .copied()
+            .unwrap_or(entity.position);
+        let prev_delta = [entity.position[0] - prev[0], entity.position[1] - prev[1]];
         push_box(
             &mut vertices,
             entity.position,
             [radius, radius],
             UNIT_HEIGHT_M,
             team_color(entity.team),
+            prev_delta,
         );
     }
     vertices
@@ -1265,7 +1314,8 @@ mod tests {
     #[test]
     fn scene_geometry_has_ground_obstacle_and_unit_boxes() {
         let snapshot = test_snapshot();
-        let vertices = build_scene_geometry(&snapshot, 200.0, 200.0);
+        let vertices =
+            build_scene_geometry(&snapshot, &std::collections::HashMap::new(), 200.0, 200.0);
         // Ground: 6 verts. Obstacle box: 5 faces * 6 = 30. Two unit boxes: 60.
         assert_eq!(vertices.len(), 6 + 30 + 60);
         let ground = &vertices[..6];
@@ -1500,7 +1550,12 @@ mod tests {
 
                 // Frame 1: unit at (20, 100).
                 let snapshot_a = test_snapshot();
-                let scene_a = build_scene_geometry(&snapshot_a, 200.0, 200.0);
+                let scene_a = build_scene_geometry(
+                    &snapshot_a,
+                    &std::collections::HashMap::new(),
+                    200.0,
+                    200.0,
+                );
                 let hud_a = build_hud_geometry(&snapshot_a, 200.0, None);
                 renderer.render_battle_temporal(
                     &backend.device,
@@ -1521,7 +1576,11 @@ mod tests {
                 // non-zero at the unit, ~zero for static ground (same camera).
                 let mut snapshot_b = snapshot_a.clone();
                 snapshot_b.entities[0].position = [25.0, 100.0];
-                let scene_b = build_scene_geometry(&snapshot_b, 200.0, 200.0);
+                // Frame 2 sees the unit's previous position, so its motion
+                // vectors reflect the 5 m move.
+                let mut prev_positions = std::collections::HashMap::new();
+                prev_positions.insert(snapshot_b.entities[0].entity_index, [20.0, 100.0]);
+                let scene_b = build_scene_geometry(&snapshot_b, &prev_positions, 200.0, 200.0);
                 renderer.render_battle_temporal(
                     &backend.device,
                     &backend.queue,

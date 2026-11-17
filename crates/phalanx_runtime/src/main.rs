@@ -696,7 +696,12 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
                 }
                 // --- Depth-tested 3D battle rendering (issue #104) ---
                 let vp = camera3d.view_projection(aspect);
-                let scene = build_scene_geometry(&snapshot, demo.map.width_m, demo.map.depth_m);
+                let scene = build_scene_geometry(
+                    &snapshot,
+                    renderer.prev_positions(),
+                    demo.map.width_m,
+                    demo.map.depth_m,
+                );
                 let drag_world = selection.drag_start.and_then(|start| {
                     let from = camera3d.screen_to_ground(aspect, start[0], start[1])?;
                     let to = camera3d.screen_to_ground(
@@ -726,6 +731,7 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
                         exposure: 1.0,
                     },
                 );
+                renderer.commit_prev_positions(&snapshot);
                 timer.mark_graphics_cpu();
                 profiler.record(timer.finish());
                 // Windowed: PERF lines only with the overlay flag; offscreen
@@ -787,7 +793,12 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
                 chunk,
                 &mut profiler,
                 |snapshot, timer, stats| {
-                    let scene = build_scene_geometry(snapshot, map_width_m, map_depth_m);
+                    let scene = build_scene_geometry(
+                        snapshot,
+                        renderer.prev_positions(),
+                        map_width_m,
+                        map_depth_m,
+                    );
                     let world_hud = build_hud_geometry(snapshot, camera.view_height_m, None);
                     let screen_hud = if perf_overlay {
                         overlay_hud_vertices(stats, map_width_m)
@@ -809,6 +820,7 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
                             exposure: 1.0,
                         },
                     );
+                    renderer.commit_prev_positions(snapshot);
                     timer.mark_graphics_cpu();
                 },
             )?;
@@ -816,7 +828,12 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
             let loser = if winner == TEAM_A { TEAM_B } else { TEAM_A };
             // Final verification frame: 3D scene only (no HUD), so every pixel
             // must be the clear color or a lit scene color.
-            let scene = build_scene_geometry(&snapshot, map_width_m, map_depth_m);
+            let scene = build_scene_geometry(
+                &snapshot,
+                renderer.prev_positions(),
+                map_width_m,
+                map_depth_m,
+            );
             let final_jitter = jitter_seq.next(render_w, render_h);
             renderer.render_battle_temporal(
                 &backend.device,
