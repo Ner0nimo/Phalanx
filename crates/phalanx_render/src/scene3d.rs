@@ -1646,9 +1646,19 @@ mod tests {
                     .count();
                 assert!(moving > 0, "some pixels carry motion");
                 // Output frame (bilinear upscale of the 256px scene) still shows
-                // the team colors.
-                assert!(count_color_family(&pixels, team_color(1)) > 0);
-                assert!(count_color_family(&pixels, team_color(2)) > 0);
+                // the team colors. The 2x bilinear upscale blends every texel, so
+                // exact family colors are not expected here; assert the dominant
+                // channel instead (robust across GPUs).
+                let blue = pixels
+                    .chunks_exact(4)
+                    .filter(|c| c[2] as i32 - c[0] as i32 > 40 && c[2] > 100)
+                    .count();
+                let red = pixels
+                    .chunks_exact(4)
+                    .filter(|c| c[0] as i32 - c[2] as i32 > 40 && c[0] > 100)
+                    .count();
+                assert!(blue > 0, "output shows team 1 (blue) after upscale");
+                assert!(red > 0, "output shows team 2 (red) after upscale");
                 // Depth readback at render resolution orders near before far.
                 let depths = renderer
                     .read_back_depth(&backend.device, &backend.queue)
