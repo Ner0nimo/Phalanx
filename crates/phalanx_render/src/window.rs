@@ -295,6 +295,7 @@ impl ApplicationHandler for FrameApp {
             config.format,
             size.width.max(1),
             size.height.max(1),
+            crate::temporal::TemporalRenderConfig::new(crate::temporal::DEFAULT_RENDER_SCALE),
         );
         // Startup log: adapter name, backend, device info (issue #61).
         println!("{report}");

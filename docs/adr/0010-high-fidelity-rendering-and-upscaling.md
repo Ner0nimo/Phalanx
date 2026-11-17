@@ -15,7 +15,8 @@ The current repository has a real but early presentation path:
 - The visible scene is a minimal depth-tested 3D presentation (issue #104: ground/obstacle/unit boxes under a perspective camera with a `Depth32Float` buffer — wgpu convention, NDC z in `[0,1]`, 0 near / 1 far, less-is-closer, non-inverted) over the 2D debug-geometry HUD overlays. The offscreen target is currently `Rgba8Unorm`.
 - The render snapshot exposes presentation-oriented positions, team/category/radius and map obstacles, not production mesh/material/animation data.
 - The performance overlay measures CPU-side encoding/submission but does not yet measure GPU execution with timestamp queries.
-- There is no production render graph, HDR scene-color path, depth/motion-vector pipeline, cooked material/texture pipeline, or temporal history management.
+- Issue #97 has since landed the first temporal render outputs (see `phalanx_render::temporal` and RtsEngineDoc §11.6): render/output resolution separation (`--render-scale` 0.25..=1.0), a linear scene-color target (`Rgba8Unorm`, linear Rec.709/sRGB primaries) at render resolution, an `Rgba16Float` motion-vector attachment (UV delta `uv_current - uv_previous`, jitter-consistent), per-frame sub-pixel Halton camera jitter with the exact offset reported, a per-frame exposure uniform, temporal-history reset on discontinuities (camera cut / resolution change / map load / frame skip), a capability-based upscaler contract with a bilinear-fallback present pass, and offscreen verification of the color/depth/motion readbacks.
+- There is still no production render graph, HDR scene-color path, cooked material/texture pipeline, GPU timestamp profiler, or native vendor-effect integration (#96).
 
 These are reasonable milestones for proving native presentation and a graphical battle, but they do not prove that the renderer is ready for high-fidelity production content or native vendor SDK effects.
 
@@ -53,6 +54,8 @@ The renderer must represent render resolution separately from display/output res
 - Explicit history lifecycle: initialization, reset on camera cut/map load/resolution change, and invalidation on discontinuities.
 
 The render graph owns resource formats, lifetimes, usages, pass dependencies, and transitions. A generic upscaler interface must not erase the information needed for native interop or make synchronization implicit.
+
+Issue #97 implemented the base version of this contract for the M1 battle presentation (`phalanx_render::temporal`, RtsEngineDoc §11.6): render/output resolution separation, linear `Rgba8Unorm` scene color at render resolution, the fixed non-inverted depth convention above, `Rgba16Float` jitter-consistent UV-delta motion vectors, per-frame Halton jitter with the exact offset reported, a per-frame exposure uniform, history reset on discontinuities, and a capability-based upscaler contract whose first implementation is the bilinear-fallback present pass. HDR scene color, motion coverage for animated/alpha-blended geometry, and the native SDK resource query remain open (#98/#99/#96).
 
 ### 3. Keep upscaler selection capability-based and vendor-neutral
 
