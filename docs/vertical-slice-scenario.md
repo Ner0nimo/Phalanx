@@ -119,3 +119,15 @@ The scenario runs fully headless (no window/GPU; `phalanx_runtime --headless` pa
 - Deterministic, testable combat outcome → §6 rules + §8 worked timing + §9 items 1–3.
 - Headless completion criterion → §9 (hash-identical replay on same build/platform, divergence tick, event assertions, ≤ 2000 ticks, < 5 s CI).
 - Small enough for fast CI → 200×200 m map, 12 units, ≤ 2000 ticks.
+
+
+## 11. Implementation status (2026-11-17)
+
+This document remains the normative gameplay and deterministic headless acceptance specification. The implementation has progressed beyond the original scenario-only prototype, but the presentation requirement and several future-system contracts remain distinct:
+
+- **Implemented headless slice:** Crossing scenario setup, tick-indexed Move/AttackMove/Attack commands, A* movement and local avoidance, CPU-authoritative combat/destruction, autonomous battle behavior, canonical checkpoint hashes, same-build replay, and full in-memory snapshot/restore.
+- **Implemented graphical interaction prototype:** issues #90–#95 provide basic click/box selection, pan/zoom, right-click Attack/AttackMove, queue append/cancel, health bars, selection rings, and order markers.
+- **Presentation limitation:** the current renderer draws 2D orthographic debug geometry on the ground plane; it does not yet render a depth-tested 3D scene. The missing M1 3D Crossing proof is tracked in [#104](https://github.com/Ner0nimo/Phalanx/issues/104). The production PBR/asset/render graph is a separate M2 target in [#98](https://github.com/Ner0nimo/Phalanx/issues/98).
+- **Not part of the M1 scenario:** territory, supply, economy/production, buildings, formations, fog of war, projectiles, audio, and strategic AI remain follow-on work; see #106–#113 and #110–#112.
+
+The scenario's map and unit definitions are currently Rust/static test fixtures with canonical content digests, not files loaded through a general-purpose authored-content pipeline. That pipeline is tracked in [#118](https://github.com/Ner0nimo/Phalanx/issues/118) and [#122](https://github.com/Ner0nimo/Phalanx/issues/122). In-memory snapshots do not constitute persistent savegames; durable saves are tracked in [#120](https://github.com/Ner0nimo/Phalanx/issues/120).
