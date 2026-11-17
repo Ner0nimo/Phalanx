@@ -70,6 +70,26 @@ GPU-dependent measurements (frame time for 10k instanced markers, compute dispat
 - **Procedure for a real-hardware run**: trigger the manual `gpu-validation` workflow (`workflow_dispatch`) on a self-hosted runner labeled `[self-hosted, gpu]`. It builds the wgpu spike in release, runs it on the GPU, and uploads `wgpu-gpu-validation-report` — a structured `REPORT` line recording adapter name/vendor/device/type/backend, driver + driver info, OS, arch, build profile, validation setting, init vs workload timing (captured separately), workload parameters, and compute verification. Record the artifact contents here (adapter, driver, OS, build mode, validation, workload) when the first run lands.
 - **No performance or backend-win claim is made**: the ash spike is initialization/resource-lifetime only (no compute, by design), so the spike comparison is asymmetric and is not a benchmark; any future backend comparison must run equivalent work on both sides (ADR-0004 revisit criteria). The renderer choice stays provisional until the first in-engine rendering path is exercised (issues #61–#64).
 
+## Addendum — high-fidelity rendering and FSR requirements (2026-11-17)
+
+The selection of wgpu in this ADR is the **working renderer API decision**, not proof that the current implementation meets the game's visual-quality goal or that AMD FSR 4 can be integrated through the current device/resource abstraction.
+
+Since this ADR was written, the repository has gained a native window, a wgpu debug-geometry pipeline, a simulation-to-render snapshot, and a graphical autonomous battle. That is meaningful presentation progress, but the actual scene remains debug geometry: there is no production 3D PBR material/lighting pipeline, HDR scene-color target, depth/motion-vector output, temporal history management, or GPU timestamp profiler yet.
+
+The FSR SDK 2.4 (October 2026) now documents FSR Upscaling 4.1.2 and Frame Generation 4.0.2 for DX12 and Vulkan 1.2. The SDK requires its prebuilt, signed loader/effect DLLs. FSR Upscaling 4.1.2 has supported Radeon RX 6000/7000/9000 and selected Ryzen APU configurations, with the FSR API selecting FSR 3.1.6 on unsupported hardware. AMD's published OS list is Windows 10/11; the project must not assume that Vulkan support also means an officially supported Linux SDK runtime. Frame Generation 4.0.2 is narrower still (Windows 11 and Radeon RX 9000-series or later).
+
+This creates a concrete backend-interoperability gate. FSR requires native graphics API access to device/queue/resources and explicit synchronization. wgpu's native HAL escape hatch is unsafe and backend-specific; wgpu-hal puts synchronization and resource-lifetime obligations on the caller. A successful integration must be same-device and avoid expensive full-frame copies. If a small audited boundary cannot achieve this, compare the cost of a dedicated native backend boundary or revisiting the renderer API before extensive renderer code accumulates. Do not weaken the workspace unsafe policy or switch to raw Vulkan merely by assumption.
+
+The current decision is therefore clarified as follows:
+- Keep wgpu as the production renderer baseline while the FSR interop spike is performed.
+- Build a backend-capability-aware, vendor-neutral temporal upscaler path; FSR 4 is optional and platform/hardware gated.
+- Treat native Linux FSR 4 support as unverified until a supported runtime and driver path are demonstrated.
+- Make temporal render inputs (linear color, depth, motion vectors, jitter, exposure/history) part of the render graph contract before committing to a post-processing architecture.
+- Keep frame generation optional and separate from upscaling; prove base frame rate, latency, pacing, and UI composition first.
+- Do not treat the current debug-geometry pipeline or CPU-side profiler as evidence of final rendering quality or GPU performance.
+
+See [ADR-0010: High-Fidelity Rendering and Temporal Upscaling](0010-high-fidelity-rendering-and-upscaling.md) and issues #96–#102. The closed issue #33 delivered a GPU-validation harness and manual workflow; its PR explicitly did **not** deliver a discrete-GPU benchmark result. The actual hardware run remains necessary for backend and effect validation.
+
 ## Revisit criteria
 
 Revisit (replacement ADR with migration impact) when any of the following occurs:
