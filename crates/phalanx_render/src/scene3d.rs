@@ -1494,7 +1494,9 @@ mod tests {
                     crate::OffscreenTarget::new(&backend.device, 512, 512).expect("output");
                 let camera = Camera3D::from_view([100.0, 100.0], 200.0, 0.0);
                 let vp = camera.view_projection(1.0);
-                let jitter = [0.05, -0.03];
+                // Sub-pixel jitter, like JitterSequence produces (max half a
+                // pixel at this resolution); both frames use the same offset.
+                let jitter = [0.003, -0.002];
 
                 // Frame 1: unit at (20, 100).
                 let snapshot_a = test_snapshot();
@@ -1541,15 +1543,37 @@ mod tests {
                     .read_back_motion(&backend.device, &backend.queue)
                     .expect("motion readback");
                 assert_eq!(motion.len(), 256 * 256);
-                // The moved unit's screen area has non-zero motion.
-                let (sx, sy, _) =
-                    world_to_screen(&camera, 1.0, [25.0, UNIT_HEIGHT_M, 100.0]).expect("visible");
-                let px = (sx * 255.0).round() as usize;
-                let py = (sy * 255.0).round() as usize;
-                let unit_motion = motion[py * 256 + px];
+                // The moved unit's screen area has non-zero motion. The renderer
+                // applies the jitter as a clip-space translation (NDC delta =
+                // jitter), so project the unit top with the jittered VP and scan
+                // a small window around it for the max motion magnitude.
+                let ndc = camera
+                    .project(1.0, [25.0, UNIT_HEIGHT_M, 100.0])
+                    .expect("visible");
+                let sx = (ndc[0] + jitter[0] + 1.0) / 2.0;
+                let sy = (1.0 - ndc[1] - jitter[1]) / 2.0;
+                let px = (sx * 255.0).round() as i64;
+                let py = (sy * 255.0).round() as i64;
+                let mut unit_motion = [0.0_f32; 2];
+                let mut best = 0.0_f32;
+                for dy in -4..=4_i64 {
+                    for dx in -4..=4_i64 {
+                        let x = px + dx;
+                        let y = py + dy;
+                        if x < 0 || y < 0 || x >= 256 || y >= 256 {
+                            continue;
+                        }
+                        let m = motion[y as usize * 256 + x as usize];
+                        let mag = m[0].abs().max(m[1].abs());
+                        if mag > best {
+                            best = mag;
+                            unit_motion = m;
+                        }
+                    }
+                }
                 assert!(
-                    unit_motion[0].abs() > 1e-4 || unit_motion[1].abs() > 1e-4,
-                    "moved unit must have non-zero motion: {unit_motion:?}"
+                    best > 1e-4,
+                    "moved unit must have non-zero motion near its projection: {unit_motion:?}"
                 );
                 // A static far corner of the map has ~zero motion (same camera).
                 let corner_motion = motion[5 * 256 + 5];
