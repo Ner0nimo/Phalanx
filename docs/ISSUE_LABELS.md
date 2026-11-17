@@ -89,3 +89,30 @@ gh label create "status:blocked" --color "b60205" --description "Cannot proceed 
 gh label create "status:needs-design" --color "d876e3" --description "Requires a product or technical design decision before implementation" --force
 gh label create "status:needs-prototype" --color "d4c5f9" --description "Requires a measured technical spike before commitment" --force
 ```
+
+
+## Documentation traceability and maintenance
+
+Every implementation, design, or roadmap issue must identify the source documentation from which its scope is derived. Add a `Documentation source and maintenance` section to the issue body with direct links to the relevant sections of `RtsEngineDoc.md`, the vertical-slice specification, and/or the applicable accepted ADRs. Link to the narrowest useful sections rather than only linking to the repository root. Do not link to planned ADRs or documents that do not yet exist; create the document as part of the design task when appropriate.
+
+The issue must also make documentation maintenance an explicit completion requirement:
+
+- Update the linked documentation in the same pull request as the implementation whenever behavior, architecture, public contracts, defaults, limitations, milestone status, or validation evidence changes.
+- If implementation requires a design or acceptance-criteria deviation, update the source documentation and explain the deviation in the pull request.
+- Keep implementation status honest: distinguish implemented behavior from prototypes, fixtures, deferred work, and unsupported capabilities.
+- Update user-facing run instructions and controls when the relevant workflow changes.
+- Do not close the issue with documentation knowingly stale or contradictory to the implementation.
+
+Use this issue-body pattern:
+
+```markdown
+## Documentation source and maintenance
+
+This issue is derived from and must stay aligned with:
+- [Architecture section](<direct GitHub link>)
+- [Relevant ADR or scenario](<direct GitHub link>)
+
+**Documentation is part of the implementation.** Update the linked documentation in the same pull request whenever implementation changes the documented behavior, contracts, defaults, limitations, or status. Explain and document any deviation from the issue's design or acceptance criteria before closing the issue.
+```
+
+When an issue spans multiple milestones, link the normative design sections and the milestone acceptance criteria that govern its delivery. If the documentation is genuinely not yet written, link the nearest existing parent section and make authoring the missing specification an explicit deliverable.
