@@ -43,7 +43,7 @@ pub const PERF_LOG_EVERY: u64 = 20;
 pub const OVERLAY_STRIP_M: f32 = 14.0;
 
 /// Bar height scale: meters of bar height per millisecond of stage time.
-const MS_TO_M: f32 = 0.5;
+pub const MS_TO_M: f32 = 0.5;
 
 /// One frame's raw measurements.
 #[derive(Clone, Copy, Debug, PartialEq)]

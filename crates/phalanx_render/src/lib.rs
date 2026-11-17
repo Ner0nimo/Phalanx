@@ -15,21 +15,32 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod frame;
 pub mod geometry;
+pub mod math;
 pub mod perf;
 pub mod present;
+pub mod scene3d;
 pub mod snapshot;
 pub mod window;
 
 pub use backend::{AdapterReport, BackendError, GpuBackend, init_headless};
+pub use frame::{BattleFrame, FrameRenderer, create_depth_target, read_back_depth};
 pub use geometry::{DebugPipeline, DebugShape, OrthoProjection, Vertex, count_color, demo_shapes};
+pub use math::Mat4;
 pub use perf::{
     DEFAULT_PERF_WINDOW, FrameProfiler, FrameTimer, FrameTimings, OVERLAY_STRIP_M, PERF_LOG_EVERY,
     PerfStats, overlay_projection, overlay_shapes,
 };
 pub use present::{
     ClearColor, DEFAULT_CLEAR, OffscreenTarget, PresentError, choose_surface_config,
-    render_clear_to_view, verify_clear_pixels, verify_clear_pixels_background, write_ppm,
+    render_clear_to_view, verify_clear_pixels, verify_clear_pixels_background,
+    verify_pixels_in_set, write_ppm,
+};
+pub use scene3d::{
+    AMBIENT, CAMERA_FOV_Y_RAD, CAMERA_PITCH_RAD, Camera3D, DEPTH_FORMAT, DIFFUSE, GROUND_COLOR,
+    HudVertex, OBSTACLE_HEIGHT_M, ScenePipelines, SceneVertex, UNIT_HEIGHT_M, build_hud_geometry,
+    build_scene_geometry, lit_color, overlay_hud_vertices,
 };
 pub use snapshot::{
     EntityCategory, OBSTACLE_COLOR, ObstacleShape, RenderEntity, RenderSnapshot, RenderSpace,

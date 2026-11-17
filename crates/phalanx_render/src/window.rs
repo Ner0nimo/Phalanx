@@ -26,7 +26,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::Window;
 
 use crate::backend::{AdapterReport, init_from_adapter, instance_descriptor};
-use crate::geometry::{DebugPipeline, OrthoProjection, demo_shapes};
+use crate::frame::FrameRenderer;
+use crate::geometry::{OrthoProjection, demo_shapes};
 use crate::present::{ClearColor, choose_surface_config};
 
 /// Structured errors of the windowed presentation path.
@@ -74,13 +75,13 @@ impl From<crate::BackendError> for RenderError {
 }
 
 /// A frame callback: renders one frame into `view` (the current surface
-/// texture view), given the device, queue, debug pipeline, the view
-/// aspect (width/height), and the accumulated input state since the last
-/// frame (issues #90/#91/#93).
+/// texture view), given the device, queue, the frame renderer (2D debug or
+/// depth-tested 3D battle paths, issue #104), the view aspect (width/height),
+/// and the accumulated input state since the last frame (issues #90/#91/#93).
 pub type FrameCallback = dyn FnMut(
     &wgpu::Device,
     &wgpu::Queue,
-    &mut DebugPipeline,
+    &mut FrameRenderer,
     &wgpu::TextureView,
     f32,
     &mut InputState,
@@ -168,9 +169,9 @@ impl InputState {
 pub fn run_windowed(clear: ClearColor, title: &str) -> Result<(), RenderError> {
     run_windowed_with(
         title,
-        move |device, queue, pipeline, view, aspect, _input| {
+        move |device, queue, renderer, view, aspect, _input| {
             let projection = OrthoProjection::CROSSING_VIEW.for_aspect(aspect);
-            pipeline.render(
+            renderer.render_debug(
                 device,
                 queue,
                 view,
@@ -191,7 +192,7 @@ where
     F: FnMut(
             &wgpu::Device,
             &wgpu::Queue,
-            &mut DebugPipeline,
+            &mut FrameRenderer,
             &wgpu::TextureView,
             f32,
             &mut InputState,
@@ -220,7 +221,7 @@ struct WindowState {
     backend: crate::GpuBackend,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    pipeline: DebugPipeline,
+    renderer: FrameRenderer,
 }
 
 struct FrameApp {
@@ -288,7 +289,13 @@ impl ApplicationHandler for FrameApp {
         let size = window.inner_size();
         let config = choose_surface_config(&capabilities, size.width.max(1), size.height.max(1));
         surface.configure(&backend.device, &config);
-        let pipeline = DebugPipeline::new(&backend.device, config.format);
+        let renderer = FrameRenderer::new(
+            &backend.device,
+            &backend.queue,
+            config.format,
+            size.width.max(1),
+            size.height.max(1),
+        );
         // Startup log: adapter name, backend, device info (issue #61).
         println!("{report}");
         println!(
@@ -300,7 +307,7 @@ impl ApplicationHandler for FrameApp {
             backend,
             surface,
             config,
-            pipeline,
+            renderer,
         });
         self.state
             .as_ref()
@@ -321,13 +328,17 @@ impl ApplicationHandler for FrameApp {
         match event {
             WindowEvent::Resized(size) => {
                 // Resize must not break presentation: reconfigure the surface
-                // with the new size and keep presenting.
+                // with the new size, recreate the depth target, and keep
+                // presenting (issue #104: the 3D pass stays correct on resize).
                 if size.width > 0 && size.height > 0 {
                     state.config.width = size.width;
                     state.config.height = size.height;
                     state
                         .surface
                         .configure(&state.backend.device, &state.config);
+                    state
+                        .renderer
+                        .resize(&state.backend.device, size.width, size.height);
                     state.window.request_redraw();
                 }
             }
@@ -382,7 +393,7 @@ impl ApplicationHandler for FrameApp {
                         (self.frame)(
                             &state.backend.device,
                             &state.backend.queue,
-                            &mut state.pipeline,
+                            &mut state.renderer,
                             &view,
                             aspect,
                             &mut self.input,
