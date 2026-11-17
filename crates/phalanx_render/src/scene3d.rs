@@ -143,9 +143,6 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-@group(1) @binding(0) var scene_tex: texture_2d<f32>;
-@group(1) @binding(1) var scene_sampler: sampler;
-
 struct SceneIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -215,9 +212,16 @@ fn fs_flat(in: VsOut) -> FsOut {
     out.motion = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     return out;
 }
+"#;
 
-// Present pass (bilinear fallback upscaler): fullscreen triangle sampling the
-// scene-color attachment at render resolution into the output view.
+/// Present-pass shader (bilinear fallback upscaler, issue #97): fullscreen
+/// triangle sampling the scene-color attachment at render resolution into the
+/// output view. Kept in its own module so the scene/hud pipelines (group 0
+/// only) validate against a pipeline layout without group 1.
+const PRESENT_SHADER_WGSL: &str = r#"
+@group(1) @binding(0) var scene_tex: texture_2d<f32>;
+@group(1) @binding(1) var scene_sampler: sampler;
+
 struct PresentOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -854,9 +858,13 @@ impl ScenePipelines {
         motion_format: wgpu::TextureFormat,
         output_format: wgpu::TextureFormat,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("phalanx-scene3d-shader"),
             source: wgpu::ShaderSource::Wgsl(SCENE_SHADER_WGSL.into()),
+        });
+        let present_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("phalanx-present-shader"),
+            source: wgpu::ShaderSource::Wgsl(PRESENT_SHADER_WGSL.into()),
         });
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -911,7 +919,8 @@ impl ScenePipelines {
                 write_mask: wgpu::ColorWrites::ALL,
             })
         };
-        let make_pipeline = |vertex_entry: &'static str,
+        let make_pipeline = |module: &wgpu::ShaderModule,
+                             vertex_entry: &'static str,
                              fragment_entry: &'static str,
                              vertex_buffer: Option<wgpu::VertexBufferLayout<'static>>,
                              targets: Vec<Option<wgpu::ColorTargetState>>,
@@ -921,13 +930,13 @@ impl ScenePipelines {
                 label: Some("phalanx-scene3d-pipeline"),
                 layout: Some(layout),
                 vertex: wgpu::VertexState {
-                    module: &shader,
+                    module,
                     entry_point: Some(vertex_entry),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &[vertex_buffer],
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &shader,
+                    module,
                     entry_point: Some(fragment_entry),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &targets,
@@ -950,6 +959,7 @@ impl ScenePipelines {
             })
         };
         let scene_pipeline = make_pipeline(
+            &scene_shader,
             "vs_scene",
             "fs_lit",
             Some(SceneVertex::layout()),
@@ -958,6 +968,7 @@ impl ScenePipelines {
             &uniform_layout,
         );
         let hud_pipeline = make_pipeline(
+            &scene_shader,
             "vs_hud",
             "fs_flat",
             Some(HudVertex::layout()),
@@ -966,6 +977,7 @@ impl ScenePipelines {
             &uniform_layout,
         );
         let present_pipeline = make_pipeline(
+            &present_shader,
             "vs_present",
             "fs_present",
             None,
@@ -974,6 +986,7 @@ impl ScenePipelines {
             &present_layout,
         );
         let hud_output_pipeline = make_pipeline(
+            &scene_shader,
             "vs_hud",
             "fs_flat",
             Some(HudVertex::layout()),
@@ -1359,6 +1372,28 @@ mod tests {
             layouter[uniforms.0].size, expected,
             "WGSL Uniforms size must match FrameUniforms::to_bytes and min_binding_size"
         );
+    }
+
+    #[test]
+    fn shader_modules_declare_only_their_own_bind_groups() {
+        // wgpu validates every shader global of a module against the pipeline
+        // layout, so the scene module (group 0 uniforms only) must not declare
+        // the present pass's group(1) texture/sampler and vice versa (observed
+        // on the Windows DX12 CI adapter: 'group: 1, binding: 0 is not available
+        // in the pipeline layout'). Parsed with naga, so this runs on GPU-less
+        // machines too.
+        for (source, allowed_group) in [(SCENE_SHADER_WGSL, 0_u32), (PRESENT_SHADER_WGSL, 1_u32)] {
+            let module = wgpu::naga::front::wgsl::parse_str(source).expect("wgsl parses");
+            for (_, global) in module.global_variables.iter() {
+                if let Some(binding) = &global.binding {
+                    assert_eq!(
+                        binding.group, allowed_group,
+                        "global {:?} declared in group {}, expected group {allowed_group}",
+                        global.name, binding.group
+                    );
+                }
+            }
+        }
     }
 
     #[test]
