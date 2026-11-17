@@ -212,6 +212,13 @@ fn fs_flat(in: VsOut) -> FsOut {
     out.motion = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     return out;
 }
+
+// Output-pass variant with a single @location(0) (the present pass has one
+// color target, unlike the scene pass's color + motion pair).
+@fragment
+fn fs_flat_output(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
 "#;
 
 /// Present-pass shader (bilinear fallback upscaler, issue #97): fullscreen
@@ -907,9 +914,12 @@ impl ScenePipelines {
             bind_group_layouts: &[Some(&uniform_bind_group_layout)],
             immediate_size: 0,
         });
+        // The present shader declares its texture/sampler at @group(1) (matching
+        // draw_output's set_bind_group(1, ..)), so the layout array must place the
+        // present bind group layout at index 1; index 0 stays empty.
         let present_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("phalanx-present-layout"),
-            bind_group_layouts: &[Some(&present_bind_group_layout)],
+            bind_group_layouts: &[None, Some(&present_bind_group_layout)],
             immediate_size: 0,
         });
         let color_target = |format: wgpu::TextureFormat| {
@@ -988,7 +998,7 @@ impl ScenePipelines {
         let hud_output_pipeline = make_pipeline(
             &scene_shader,
             "vs_hud",
-            "fs_flat",
+            "fs_flat_output",
             Some(HudVertex::layout()),
             vec![color_target(output_format)],
             None,
@@ -1393,6 +1403,46 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Counts the @location outputs of a fragment entry point in a WGSL module.
+    fn fragment_output_locations(source: &str, entry: &str) -> usize {
+        let module = wgpu::naga::front::wgsl::parse_str(source).expect("wgsl parses");
+        let ep = module
+            .entry_points
+            .iter()
+            .find(|ep| ep.name == entry && ep.stage == wgpu::naga::ShaderStage::Fragment)
+            .expect("fragment entry point");
+        match &ep.function.result {
+            Some(result) => match &module.types[result.ty].inner {
+                wgpu::naga::TypeInner::Struct { members, .. } => members
+                    .iter()
+                    .filter(|m| matches!(&m.binding, Some(wgpu::naga::Binding::Location { .. })))
+                    .count(),
+                _ => 1,
+            },
+            None => 0,
+        }
+    }
+
+    #[test]
+    fn pipeline_fragment_outputs_match_their_target_counts() {
+        // wgpu validates that a fragment entry point's @location outputs match
+        // the pipeline's color-target count: the scene pass provides scene-color
+        // + motion (2 targets), the output pass provides the single output target.
+        // Parsed with naga, so this runs on GPU-less machines too.
+        for (source, entry, expected) in [
+            (SCENE_SHADER_WGSL, "fs_lit", 2_usize),
+            (SCENE_SHADER_WGSL, "fs_flat", 2),
+            (SCENE_SHADER_WGSL, "fs_flat_output", 1),
+            (PRESENT_SHADER_WGSL, "fs_present", 1),
+        ] {
+            assert_eq!(
+                fragment_output_locations(source, entry),
+                expected,
+                "{entry} must declare exactly {expected} @location outputs"
+            );
         }
     }
 
