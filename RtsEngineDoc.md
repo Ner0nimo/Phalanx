@@ -10,7 +10,7 @@ This document is both a game-design direction and an engineering contract for hu
 
 **Reading guide — stable contracts vs provisional design (issue #31):**
 
-- **[Stable contract]** — binding, validated architecture: §3 invariants, the §6 simulation model and §6.1 phase schedule, §12 command protocol, §13 savegame/replay/hash contracts, §15–§17 process gates, and accepted ADRs (ADR-0001…ADR-0004). These change only via an ADR.
+- **[Stable contract]** — binding, validated architecture: §3 invariants, the §6 simulation model and §6.1 phase schedule, the internal command-ingress contract in §12, replay/hash contracts in §13.2–§13.3, and the process gates in §15–§17. Accepted ADRs are ADR-0001…ADR-0004, ADR-0009, and ADR-0010. Durable savegames and the external agent/editor protocol are not yet implemented.
 - **[Provisional]** — subsystem design the M1 vertical slice has not yet validated. Each provisional section names the milestone/issue that will validate it. Do not treat these as implementation commitments.
 - **[Deferred]** — explicitly out of scope for the current milestone; listed so it is not mistaken for planned work.
 - §18 milestones are the implementation baseline, and **M1 is the immediate baseline** until its exit criteria pass.
@@ -359,11 +359,11 @@ Do not use an untyped global event bus as a substitute for clear ownership or di
 
 ## 7. Navigation, movement, and formations
 
-*[Provisional] — the movement prototype is implemented (issue #12, PR #59); flow fields, hierarchical nav, and formations (§7.3) are unvalidated and belong to M2.*
+*[Provisional] — the M1 A* and local-movement prototype is implemented (issue #12, PR #59). Formation/group movement is M2 work (#110); shared flow fields and hierarchical pathfinding are M3 scale work (#114, #115).*
 
 Navigation is a core differentiator and must be designed as three cooperating layers.
 
-**Prototype status (issue #12):** `phalanx_navigation` implements the first CPU-only prototype: a 1 m `NavGrid` over static maps (obstacles inflated by the unit radius), deterministic A* route queries with explicit unreachable/blocked outcomes, a budgeted per-tick path-request queue, move orders with observable completed/failed status, route following with separation that never lets a unit cross an obstacle or another unit (movement is clamped against occupied cells; recomputed routes dynamically avoid congested cells), and machine-readable diagnostics (`NavDiagnostics`, canonical-encoded). The `MovementSystem` runs in `Phase::ResolveMovement` with its state in the canonical checkpoint digest, so movement is covered by replays and snapshots. Baseline benchmark: `benchmarks/navigation` (1k/10k units). Not yet implemented: flow fields, hierarchical navigation, GPU avoidance, formations (§7.3), multiple profiles beyond the data-driven `MovementProfile`.
+**Prototype status (issue #12):** `phalanx_navigation` implements the first CPU-only prototype: a 1 m `NavGrid` over static maps (obstacles inflated by the unit radius), deterministic A* route queries with explicit unreachable/blocked outcomes, a budgeted per-tick path-request queue, move orders with observable completed/failed status, route following with separation that never lets a unit cross an obstacle or another unit (movement is clamped against occupied cells; recomputed routes dynamically avoid congested cells), and machine-readable diagnostics (`NavDiagnostics`, canonical-encoded). The `MovementSystem` runs in `Phase::ResolveMovement` with its state in the canonical checkpoint digest, so movement is covered by replays and snapshots. Baseline benchmark: `benchmarks/navigation` (1k/10k units). Not yet implemented: shared flow fields (#114), hierarchical pathfinding (#115), GPU avoidance, formation/group movement (#110), and broader movement-profile validation.
 
 ### 7.1 Global navigation
 
@@ -470,7 +470,7 @@ Implement in phases; this list describes the intended system surface, not the fi
 - Feedback for accepted, active, completed, failed, and cancelled commands.
 - Command history suitable for replay and debugging.
 
-### 9.2 Economy and production
+**Player interaction status (M1, issues #90–#95):** the graphical prototype supports left-click selection, drag-box selection, Escape to clear selection, right-click Attack/AttackMove orders, Shift+right-click queue append, and Delete/Backspace cancellation. The camera supports WASD/arrow-key pan and mouse-wheel zoom. The HUD draws health bars, selection rings, order lines, and a drag outline. This is a basic playable input path, not the complete §9.1 interaction design: additive selection, control groups, selection filters, group commands, and richer command lifecycle feedback remain open (#105, #123).
 
 - Resource sources and extraction.
 - Resource stockpiles and/or income flow.
@@ -501,7 +501,9 @@ Avoid floating-point currency if exact accounting matters; choose fixed-point or
 - Combat events for UI/audio/replay.
 - Deterministic tie-breaking for target selection and simultaneous effects.
 
-**Prototype status (issue #13):** `phalanx_game` implements the first CPU-authoritative combat loop on top of `phalanx_core` and `phalanx_navigation` (`docs/vertical-slice-scenario.md` §3–§8): data-driven unit/weapon definitions with a roster content digest, typed deterministic battle events (`DamageDealt`/`UnitDestroyed`/`MatchOver`/`CommandFailed`), and `BattleWorld` — the movement layer plus per-unit combat state, commands, events, and match outcome, all canonical state covered by checkpoint digests, snapshots, and replays (issues #34/#49). Three systems share the world: `battle-commands` (`Phase::ApplyCommands`), `battle-movement` (`Phase::ResolveMovement`), `battle-combat` (`Phase::ResolveCombat`, owns the canonical state hooks). Combat rules: nearest-enemy acquisition within sight range for units with an Attack/AttackMove command, lowest-`EntityId` tie-break; hold-and-fire within weapon range; `damage = max(1, weapon.damage - armor)`; cooldown restart per shot; simultaneous fire applied in ascending `EntityId` order; destruction emits `UnitDestroyed`, releases the entity, and clears stale references; `MatchOver` at the first tick a team has zero living units. The scripted "Crossing assault" acceptance scenario runs end-to-end in `crates/phalanx_game/tests/crossing_assault.rs` (Team A wins within 2000 ticks, rule-derived first-contact tick, hash-identical replay, altered-command divergence at tick 1, snapshot/restore continuity). With the autonomous stance (`BattleWorld::set_autonomous(true)`, issue #64 — canonical state), units without any command acquire, approach, and engage on their own, so a battle runs to `MatchOver` with zero submitted commands (`crates/phalanx_game/tests/autonomous_battle.rs`). Not yet implemented: projectiles, damage-type matrix, line of sight, wrecks, area effects.
+**Prototype status (issue #13):** `phalanx_game` implements the first CPU-authoritative combat loop on top of `phalanx_core` and `phalanx_navigation` (`docs/vertical-slice-scenario.md` §3–§8): data-driven unit/weapon definitions with a roster content digest, typed deterministic battle events (`DamageDealt`/`UnitDestroyed`/`MatchOver`/`CommandFailed`), and `BattleWorld` — the movement layer plus per-unit combat state, commands, events, and match outcome, all canonical state covered by checkpoint digests, snapshots, and replays (issues #34/#49). Three systems share the world: `battle-commands` (`Phase::ApplyCommands`), `battle-movement` (`Phase::ResolveMovement`), `battle-combat` (`Phase::ResolveCombat`, owns the canonical state hooks). Combat rules: nearest-enemy acquisition within sight range for units with an Attack/AttackMove command, lowest-`EntityId` tie-break; hold-and-fire within weapon range; `damage = max(1, weapon.damage - armor)`; cooldown restart per shot; simultaneous fire applied in ascending `EntityId` order; destruction emits `UnitDestroyed`, releases the entity, and clears stale references; `MatchOver` at the first tick a team has zero living units. The scripted "Crossing assault" acceptance scenario runs end-to-end in `crates/phalanx_game/tests/crossing_assault.rs` (Team A wins within 2000 ticks, rule-derived first-contact tick, hash-identical replay, altered-command divergence at tick 1, snapshot/restore continuity). With the autonomous stance (`BattleWorld::set_autonomous(true)`, issue #64 — canonical state), units without any command acquire, approach, and engage on their own, so a battle runs to `MatchOver` with zero submitted commands (`crates/phalanx_game/tests/autonomous_battle.rs`). Not yet implemented: CPU-authoritative projectile lifecycle and area-effect resolution (#113), energy/kinetic damage, shields, and shield-boundary splash (#23), line of sight, and wrecks. The autonomous stance in #64 is a local tactical behavior, not the strategic/operational skirmish AI planned in #111.
+
+*[Not implemented] — the M1 Crossing scenario intentionally uses full visibility. Authoritative per-player visibility, scouting, and fog rendering are tracked in #112.*
 
 ### 9.5 Fog of war and intelligence
 
@@ -513,7 +515,7 @@ Visibility updates may be scheduled and spatially accelerated, but gameplay deci
 
 ### 9.6 AI
 
-*[Deferred to M2] — skirmish AI validates via the public command interface in M2.*
+*[Deferred to M2] — the current autonomous battle only supplies tactical target acquisition/engagement. Strategic and operational skirmish AI using the same validated public command interface is tracked in #111.*
 
 Use a hierarchy:
 
@@ -527,7 +529,7 @@ AI must issue the same validated commands as a player and observe the same permi
 
 ## 10. World, maps, and terrain
 
-*[Provisional] — the Crossing map and content-digest validation exist (issue #52); broader map pipelines validate with slice content (M1) and M2.*
+*[Provisional] — Crossing is a hard-coded scenario fixture with canonical content-digest validation (#52), not a general authored-map pipeline. Versioned map/terrain loading and validation are tracked in #118; safe authoring/editor operations are tracked in #119.*
 
 ### 10.1 Terrain representation
 
@@ -592,17 +594,19 @@ Rendering must be optional for headless simulation. Renderer initialization fail
 
 **In-game FPS/frametime overlay (issue #88, implemented):** `phalanx_render::perf` is an independent presentation-side collector: `FrameTimer` marks the per-frame stages with explicit measurement boundaries — `simulation` (wall-clock `SimulationRunner` advance, with `simulation_steps` so an idle frame at the fixed 20 Hz rate reads `sim_ms=0, sim_steps=0`, not "free"), `snapshot` (`extract_snapshot`), `graphics_cpu` (CPU-side wgpu encode/submit only; presentation is asynchronous and true on-GPU time would need timestamp queries, deferred), and `total` measured independently from frame start to end, never summed from stages. `FrameProfiler` aggregates a fixed-size sliding window (default 120 frames, no per-frame allocation or formatting) into `PerfStats` (avg FPS, worst frametime, per-stage averages). `--graphical --battle --perf-overlay` draws bar-based stage timings via the debug-geometry pipeline (a strip above the map; numeric values are stdout-only since there is no text renderer) and prints a structured line every 20 frames: `PERF frame=<n> fps=<avg> worst_ms=<x> total_ms=<x> sim_ms=<x> snapshot_ms=<x> graphics_cpu_ms=<x> sim_steps=<n>`. Works windowed and offscreen; the GPU-less offscreen probe still runs the sim and collector and emits the `PERF` lines (`graphics_cpu_ms=0`, nothing rendered), so CI verifies it without a GPU — collection is separated from rendering, pixel verification only when an adapter exists. Measurement is wall-clock only and never feeds back into simulation state: the `--headless` digest is unchanged with the overlay enabled.
 
+**Current player-facing interaction (issues #90–#95, implemented):** the graphical battle has basic click/drag selection, WASD/arrow pan, wheel zoom, right-click Attack/AttackMove, Shift queue append, and Delete/Backspace cancellation. The HUD is currently geometry-only (health bars, rings, order lines, drag outline); there is no text renderer or production RTS interface. The documented camera rotation, edge-pan, jump-to-event, bookmarks, additive/control-group selection, and selection filters are not part of this implementation; see #105. A small depth-tested 3D Crossing-scene proof is tracked in #104. The current geometry pipeline is a 2D orthographic projection of the ground plane, not a 3D scene renderer; production 3D/PBR work remains #98.
+
 ### 11.5 Product visual-quality baseline
 
 The shipping goal is a polished 3D RTS with high visual quality at tactical zoom, clear strategic readability at large zoom, and a credible performance profile in large battles. The current colored debug geometry is a development visualization only; it is not the target art/rendering quality.
 
 The first production-quality rendering slice must demonstrate, in the Crossing reference battle and at wide, medium, and close camera distances:
 
-- A linear-HDR scene-color pipeline with explicit exposure and tone mapping; correct sRGB/linear handling and a defined policy for display output and HDR-capable displays.
+- A linear-HDR scene-color pipeline with explicit exposure and tone mapping in the renderer (#98). Display/output color-space selection, SDR encoding, HDR-capable display presentation, and user-facing display controls are handled separately by #101.
 - A coherent physically based material model for units, buildings, terrain, and props (base color, normal, roughness/metalness or the selected equivalent), with texture filtering, mip generation, anisotropy, and GPU-friendly texture formats.
 - Directional sunlight, ambient/skylight contribution, stable shadowing (including cascades or an equivalent RTS-appropriate solution), atmospheric depth/fog, and readable terrain/material blending.
 - Real mesh rendering with instancing/batching, mesh and material LOD, frustum/occlusion culling where useful, and a representation transition from aggregated armies to individual units.
-- A defined model/animation path for skeletal units, animation LOD, particles, decals, explosions, water/foliage where present, and visual effects that remain presentation-only.
+- A defined model/animation path for skeletal units, animation LOD, particles, decals, explosions, water/foliage where present, and visual effects that remain presentation-only; runtime animation/VFX implementation is tracked in #124.
 - High-contrast, legible selection, health, command, ownership, and objective feedback across zoom levels without obscuring the battlefield.
 
 The implementation should use an engine-owned cooked asset pipeline rather than loading authoring files directly at runtime. glTF 2.0 is the initial interchange candidate, not the runtime format. Import/cook steps must validate mesh/material/texture/skeleton data, generate mipmaps and required LODs, compress textures for the target GPU formats, and emit a versioned content manifest. The exact material model, lighting approach, and quality tiers must be measured against real content and hardware before they are frozen.
@@ -632,7 +636,7 @@ Frame generation is optional and separate from upscaling. AMD FSR Frame Generati
 
 ## 12. Agent/editor command API
 
-*[Stable contract] for the versioned command envelope/ingress/arbitration protocol (implemented, replay-covered); agent-integration specifics (§12.3) are [Provisional].*
+*[Stable contract] for the internal versioned command envelope, ingress, and arbitration path (implemented and replay-covered); the external agent/editor process protocol and map-editing surface are not implemented yet (#121, #119).*
 
 The editor and scenario tools must be controllable without manual interaction. The initial transport is JSON Lines (one JSON object per line), but the protocol must be versioned and documented.
 
@@ -656,11 +660,13 @@ Coding agents must follow the repository-wide instructions in `AGENTS.md`. The c
 
 ## 13. Savegames, replays, and compatibility
 
-*[Stable contract] — implemented in phalanx_core::replay/hash with versioned formats and boundary rejection.*
+*[Partially implemented] — canonical hashing, replay compatibility checks, and in-memory full-state snapshots are implemented. Durable on-disk savegames and load/migration are not implemented (#120); replay-recording API immutability remains open (#53).*
 
 These are foundational systems, not polish.
 
 ### 13.1 Savegame model
+
+The structure below is the target savegame contract, not a description of a completed file format. `SimulationRunner::snapshot`/`restore_snapshot` currently round-trip canonical in-memory bytes; they do not by themselves provide a durable save container, map/content packaging, atomic process-level load, or schema migration. Those capabilities are tracked in #120 and depend on the versioned map/content work in #118.
 
 Separate:
 
@@ -676,7 +682,7 @@ Save loading must validate versions, references, limits, and invariants before a
 
 A replay contains replay format version, simulation/game rules version, initial map/scenario and content identifiers/hashes, player identity/configuration, deterministic RNG seeds and stream state as required, tick-indexed commands and other authoritative external inputs, and optional periodic state hashes/checkpoints.
 
-Replays must support seeking through checkpoints or deterministic resimulation. A replay mismatch report should identify the first divergent tick and provide subsystem-level diagnostics where feasible. The replay harness is implemented in `phalanx_core::replay` (`crates/phalanx_core/src/replay.rs`) — `ReplayRecording`/`ReplayRecorder` capture format and simulation schema versions, the simulation configuration version and tick rate (issue #37), the RNG seed-derivation version (issue #47), digest algorithm, the finalized system manifest, RNG seed, the recorded command ingress limits, named content digests (map/roster/... canonical content identities, issue #52), the explicit end tick, the tick-indexed command stream, and per-tick digests; recordings are structurally validated before any playback (issue #51) and replay requires every recorded content identity to be present and matching (issue #52), and `replay_recording` reports the first divergent tick and rejects, before any tick is stepped, unsupported replay format versions, unsupported simulation schema versions, incompatible simulation config versions, incompatible digest algorithms, or an incompatible system manifest — with a small deterministic CI scenario in `phalanx_core::scenario`.
+Replays must support seeking through checkpoints or deterministic resimulation. A replay mismatch report should identify the first divergent tick and provide subsystem-level diagnostics where feasible. The replay harness is implemented in `phalanx_core::replay` (`crates/phalanx_core/src/replay.rs`) — `ReplayRecording`/`ReplayRecorder` capture format and simulation schema versions, the simulation configuration version and tick rate (issue #37), the RNG seed-derivation version (issue #47), digest algorithm, the finalized system manifest, RNG seed, the recorded command ingress limits, named content digests (map/roster/... canonical content identities, issue #52), the explicit end tick, the tick-indexed command stream, and per-tick digests; recordings are structurally validated before any playback (issue #51) and replay requires every recorded content identity to be present and matching (issue #52), and `replay_recording` reports the first divergent tick and rejects, before any tick is stepped, unsupported replay format versions, unsupported simulation schema versions, incompatible simulation config versions, incompatible digest algorithms, or an incompatible system manifest — with a small deterministic CI scenario in `phalanx_core::scenario`. The normal replay API still exposes mutation helpers (`commands_mut`, `push_command`, and `push_tick_hash`) for diagnostics/tests; making finalized recordings immutable through a validated builder while preserving test corruption fixtures is tracked in #53.
 
 ### 13.3 State hashing
 
@@ -688,7 +694,7 @@ The current algorithm is FNV-1a 64, a fast divergence check only — not a crypt
 
 ## 14. Performance and scalability
 
-*[Provisional] — targets are workload-defined and unvalidated until M3 (issue #32); benchmarks are build/lint-gated only on shared runners.*
+*[Provisional] — the ECS and navigation library spikes exist (#32, #12), and the windowed overlay measures CPU-side stages (#88). There is not yet an integrated 10k-unit simulation/combat/full-battlefield benchmark or a GPU timestamp profile; see #116 and #100.*
 
 ### 14.1 Targets are workload-defined
 
@@ -736,6 +742,8 @@ Testing is a primary engineering requirement.
 - Headless smoke tests.
 
 The M0 subset of these gates is implemented in `.github/workflows/ci.yml`: formatting, Clippy with `-D warnings`, tests, a workspace build, and the CPU-only headless smoke scenario run on `ubuntu-latest` and `windows-latest` for pushes to `main` and pull requests targeting `main`, plus a `cargo audit` dependency job against the committed `Cargo.lock` and a gitleaks secret-scanning job. The workflow uses least-privilege permissions (`contents: read`) and cargo artifact caching; performance timing thresholds are intentionally excluded from shared hosted runners.
+
+**Coverage gap:** unit/integration/replay determinism tests and the basic Windows/Linux CI gates exist, but the required property-based and fuzz coverage for untrusted maps, saves, assets, and agent commands is not yet in place. Track that work in #126; save/load tests depend on #120.
 
 ### 15.2 Required test categories
 
@@ -798,10 +806,10 @@ ADR index (remaining entries are created as their decisions land):
 - [0002-determinism-and-numeric-model.md](docs/adr/0002-determinism-and-numeric-model.md) (accepted; the numeric/floating-point determinism policy: permitted operations, fast-math constraints, NaN/-0.0/denormal handling, integer rounding, canonical float encoding, cross-OS golden-vector experiments)
 - [0003-ecs-selection.md](docs/adr/0003-ecs-selection.md) (accepted as an initial spike selection; production commitment deferred to M3 validation)
 - [0004-rendering-backend.md](docs/adr/0004-rendering-backend.md) (accepted for the production prototype; headed GPU validation is a recorded follow-up)
-- 0005-navigation-and-formation-model.md
-- 0006-territory-and-supply-model.md
-- 0007-map-and-save-format.md
-- 0008-agent-command-protocol.md
+- 0005-navigation-and-formation-model.md *(planned; #110, #114, #115 — file does not exist yet)*
+- 0006-territory-and-supply-model.md *(planned; #14, #15, #106, #107 — file does not exist yet)*
+- 0007-map-and-save-format.md *(planned; #118, #120 — file does not exist yet)*
+- 0008-agent-command-protocol.md *(planned; #121 — file does not exist yet)*
 - [0009-phase-schedule-cadence-and-access.md](docs/adr/0009-phase-schedule-cadence-and-access.md) (accepted; phase-ordering invariants justified by real systems, deterministic system cadence, access contract and deferred parallel path)
 - [0010-high-fidelity-rendering-and-upscaling.md](docs/adr/0010-high-fidelity-rendering-and-upscaling.md) (accepted direction; wgpu remains the working renderer baseline, but FSR/native interop, temporal inputs, fallback platforms, and production visual quality must be proven before final backend commitment)
 
@@ -838,7 +846,7 @@ Milestones are capability gates, not calendar promises. Do not start broad conte
 
 **This is the immediate implementation baseline (issue #31): current work proceeds against these requirements and the Crossing scenario until the M1 exit criteria pass; M2+ sections above are not commitments.**
 
-- Small 3D battlefield and camera.
+- Small 3D battlefield and camera (the current renderer is still a 2D orthographic debug projection; the missing depth-tested 3D Crossing proof is explicitly tracked in #104).
 - Two teams and a small set of unit definitions.
 - Selection and basic command feedback.
 - Move and attack-move orders.
@@ -847,50 +855,55 @@ Milestones are capability gates, not calendar promises. Do not start broad conte
 - Headless execution of the same scenario.
 - Command recording, replay, and state hashing.
 
-The concrete scenario ("Crossing assault") and its headless acceptance test are specified in [docs/vertical-slice-scenario.md](docs/vertical-slice-scenario.md).
+The concrete scenario ("Crossing assault") and its headless acceptance test are specified in [docs/vertical-slice-scenario.md](docs/vertical-slice-scenario.md). The player interaction prototype is substantially implemented (#90–#95), but M1 is not complete while the minimal 3D presentation requirement remains open (#104).
 
 **Exit:** a complete small battle can be played, recorded, and reproduced in headless mode with matching state hashes on the same supported build/platform.
 
 ### M2 — Operational RTS foundation
 
-- Squads/formations and group orders.
-- Region graph and capture/control loop.
-- Resource sites and production.
-- Basic supply sources and routes with visible consequences.
-- Strategic overlays for regions, groups, and supply.
-- Basic skirmish AI using the public command interface.
+- Squads/formations and group orders (#110).
+- Region graph and capture/control loop (#14, #106).
+- Resource sites and production (#108).
+- Buildings and infrastructure lifecycle (#109).
+- Basic supply sources, routes, and reinforcement with visible consequences (#15, #107).
+- Strategic overlays for regions, groups, and supply (follow-on presentation in #117 and #123).
+- Basic skirmish AI using the public command interface (#111).
+- Per-player visibility and scouting (#112).
+- Initial projectile and area-effect combat (#113).
 
 **Exit:** a match has meaningful expansion, fronts, reinforcement, and at least one supply-driven strategic decision.
 
 ### M3 — Scale and performance validation
 
-- Mass-movement benchmark.
-- Mass-combat benchmark.
-- 10k-unit full-battlefield scenario.
-- Navigation and simulation profiling.
-- LOD and strategic aggregation.
+- Shared flow fields and hierarchical pathfinding (#114, #115).
+- Mass-movement and mass-combat benchmarks.
+- 10k-unit integrated simulation/full-battlefield scenario and measured budgets (#116).
+- GPU per-pass timing (#100) and named-hardware renderer profiling.
+- LOD and strategic aggregation (#117, alongside mesh/material LOD in #98).
 - Memory and frame-time budgets measured on named reference hardware.
 
 **Exit:** documented performance results identify bottlenecks and demonstrate the agreed target workload. Do not claim a 10k/60 FPS target until this gate passes.
 
 ### M4 — Content and editor workflow
 
-- Agent command/query API.
-- Map editor operations and validation.
-- Data-driven units, buildings, weapons, and upgrades.
-- Asset import/cook pipeline.
-- Save/load with schema versioning.
-- Improved AI, HUD, audio, effects, and animation.
+- Versioned map/terrain format and validation (#118), plus safe map authoring/editor operations (#119).
+- Agent command/query protocol (#121).
+- Data-driven units, buildings, weapons, and upgrades (#122).
+- Asset import/cook pipeline (#99).
+- Durable save/load with schema versioning (#120).
+- Production RTS UI, text, and command-status feedback (#123).
+- Runtime animation/VFX (#124), spatial audio (#125), and property/fuzz testing (#126).
+- Improved AI and content iterations building on #111.
 
 **Exit:** an agent can construct, validate, save, and launch a deterministic skirmish scenario without manual editor interaction.
 
 ### M5 — Product readiness
 
-- Multiple maps and factions/rosters with distinct gameplay.
-- Robust save/load and replay compatibility policy.
-- Settings, onboarding, accessibility, and UX polish.
-- Packaging and native Windows/Linux release pipeline.
-- Profiling and crash diagnostics.
+- Multiple validated maps and distinct faction/roster content (#129).
+- Robust save/load and replay compatibility policy (#120, #53).
+- Settings, onboarding, accessibility, and UX polish (#128).
+- Packaging and native Windows/Linux release pipeline (#127).
+- Crash/runtime support diagnostics (#128).
 - Balance and large-scale gameplay iteration.
 
 Multiplayer is a separate product milestone and must not be treated as a small transport add-on.
@@ -926,8 +939,8 @@ These are intentionally open and must be resolved with prototypes, design tests,
 - wgpu vs ash.
 - bevy_ecs vs hecs.
 - Terrain representation beyond initial heightfield plus static geometry.
-- Animation runtime and asset cooking format.
-- Audio library.
+- Animation runtime and asset cooking format (#99, #124).
+- Audio library (#125).
 - Whether and when gameplay scripting is needed.
 - Embedded vs standalone editor.
 - Multiplayer model and transport.
