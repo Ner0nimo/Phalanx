@@ -283,6 +283,15 @@ impl Camera3D {
     }
 }
 
+/// Counts readback pixels matching a base color in either lighting variant
+/// (top face = factor 1.0, vertical sides = factor [`AMBIENT`]). Robust to
+/// which face of a small box dominates the rasterized pixels.
+#[must_use]
+pub fn count_color_family(pixels: &[u8], base: [f32; 4]) -> usize {
+    crate::geometry::count_color(pixels, lit_color(base, AMBIENT + DIFFUSE))
+        + crate::geometry::count_color(pixels, lit_color(base, AMBIENT))
+}
+
 /// Projects a world point to normalized screen coordinates (x right, y down)
 /// plus its NDC z; `None` when the point is behind the camera.
 #[must_use]
@@ -1168,10 +1177,12 @@ mod tests {
                 let color_format = crate::OffscreenTarget::FORMAT;
                 let mut pipelines =
                     ScenePipelines::new(&backend.device, &backend.queue, color_format);
+                // 512x512 so a 1 m unit box top face covers several pixels (at
+                // 128x128 it can rasterize to zero top-face pixels).
                 let target =
-                    crate::OffscreenTarget::new(&backend.device, 128, 128).expect("target");
+                    crate::OffscreenTarget::new(&backend.device, 512, 512).expect("target");
                 let (depth, depth_view) =
-                    crate::frame::create_depth_target(&backend.device, 128, 128);
+                    crate::frame::create_depth_target(&backend.device, 512, 512);
                 let camera = Camera3D::from_view([100.0, 100.0], 200.0, 0.0);
                 let vp = camera.view_projection(1.0);
                 let mut snapshot = test_snapshot();
@@ -1218,8 +1229,8 @@ mod tests {
                     &backend.device,
                     &backend.queue,
                     &depth,
-                    128,
-                    128,
+                    512,
+                    512,
                 )
                 .expect("depth readback");
                 // Color: every pixel is the clear color or a lit scene/HUD color.
@@ -1249,7 +1260,7 @@ mod tests {
                 // near geometry (unit tops) from the ground plane.
                 let rendered = depths.iter().filter(|d| **d < 1.0).count();
                 assert!(
-                    rendered > 128 * 128 / 2,
+                    rendered > 512 * 512 / 2,
                     "ground plane covers most of the frame"
                 );
                 // Depth ordering, proven against the CPU projection (robust to
@@ -1258,11 +1269,11 @@ mod tests {
                 // ground 10 m farther from the camera behind it.
                 let near = [20.0, UNIT_HEIGHT_M, 100.0];
                 let far = [20.0, 0.0, 90.0];
-                verify_depth_ordering(&depths, 128, 128, &camera, 1.0, near, far)
+                verify_depth_ordering(&depths, 512, 512, &camera, 1.0, near, far)
                     .expect("depth buffer must order near geometry before far");
-                // Both team colors are present (unit top faces get factor 1.0).
-                assert!(crate::geometry::count_color(&pixels, team_color(1)) > 0);
-                assert!(crate::geometry::count_color(&pixels, team_color(2)) > 0);
+                // Both team colors are present (either lit variant of a unit box).
+                assert!(count_color_family(&pixels, team_color(1)) > 0);
+                assert!(count_color_family(&pixels, team_color(2)) > 0);
             }
         }
     }

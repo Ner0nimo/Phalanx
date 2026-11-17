@@ -15,9 +15,10 @@ use phalanx_render::{
     AMBIENT, BackendError, Camera3D, ClearColor, DEFAULT_CLEAR, DEFAULT_PERF_WINDOW, DIFFUSE,
     DebugPipeline, FrameProfiler, FrameRenderer, FrameTimer, GROUND_COLOR, InputEvent, KeyCode,
     MouseButton, OBSTACLE_COLOR, OffscreenTarget, OrthoProjection, PerfStats, RenderSnapshot,
-    UNIT_HEIGHT_M, build_hud_geometry, build_scene_geometry, count_color, demo_shapes,
-    init_headless, lit_color, overlay_hud_vertices, run_windowed, run_windowed_with, team_color,
-    verify_clear_pixels_background, verify_depth_ordering, verify_pixels_in_set, write_ppm,
+    UNIT_HEIGHT_M, build_hud_geometry, build_scene_geometry, count_color, count_color_family,
+    demo_shapes, init_headless, lit_color, overlay_hud_vertices, run_windowed, run_windowed_with,
+    team_color, verify_clear_pixels_background, verify_depth_ordering, verify_pixels_in_set,
+    write_ppm,
 };
 
 fn main() -> ExitCode {
@@ -889,12 +890,15 @@ fn run_battle_graphical(
                         .to_owned(),
                 );
             }
-            if count_color(&pixels, team_color(winner)) == 0 {
+            // Team presence is checked on either lit variant of the team color
+            // (box top = factor 1.0, sides = AMBIENT), robust to which face of
+            // a small unit box covers the rasterized pixels.
+            if count_color_family(&pixels, team_color(winner)) == 0 {
                 return Err(format!(
                     "offscreen battle frame verification failed: winner team {winner} color not rendered"
                 ));
             }
-            if count_color(&pixels, team_color(loser)) != 0 {
+            if count_color_family(&pixels, team_color(loser)) != 0 {
                 return Err(format!(
                     "offscreen battle frame verification failed: destroyed team {loser} still rendered"
                 ));
