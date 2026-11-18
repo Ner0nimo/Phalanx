@@ -6,7 +6,7 @@
 use phalanx_core::entity::EntityId;
 use phalanx_navigation::map::Map;
 use phalanx_render::snapshot::{
-    EntityCategory, ObstacleShape, RenderEntity, RenderSnapshot, RenderSpace,
+    EntityCategory, ObstacleShape, RenderEntity, RenderSnapshot, RenderSpace, RenderSquad,
 };
 
 use crate::world::BattleWorld;
@@ -68,10 +68,30 @@ pub fn extract_snapshot_selected(
             ],
         })
         .collect();
+    let squads = world
+        .squads
+        .iter()
+        .map(|(id, squad)| RenderSquad {
+            squad_index: id.index(),
+            team: squad.team,
+            members: squad.members.iter().map(|m| m.index()).collect(),
+            formation: squad.formation.tag(),
+            destination: squad
+                .command
+                .as_ref()
+                .and_then(|command| match command {
+                    crate::world::SquadCommand::Move { destination }
+                    | crate::world::SquadCommand::AttackMove { destination } => Some(*destination),
+                    crate::world::SquadCommand::Defend => squad.anchor,
+                })
+                .map(|(x, z)| RenderSpace::from_world(x, z)),
+        })
+        .collect();
     RenderSnapshot {
         tick,
         entities,
         obstacles,
+        squads,
     }
 }
 

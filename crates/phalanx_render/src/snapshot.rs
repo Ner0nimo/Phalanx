@@ -67,6 +67,24 @@ pub struct RenderSnapshot {
     pub entities: Vec<RenderEntity>,
     /// Static obstacles.
     pub obstacles: Vec<ObstacleShape>,
+    /// Squads (issue #110): formation membership and group destination.
+    pub squads: Vec<RenderSquad>,
+}
+
+/// Presentation-only squad state (issue #110).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderSquad {
+    /// Squad index (stable while the squad exists).
+    pub squad_index: u32,
+    /// Owning team.
+    pub team: u64,
+    /// Member entity indices (ascending).
+    pub members: Vec<u32>,
+    /// Formation template tag (`phalanx_game::formation::FormationTemplate`).
+    pub formation: u32,
+    /// Group destination in render world coordinates, if a group order is
+    /// active.
+    pub destination: Option<[f32; 2]>,
 }
 
 impl RenderSnapshot {
@@ -241,6 +259,7 @@ mod tests {
                 center: [100.0, 60.0],
                 half_size: [2.0, 45.0],
             }],
+            squads: Vec::new(),
         };
         let shapes = snapshot.shapes();
         assert_eq!(shapes.len(), 3);
@@ -299,6 +318,7 @@ mod tests {
                 },
             ],
             obstacles: vec![],
+            squads: Vec::new(),
         };
         let plain = snapshot.shapes();
         assert_eq!(plain.len(), 2, "just the two unit rects");

@@ -1269,6 +1269,7 @@ mod tests {
                 center: [100.0, 60.0],
                 half_size: [45.0, 2.0],
             }],
+            squads: Vec::new(),
         }
     }
 
