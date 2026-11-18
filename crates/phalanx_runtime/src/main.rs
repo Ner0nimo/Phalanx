@@ -618,6 +618,16 @@ fn run_battle_graphical(options: GraphicalOptions) -> Result<(), String> {
                                             phalanx_game::BattleCommand::Attack { target: *target }
                                         }
                                         CommandPayload::Diagnostics { .. } => continue,
+                                        // Group (squad) commands are not issued
+                                        // by click; they arrive via the command
+                                        // interface (issue #110).
+                                        CommandPayload::CreateSquad { .. }
+                                        | CommandPayload::DisbandSquad { .. }
+                                        | CommandPayload::SetSquadMembers { .. }
+                                        | CommandPayload::SetSquadFormation { .. }
+                                        | CommandPayload::SquadMove { .. }
+                                        | CommandPayload::SquadAttackMove { .. }
+                                        | CommandPayload::SquadDefend { .. } => continue,
                                     };
                                     demo.world.borrow_mut().queue_command(id, cmd);
                                 } else {

@@ -124,6 +124,8 @@ These concepts must not be conflated:
 
 The first implementation may use simple formation patterns (line, column, loose, defensive) and basic group cohesion. The architecture should allow later specialized formations without rewriting unit ownership or command history.
 
+**Squads and formations (issue #110, implemented):** squads are authoritative state in `phalanx_game::world::BattleWorld` (`Squad` per stable, never-reused `SquadId`, with team, formation template, member set in ascending entity-ID order, heading, anchor, and active group order), mirrored on each unit's `CombatState::squad` and cleaned eagerly on destruction/disband/reassignment, so no stale references survive. Formation templates (`phalanx_game::formation::FormationTemplate`: line, column, wedge, loose, defensive) map members to deterministic slot offsets in the group-heading frame (no trigonometry — plain `f32` arithmetic plus IEEE-exact `sqrt`, per ADR-0001/ADR-0002). Group commands (`CreateSquad`, `DisbandSquad`, `SetSquadMembers`, `SetSquadFormation`, `SquadMove`, `SquadAttackMove`, `SquadDefend` in `CommandPayload`) are validated at the tick boundary (unknown squad/member/formation rejected with structured reasons) and resolve to per-member slot destinations as ordinary unit commands, preserving member-level navigation, avoidance, and combat. Blocked slots fall back to the nearest free cell within a bounded radius (formation compression at chokepoints), never onto an obstacle. Group completion/failure is reported once per order via typed events (`SquadOrderCompleted`/`SquadOrderFailed`). Squad state is canonical (checkpoint digests, snapshot/restore, replays) and exposed in the render snapshot (`RenderSnapshot::squads`). Open follow-ons: richer templates, dynamic re-formation while moving, and mixed movement-profile policies (§7.4).
+
 ### 2.5 Command philosophy
 
 The player should primarily issue intent-based commands:
@@ -395,7 +397,7 @@ RVO/ORCA-style algorithms are candidates, not a complete solution. Benchmark and
 
 ### 7.3 Formation movement
 
-*[Deferred to M2] — not validated by the M1 slice.*
+*[M2 basics implemented (issue #110): templates + deterministic slot assignment + group Move/AttackMove/Defend with member-level navigation preserved; see §2.4. Not yet validated at scale: compression dynamics under congestion, regrouping, and mixed-profile groups.]*
 
 Formation movement must not be reduced to sending every member to the same point.
 
@@ -863,7 +865,7 @@ The concrete scenario ("Crossing assault") and its headless acceptance test are 
 
 ### M2 — Operational RTS foundation
 
-- Squads/formations and group orders (#110).
+- Squads/formations and group orders (#110, implemented: authoritative squads, formation templates, group commands, canonical/replay coverage).
 - Region graph and capture/control loop (#14, #106).
 - Resource sites and production (#108).
 - Buildings and infrastructure lifecycle (#109).

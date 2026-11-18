@@ -49,7 +49,7 @@
 //! assigned command IDs, so a replay reproduces the identical per-tick sets
 //! and therefore the identical arbitration result.
 
-use crate::entity::EntityId;
+use crate::entity::{EntityId, SquadId};
 use crate::hash::{
     CanonicalDecode, CanonicalError, CanonicalReader, CanonicalSerialize, CanonicalSink,
 };
@@ -97,6 +97,36 @@ pub enum CommandPayload {
     AttackMove { destination: (f32, f32) },
     /// Engage the target entity until it dies or a new command replaces it.
     Attack { target: EntityId },
+    /// Creates a squad from the given live units (group commands, issue #110).
+    /// `formation` is the template tag (see `phalanx_game::formation`).
+    CreateSquad {
+        members: Vec<EntityId>,
+        formation: u32,
+    },
+    /// Disbands a squad; its members become unassigned (no stale references).
+    DisbandSquad { squad: SquadId },
+    /// Replaces a squad's member set; listed members are removed from any
+    /// other squad first, so membership never aliases.
+    SetSquadMembers {
+        squad: SquadId,
+        members: Vec<EntityId>,
+    },
+    /// Changes a squad's formation template; member slots are recomputed.
+    SetSquadFormation { squad: SquadId, formation: u32 },
+    /// Group move: each member moves to its formation slot around
+    /// `destination` while keeping member-level navigation/avoidance.
+    SquadMove {
+        squad: SquadId,
+        destination: (f32, f32),
+    },
+    /// Group attack-move: like [`Self::SquadMove`] but members engage enemies
+    /// that enter weapon range.
+    SquadAttackMove {
+        squad: SquadId,
+        destination: (f32, f32),
+    },
+    /// Group defend: hold the current formation and engage enemies in range.
+    SquadDefend { squad: SquadId },
 }
 
 /// A command submitted to the simulation, before validation and ID
@@ -558,6 +588,39 @@ impl CanonicalSerialize for CommandPayload {
                 sink.write_u32(3);
                 target.write_canonical(sink);
             }
+            Self::CreateSquad { members, formation } => {
+                sink.write_u32(4);
+                members.write_canonical(sink);
+                sink.write_u32(*formation);
+            }
+            Self::DisbandSquad { squad } => {
+                sink.write_u32(5);
+                squad.write_canonical(sink);
+            }
+            Self::SetSquadMembers { squad, members } => {
+                sink.write_u32(6);
+                squad.write_canonical(sink);
+                members.write_canonical(sink);
+            }
+            Self::SetSquadFormation { squad, formation } => {
+                sink.write_u32(7);
+                squad.write_canonical(sink);
+                sink.write_u32(*formation);
+            }
+            Self::SquadMove { squad, destination } => {
+                sink.write_u32(8);
+                squad.write_canonical(sink);
+                destination.write_canonical(sink);
+            }
+            Self::SquadAttackMove { squad, destination } => {
+                sink.write_u32(9);
+                squad.write_canonical(sink);
+                destination.write_canonical(sink);
+            }
+            Self::SquadDefend { squad } => {
+                sink.write_u32(10);
+                squad.write_canonical(sink);
+            }
         }
     }
 }
@@ -576,6 +639,32 @@ impl CanonicalDecode for CommandPayload {
             }),
             3 => Ok(Self::Attack {
                 target: CanonicalDecode::read_canonical(reader)?,
+            }),
+            4 => Ok(Self::CreateSquad {
+                members: CanonicalDecode::read_canonical(reader)?,
+                formation: reader.read_u32()?,
+            }),
+            5 => Ok(Self::DisbandSquad {
+                squad: CanonicalDecode::read_canonical(reader)?,
+            }),
+            6 => Ok(Self::SetSquadMembers {
+                squad: CanonicalDecode::read_canonical(reader)?,
+                members: CanonicalDecode::read_canonical(reader)?,
+            }),
+            7 => Ok(Self::SetSquadFormation {
+                squad: CanonicalDecode::read_canonical(reader)?,
+                formation: reader.read_u32()?,
+            }),
+            8 => Ok(Self::SquadMove {
+                squad: CanonicalDecode::read_canonical(reader)?,
+                destination: CanonicalDecode::read_canonical(reader)?,
+            }),
+            9 => Ok(Self::SquadAttackMove {
+                squad: CanonicalDecode::read_canonical(reader)?,
+                destination: CanonicalDecode::read_canonical(reader)?,
+            }),
+            10 => Ok(Self::SquadDefend {
+                squad: CanonicalDecode::read_canonical(reader)?,
             }),
             other => Err(CanonicalError::UnknownTag(other)),
         }

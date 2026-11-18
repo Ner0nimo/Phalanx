@@ -18,6 +18,7 @@
 
 pub mod defs;
 pub mod events;
+pub mod formation;
 pub mod scenario;
 pub mod snapshot;
 pub mod system;
@@ -25,6 +26,7 @@ pub mod world;
 
 pub use defs::{Roster, UnitDef, WeaponDef, slice_roster};
 pub use events::{BattleEvent, CommandFailReason};
+pub use formation::{FORMATION_SPACING_M, FormationTemplate, normalize_heading, rotate_slot};
 pub use scenario::{
     AUTONOMOUS_PAD_A, AUTONOMOUS_PAD_B, SCENARIO_SEED, SPAWN_PAD_A, SPAWN_PAD_B, TEAM_A, TEAM_B,
     UNITS_PER_TEAM, battle_world, crossing_assault_commands, setup_autonomous_battle, setup_battle,
@@ -35,4 +37,4 @@ pub use system::{
     BattleCommandSystem, BattleMovementSystem, BattleSystem, SharedBattleWorld,
     register_battle_systems,
 };
-pub use world::{BattleCommand, BattleSpawnError, BattleWorld, CombatState};
+pub use world::{BattleCommand, BattleSpawnError, BattleWorld, CombatState, Squad, SquadCommand};

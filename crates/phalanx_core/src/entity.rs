@@ -50,6 +50,32 @@ impl EntityId {
     }
 }
 
+/// A stable squad identifier (issue #110): assigned monotonically by the
+/// battle world and never reused, so a stale [`SquadId`] can never resolve to
+/// a different squad (unlike entity slots, squads are not recycled).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SquadId(pub u32);
+
+impl SquadId {
+    /// Returns the raw squad index.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+impl CanonicalSerialize for SquadId {
+    fn write_canonical(&self, sink: &mut dyn CanonicalSink) {
+        sink.write_u32(self.0);
+    }
+}
+
+impl CanonicalDecode for SquadId {
+    fn read_canonical(reader: &mut CanonicalReader<'_>) -> Result<Self, CanonicalError> {
+        Ok(Self(reader.read_u32()?))
+    }
+}
+
 /// Errors produced when validating or releasing an [`EntityId`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntityError {

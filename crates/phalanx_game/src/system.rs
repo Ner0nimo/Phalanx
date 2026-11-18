@@ -12,6 +12,7 @@ use phalanx_core::hash::{CanonicalError, CanonicalReader, CanonicalSink};
 use phalanx_core::simulation::{Phase, Simulation, SimulationRunner, SimulationSystem, SystemId};
 
 use crate::events::CommandFailReason;
+use crate::formation::FormationTemplate;
 use crate::world::BattleWorld;
 
 /// Shared battle world handle.
@@ -31,6 +32,60 @@ pub struct BattleMovementSystem {
 /// `Phase::ResolveCombat`).
 pub struct BattleSystem {
     world: SharedBattleWorld,
+}
+
+/// Application-time validation for group (squad) commands (issue #110):
+/// squad IDs must exist, membership lists must be non-empty and reference
+/// only live units, and formation tags must be known.
+fn validate_group_command(
+    world: &BattleWorld,
+    payload: &CommandPayload,
+) -> Option<CommandFailReason> {
+    match payload {
+        CommandPayload::CreateSquad { members, formation } => {
+            if members.is_empty() {
+                return Some(CommandFailReason::EmptySquad);
+            }
+            if members.iter().any(|m| !world.combat.contains_key(m)) {
+                return Some(CommandFailReason::UnknownMember);
+            }
+            if FormationTemplate::from_tag(*formation).is_none() {
+                return Some(CommandFailReason::InvalidFormation);
+            }
+            None
+        }
+        CommandPayload::SetSquadMembers { squad, members } => {
+            if !world.squads.contains_key(squad) {
+                return Some(CommandFailReason::UnknownSquad);
+            }
+            if members.is_empty() {
+                return Some(CommandFailReason::EmptySquad);
+            }
+            if members.iter().any(|m| !world.combat.contains_key(m)) {
+                return Some(CommandFailReason::UnknownMember);
+            }
+            None
+        }
+        CommandPayload::SetSquadFormation { squad, formation } => {
+            if !world.squads.contains_key(squad) {
+                return Some(CommandFailReason::UnknownSquad);
+            }
+            if FormationTemplate::from_tag(*formation).is_none() {
+                return Some(CommandFailReason::InvalidFormation);
+            }
+            None
+        }
+        CommandPayload::DisbandSquad { squad }
+        | CommandPayload::SquadMove { squad, .. }
+        | CommandPayload::SquadAttackMove { squad, .. }
+        | CommandPayload::SquadDefend { squad } => {
+            if !world.squads.contains_key(squad) {
+                return Some(CommandFailReason::UnknownSquad);
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 impl SimulationSystem<CommandPayload> for BattleCommandSystem {
@@ -68,6 +123,13 @@ impl SimulationSystem<CommandPayload> for BattleCommandSystem {
         // the authoritative world at the command's target tick: unknown
         // subjects and invalid attack targets are rejected here, with typed
         // reason codes, before any command is applied this tick.
+        // Group (squad) commands (issue #110) carry no per-unit subject; they
+        // are validated against the squad table and member liveness instead.
+        if let Some(reason) = validate_group_command(&self.world.borrow(), envelope.payload()) {
+            return CommandVerdict::Reject {
+                reason: reason.code(),
+            };
+        }
         let Some(subject) = envelope.subject() else {
             return CommandVerdict::Accept;
         };
@@ -130,10 +192,10 @@ impl SimulationSystem<CommandPayload> for BattleMovementSystem {
     fn run(
         &mut self,
         _ctx: &TickContext,
-        _simulation: &mut Simulation<CommandPayload>,
+        simulation: &mut Simulation<CommandPayload>,
         _phase: Phase,
     ) -> Result<SystemOutput<CommandPayload>, SystemError> {
-        self.world.borrow_mut().step_movement();
+        self.world.borrow_mut().step_movement(simulation.tick());
         Ok(SystemOutput::default())
     }
 }
